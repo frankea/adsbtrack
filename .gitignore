@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.db
+cookies.json
+airports.csv
+*.egg-info/
+dist/
+build/
+.venv/
+*.har
+*.txt

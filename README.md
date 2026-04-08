@@ -28,7 +28,17 @@ uv sync
 ### Fetch trace data
 
 ```
-uv run python -m adsbtrack.cli fetch --hex adf64f --start 2020-01-01
+uv run python -m adsbtrack.cli fetch --hex a66ad3 --start 2020-01-01
+```
+
+```
+Fetching a66ad3 from 2020-01-01 to 2026-04-08
+Fetching a66ad3 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2163/2163 0:00:00
+
+Done! Fetched: 2163, With data: 391, Skipped (already fetched): 127, Errors: 0
+
+Extracting flights...
+Found 305 flights
 ```
 
 Options:
@@ -40,10 +50,68 @@ Options:
 
 The first run will automatically download the airport database (~10k airports). Fetching skips dates that have already been downloaded, so you can safely re-run to extend the date range or retry after interruptions.
 
+### View statistics
+
+```
+uv run python -m adsbtrack.cli status --hex a66ad3
+```
+
+```
+Status for a66ad3
+
+  Registration:  N512WB
+  Type:          Pilatus PC-XII 45
+  Owner:         None
+
+  Date range:    2020-01-01 to 2026-04-08
+  Days checked:  2290
+  Days w/ data:  392
+  Total flights: 305
+
+Top airports:
+
+┏━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┓
+┃ Airport ┃ Name                                     ┃ Visits ┃
+┡━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━┩
+│ KSRQ    │ Sarasota Bradenton International Airport │    130 │
+│ KVNC    │ Venice Municipal Airport                 │     54 │
+│ 67FL    │ Bald Eagle Airstrip                      │     26 │
+│ KFXE    │ Fort Lauderdale Executive Airport        │     16 │
+│ KFFC    │ Peachtree City Falcon Field              │     16 │
+│ KTRI    │ Tri-Cities Regional TN/VA Airport        │     14 │
+│ KBAZ    │ New Braunfels National Airport           │     11 │
+│ KPBI    │ Palm Beach International Airport         │     10 │
+│ KOPF    │ Miami-Opa Locka Executive Airport        │     10 │
+│ KBNA    │ Nashville International Airport          │     10 │
+└─────────┴──────────────────────────────────────────┴────────┘
+```
+
 ### View flight history
 
 ```
-uv run python -m adsbtrack.cli trips --hex adf64f
+uv run python -m adsbtrack.cli trips --hex a66ad3 --from 2026-03-25
+```
+
+```
+                               Flights for a66ad3
+┏━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━┓
+┃ Date       ┃ From                ┃ To                  ┃ Duration ┃ Callsign ┃
+┡━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━┩
+│ 2026-03-27 │ 67FL (Bald Eagle    │ KSPG (Albert        │ 10m      │ N512WB   │
+│            │ Airstrip)           │ Whitted Airport)    │          │          │
+│ 2026-03-27 │ KSPG (Albert        │ KHKY (Hickory       │ 3h 1m    │ N512WB   │
+│            │ Whitted Airport)    │ Regional Airport)   │          │          │
+│ 2026-03-28 │ KHKY (Hickory       │ KVNC (Venice        │ 4h 17m   │ N512WB   │
+│            │ Regional Airport)   │ Municipal Airport)  │          │          │
+│ 2026-03-28 │ KVNC (Venice        │ KHKY (Hickory       │ 2h 19m   │ N512WB   │
+│            │ Municipal Airport)  │ Regional Airport)   │          │          │
+│ 2026-03-29 │ KHKY (Hickory       │ KSPG (Albert        │ 2h 23m   │ N512WB   │
+│            │ Regional Airport)   │ Whitted Airport)    │          │          │
+│ 2026-03-29 │ KSPG (Albert        │ in flight?          │          │ N512WB   │
+│            │ Whitted Airport)    │                     │          │          │
+└────────────┴─────────────────────┴─────────────────────┴──────────┴──────────┘
+
+Total: 6 flights
 ```
 
 Options:
@@ -51,18 +119,10 @@ Options:
 - `--to` - Filter to date
 - `--airport` - Filter by airport ICAO code (e.g. `--airport KSRQ`)
 
-### View statistics
-
-```
-uv run python -m adsbtrack.cli status --hex adf64f
-```
-
-Shows registration, aircraft type, owner, date range, flight count, and top airports with visit counts.
-
 ### Re-extract flights
 
 ```
-uv run python -m adsbtrack.cli extract --hex adf64f --reprocess
+uv run python -m adsbtrack.cli extract --hex a66ad3 --reprocess
 ```
 
 Useful if you want to rebuild the flight table from raw trace data (e.g. after code changes to the parser).

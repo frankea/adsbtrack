@@ -1,16 +1,17 @@
+import contextlib
 import gzip
 import io
 import json
+import os
 import tarfile
 import time
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 
 import httpx
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
-from .config import Config, SOURCE_URLS
+from .config import SOURCE_URLS, Config
 from .db import Database
-
 
 # Referer headers per source domain
 _SOURCE_REFERERS = {
@@ -22,19 +23,9 @@ _SOURCE_REFERERS = {
 }
 
 
-def load_cookies(config: Config) -> dict[str, str] | None:
-    if not config.cookies_path.exists():
-        return None
-    with open(config.cookies_path) as f:
-        return json.load(f)
-
-
 def build_url(base_url: str, hex_code: str, day: date) -> str:
     last2 = hex_code[-2:]
-    return (
-        f"{base_url}/{day.year}/{day.month:02d}/{day.day:02d}"
-        f"/traces/{last2}/trace_full_{hex_code}.json"
-    )
+    return f"{base_url}/{day.year}/{day.month:02d}/{day.day:02d}/traces/{last2}/trace_full_{hex_code}.json"
 
 
 def date_range(start: date, end: date) -> list[date]:
@@ -58,9 +49,9 @@ def _referer_for_source(source: str) -> str:
     return f"https://{source}/"
 
 
-def fetch_traces(db: Database, config: Config, hex_code: str,
-                 start_date: date, end_date: date,
-                 source: str = "adsbx") -> dict:
+def fetch_traces(
+    db: Database, config: Config, hex_code: str, start_date: date, end_date: date, source: str = "adsbx"
+) -> dict:
     base_url = SOURCE_URLS[source]
     already_fetched = db.get_fetched_dates(hex_code, source=source)
 
@@ -91,130 +82,125 @@ def fetch_traces(db: Database, config: Config, hex_code: str,
         "sec-fetch-mode": "cors",
         "sec-fetch-site": "same-origin",
         "sec-gpc": "1",
-        "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+        ),
         "x-requested-with": "XMLHttpRequest",
     }
 
-    # Browser doesn't send cookies - neither should we
-    cookies = None
-
-    with httpx.Client(http2=True, headers=headers, cookies=cookies,
-                      timeout=30, follow_redirects=True) as client:
-        with Progress(
+    with (
+        httpx.Client(http2=True, headers=headers, timeout=30, follow_redirects=True) as client,
+        Progress(
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
             TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task(
-                f"Fetching {hex_code} ({source})", total=len(to_fetch)
-            )
+        ) as progress,
+    ):
+        task = progress.add_task(f"Fetching {hex_code} ({source})", total=len(to_fetch))
 
-            for day in to_fetch:
-                url = build_url(base_url, hex_code, day)
-                retries = 0
-                max_retries = 5
+        for day in to_fetch:
+            url = build_url(base_url, hex_code, day)
+            retries = 0
+            max_retries = 5
 
-                while retries <= max_retries:
-                    try:
-                        resp = client.get(url)
+            while retries <= max_retries:
+                try:
+                    resp = client.get(url)
 
-                        if resp.status_code == 200:
-                            # Handle gzip - try to decompress raw bytes first
-                            try:
-                                text = gzip.decompress(resp.content).decode("utf-8")
-                            except gzip.BadGzipFile:
-                                text = resp.text
-                            data = json.loads(text)
+                    if resp.status_code == 200:
+                        # Handle gzip - try to decompress raw bytes first
+                        try:
+                            text = gzip.decompress(resp.content).decode("utf-8")
+                        except gzip.BadGzipFile:
+                            text = resp.text
+                        data = json.loads(text)
 
-                            # Some 200 responses have no trace data (just {"icao": "..."})
-                            if "trace" not in data or not data["trace"]:
-                                db.insert_fetch_log(hex_code, day.isoformat(), 204, source=source)
-                                break
-
-                            # Synthesize timestamp if missing (midnight UTC of that day)
-                            if "timestamp" not in data:
-                                from datetime import datetime, timezone
-                                data["timestamp"] = datetime(
-                                    day.year, day.month, day.day, tzinfo=timezone.utc
-                                ).timestamp()
-
-                            db.insert_trace_day(hex_code, day.isoformat(), data, source=source)
-                            db.insert_fetch_log(hex_code, day.isoformat(), 200, source=source)
-                            stats["with_data"] += 1
+                        # Some 200 responses have no trace data (just {"icao": "..."})
+                        if "trace" not in data or not data["trace"]:
+                            db.insert_fetch_log(hex_code, day.isoformat(), 204, source=source)
                             break
 
-                        elif resp.status_code == 404:
-                            db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
-                            break
+                        # Synthesize timestamp if missing (midnight UTC of that day)
+                        if "timestamp" not in data:
+                            progress.console.print(f"  [dim yellow]No timestamp in {day} data, using midnight UTC[/]")
+                            data["timestamp"] = datetime(day.year, day.month, day.day, tzinfo=UTC).timestamp()
 
-                        elif resp.status_code == 403:
-                            progress.stop()
-                            raise RuntimeError(
-                                f"Authentication failed (403). Update cookies in {config.cookies_path}"
-                            )
+                        db.insert_trace_day(hex_code, day.isoformat(), data, source=source)
+                        db.insert_fetch_log(hex_code, day.isoformat(), 200, source=source)
+                        stats["with_data"] += 1
+                        break
 
-                        elif resp.status_code in (429, 500, 502, 503, 504):
-                            retries += 1
-                            if retries > max_retries:
-                                db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
-                                stats["errors"] += 1
-                                break
-                            # On 429, also increase the base delay for future requests
-                            if resp.status_code == 429:
-                                retry_after = resp.headers.get("retry-after")
-                                if retry_after and retry_after.isdigit():
-                                    wait = int(retry_after)
-                                else:
-                                    wait = 2 ** retries
-                                current_delay = min(current_delay * 2, config.rate_limit_max)
-                                successes_since_backoff = 0
-                                progress.console.print(
-                                    f"  [yellow]HTTP 429 for {day}, waiting {wait}s "
-                                    f"(base delay now {current_delay:.1f}s)[/]"
-                                )
-                            else:
-                                wait = 2 ** retries
-                                progress.console.print(
-                                    f"  [yellow]HTTP {resp.status_code} for {day}, retrying in {wait}s...[/]"
-                                )
-                            time.sleep(wait)
-                        else:
+                    elif resp.status_code == 404:
+                        db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
+                        break
+
+                    elif resp.status_code == 403:
+                        progress.stop()
+                        raise RuntimeError(
+                            f"Authentication failed (403) for {source}. "
+                            "The source may require authentication or be blocking automated requests."
+                        )
+
+                    elif resp.status_code in (429, 500, 502, 503, 504):
+                        retries += 1
+                        if retries > max_retries:
                             db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
                             stats["errors"] += 1
                             break
-
-                    except httpx.RequestError as e:
-                        retries += 1
-                        if retries > max_retries:
-                            stats["errors"] += 1
-                            break
-                        wait = 2 ** retries
-                        progress.console.print(
-                            f"  [yellow]Network error for {day}: {e}, retrying in {wait}s...[/]"
-                        )
+                        # On 429, also increase the base delay for future requests
+                        if resp.status_code == 429:
+                            retry_after = resp.headers.get("retry-after")
+                            wait = int(retry_after) if retry_after and retry_after.isdigit() else 2**retries
+                            current_delay = min(current_delay * 2, config.rate_limit_max)
+                            successes_since_backoff = 0
+                            progress.console.print(
+                                f"  [yellow]HTTP 429 for {day}, waiting {wait}s "
+                                f"(base delay now {current_delay:.1f}s)[/]"
+                            )
+                        else:
+                            wait = 2**retries
+                            progress.console.print(
+                                f"  [yellow]HTTP {resp.status_code} for {day}, retrying in {wait}s...[/]"
+                            )
                         time.sleep(wait)
+                    else:
+                        db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
+                        stats["errors"] += 1
+                        break
 
-                stats["fetched"] += 1
-                progress.advance(task)
+                except httpx.RequestError as e:
+                    retries += 1
+                    if retries > max_retries:
+                        stats["errors"] += 1
+                        break
+                    wait = 2**retries
+                    progress.console.print(f"  [yellow]Network error for {day}: {e}, retrying in {wait}s...[/]")
+                    time.sleep(wait)
 
-                # Gradually recover delay after consecutive successes
-                successes_since_backoff += 1
-                if (current_delay > config.rate_limit
-                        and successes_since_backoff >= config.rate_limit_recovery):
-                    current_delay = max(current_delay / 2, config.rate_limit)
-                    successes_since_backoff = 0
-                    progress.console.print(
-                        f"  [green]Rate recovering, delay now {current_delay:.1f}s[/]"
-                    )
+            stats["fetched"] += 1
+            progress.advance(task)
 
-                time.sleep(current_delay)
+            # Gradually recover delay after consecutive successes
+            successes_since_backoff += 1
+            if current_delay > config.rate_limit and successes_since_backoff >= config.rate_limit_recovery:
+                current_delay = max(current_delay / 2, config.rate_limit)
+                successes_since_backoff = 0
+                progress.console.print(f"  [green]Rate recovering, delay now {current_delay:.1f}s[/]")
+
+            time.sleep(current_delay)
+
+            # Commit periodically so progress is saved on interrupt
+            if stats["fetched"] % 50 == 0:
+                db.commit()
+
+        db.commit()
 
     return stats
 
 
-def fetch_traces_adsblol(db: Database, config: Config, hex_code: str,
-                         start_date: date, end_date: date) -> dict:
+def fetch_traces_adsblol(db: Database, config: Config, hex_code: str, start_date: date, end_date: date) -> dict:
     """Fetch traces from adsb.lol GitHub releases (same readsb JSON format)."""
     source = "adsblol"
     already_fetched = db.get_fetched_dates(hex_code, source=source)
@@ -228,45 +214,43 @@ def fetch_traces_adsblol(db: Database, config: Config, hex_code: str,
     last2 = hex_code[-2:]
     trace_filename = f"traces/{last2}/trace_full_{hex_code}.json"
 
-    with httpx.Client(timeout=120, follow_redirects=True) as client:
-        with Progress(
+    with (
+        httpx.Client(timeout=120, follow_redirects=True) as client,
+        Progress(
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
             TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task(
-                f"Fetching {hex_code} (adsblol)", total=len(to_fetch)
-            )
+        ) as progress,
+    ):
+        task = progress.add_task(f"Fetching {hex_code} (adsblol)", total=len(to_fetch))
 
-            for day in to_fetch:
-                year = day.year
-                tag = day.isoformat()
-                # adsb.lol publishes daily tarballs as GitHub release assets
-                asset_url = (
-                    f"https://github.com/adsblol/globe_history_{year}"
-                    f"/releases/download/{tag}/traces.tar.gz"
-                )
+        for day in to_fetch:
+            year = day.year
+            tag = day.isoformat()
+            # adsb.lol publishes daily tarballs as GitHub release assets
+            asset_url = f"https://github.com/adsblol/globe_history_{year}/releases/download/{tag}/traces.tar.gz"
 
-                try:
-                    resp = client.get(asset_url)
-                    if resp.status_code == 200:
-                        try:
-                            tar = tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz")
+            try:
+                resp = client.get(asset_url)
+                if resp.status_code == 200:
+                    try:
+                        with tarfile.open(fileobj=io.BytesIO(resp.content), mode="r:gz") as tar:
                             try:
                                 member = tar.getmember(trace_filename)
                                 f = tar.extractfile(member)
                                 raw = f.read()
                                 # File may be gzipped inside the tar
-                                try:
+                                with contextlib.suppress(gzip.BadGzipFile):
                                     raw = gzip.decompress(raw)
-                                except gzip.BadGzipFile:
-                                    pass
                                 data = json.loads(raw)
                                 if "trace" in data and data["trace"]:
                                     if "timestamp" not in data:
+                                        progress.console.print(
+                                            f"  [dim yellow]No timestamp in {day} data, using midnight UTC[/]"
+                                        )
                                         data["timestamp"] = datetime(
-                                            day.year, day.month, day.day, tzinfo=timezone.utc
+                                            day.year, day.month, day.day, tzinfo=UTC
                                         ).timestamp()
                                     db.insert_trace_day(hex_code, day.isoformat(), data, source=source)
                                     db.insert_fetch_log(hex_code, day.isoformat(), 200, source=source)
@@ -276,41 +260,52 @@ def fetch_traces_adsblol(db: Database, config: Config, hex_code: str,
                             except KeyError:
                                 # Hex not in this day's archive
                                 db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
-                            finally:
-                                tar.close()
-                        except (tarfile.TarError, EOFError):
-                            db.insert_fetch_log(hex_code, day.isoformat(), 500, source=source)
-                            stats["errors"] += 1
-                    elif resp.status_code == 404:
-                        db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
-                    else:
-                        db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
+                    except (tarfile.TarError, EOFError):
+                        db.insert_fetch_log(hex_code, day.isoformat(), 500, source=source)
                         stats["errors"] += 1
-                except httpx.RequestError as e:
-                    progress.console.print(f"  [yellow]Network error for {day}: {e}[/]")
+                elif resp.status_code == 404:
+                    db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
+                else:
+                    db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
                     stats["errors"] += 1
+            except httpx.RequestError as e:
+                progress.console.print(f"  [yellow]Network error for {day}: {e}[/]")
+                stats["errors"] += 1
 
-                stats["fetched"] += 1
-                progress.advance(task)
-                time.sleep(config.rate_limit)
+            stats["fetched"] += 1
+            progress.advance(task)
+            time.sleep(config.rate_limit)
+
+            if stats["fetched"] % 50 == 0:
+                db.commit()
+
+        db.commit()
 
     return stats
 
 
 def _load_opensky_credentials(config: Config) -> tuple[str, str]:
-    """Load OpenSky credentials from JSON file. Returns (username, password)."""
+    """Load OpenSky credentials from env vars or JSON file. Returns (username, password)."""
+    # Prefer environment variables
+    client_id = os.environ.get("OPENSKY_CLIENT_ID")
+    client_secret = os.environ.get("OPENSKY_CLIENT_SECRET")
+    if client_id and client_secret:
+        return client_id, client_secret
+
+    # Fall back to credentials file
     if not config.credentials_path.exists():
         raise RuntimeError(
-            f"Credentials file not found: {config.credentials_path}\n"
-            f'Create it with: {{"clientId": "...", "clientSecret": "..."}}'
+            "OpenSky credentials not found.\n"
+            "Set OPENSKY_CLIENT_ID and OPENSKY_CLIENT_SECRET environment variables,\n"
+            f"or create {config.credentials_path} with: "
+            '{"clientId": "...", "clientSecret": "..."}'
         )
     with open(config.credentials_path) as f:
         creds = json.load(f)
     return creds["clientId"], creds["clientSecret"]
 
 
-def _opensky_path_to_readsb(path: list, callsign: str | None,
-                             start_time: int) -> dict:
+def _opensky_path_to_readsb(path: list, callsign: str | None, start_time: int) -> dict:
     """Convert OpenSky track response to readsb-compatible trace format."""
     trace = []
     for wp in path:
@@ -329,8 +324,7 @@ def _opensky_path_to_readsb(path: list, callsign: str | None,
     }
 
 
-def fetch_traces_opensky(db: Database, config: Config, hex_code: str,
-                          start_date: date, end_date: date) -> dict:
+def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date: date, end_date: date) -> dict:
     """Fetch flight data from OpenSky Network API.
 
     Uses /flights/aircraft for historical flight metadata (no 30-day limit),
@@ -353,121 +347,115 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str,
     i = 0
     while i < len(to_fetch):
         window_start = to_fetch[i]
-        window_end = min(to_fetch[min(i + 1, len(to_fetch) - 1)],
-                         window_start + timedelta(days=1))
-        window_days = [to_fetch[j] for j in range(i, min(i + 2, len(to_fetch)))
-                       if to_fetch[j] <= window_end]
+        window_end = min(to_fetch[min(i + 1, len(to_fetch) - 1)], window_start + timedelta(days=1))
+        window_days = [to_fetch[j] for j in range(i, min(i + 2, len(to_fetch))) if to_fetch[j] <= window_end]
         windows.append((window_start, window_end, window_days))
         i += len(window_days)
 
     base_url = "https://opensky-network.org/api"
     thirty_days_ago = date.today() - timedelta(days=30)
 
-    with httpx.Client(auth=(username, password), timeout=30) as client:
-        with Progress(
+    with (
+        httpx.Client(auth=(username, password), timeout=30) as client,
+        Progress(
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
             MofNCompleteColumn(),
             TimeRemainingColumn(),
-        ) as progress:
-            task = progress.add_task(
-                f"Fetching {hex_code} (opensky)", total=len(to_fetch)
+        ) as progress,
+    ):
+        task = progress.add_task(f"Fetching {hex_code} (opensky)", total=len(to_fetch))
+
+        for window_start, window_end, window_days in windows:
+            begin_ts = int(datetime(window_start.year, window_start.month, window_start.day, tzinfo=UTC).timestamp())
+            end_ts = int(
+                datetime(window_end.year, window_end.month, window_end.day, 23, 59, 59, tzinfo=UTC).timestamp()
             )
 
-            for window_start, window_end, window_days in windows:
-                begin_ts = int(datetime(window_start.year, window_start.month,
-                                        window_start.day, tzinfo=timezone.utc).timestamp())
-                end_ts = int(datetime(window_end.year, window_end.month,
-                                      window_end.day, 23, 59, 59, tzinfo=timezone.utc).timestamp())
+            try:
+                # Get flights in this window
+                resp = client.get(
+                    f"{base_url}/flights/aircraft", params={"icao24": hex_code, "begin": begin_ts, "end": end_ts}
+                )
 
-                try:
-                    # Get flights in this window
-                    resp = client.get(
-                        f"{base_url}/flights/aircraft",
-                        params={"icao24": hex_code, "begin": begin_ts, "end": end_ts}
+                if resp.status_code == 403:
+                    progress.stop()
+                    raise RuntimeError(
+                        f"OpenSky access denied: {resp.text.strip()}. "
+                        "Historical data requires upgraded access at opensky-network.org"
                     )
 
-                    if resp.status_code == 403:
-                        progress.stop()
-                        raise RuntimeError(
-                            f"OpenSky access denied: {resp.text.strip()}. "
-                            "Historical data requires upgraded access at opensky-network.org"
-                        )
+                if resp.status_code == 200:
+                    flights = resp.json()
+                    if not flights:
+                        for day in window_days:
+                            db.insert_fetch_log(hex_code, day.isoformat(), 204, source=source)
+                            stats["fetched"] += 1
+                            progress.advance(task)
+                        time.sleep(1)
+                        continue
 
-                    if resp.status_code == 200:
-                        flights = resp.json()
-                        if not flights:
-                            for day in window_days:
-                                db.insert_fetch_log(hex_code, day.isoformat(), 204, source=source)
-                                stats["fetched"] += 1
-                                progress.advance(task)
-                            time.sleep(1)
+                    # For each flight, try to get the track if within 30 days
+                    for flight in flights:
+                        first_seen = flight.get("firstSeen")
+                        if not first_seen:
                             continue
+                        flight_date = datetime.fromtimestamp(first_seen, tz=UTC).date()
+                        flight_day_str = flight_date.isoformat()
 
-                        # For each flight, try to get the track if within 30 days
-                        for flight in flights:
-                            first_seen = flight.get("firstSeen")
-                            if not first_seen:
-                                continue
-                            flight_date = datetime.fromtimestamp(first_seen, tz=timezone.utc).date()
-                            flight_day_str = flight_date.isoformat()
+                        if flight_date >= thirty_days_ago:
+                            # Can get detailed track
+                            time.sleep(1)
+                            track_resp = client.get(
+                                f"{base_url}/tracks/all", params={"icao24": hex_code, "time": first_seen}
+                            )
+                            if track_resp.status_code == 200:
+                                track = track_resp.json()
+                                if track and track.get("path"):
+                                    data = _opensky_path_to_readsb(
+                                        track["path"], track.get("callsign"), track["startTime"]
+                                    )
+                                    db.insert_trace_day(hex_code, flight_day_str, data, source=source)
+                                    db.insert_fetch_log(hex_code, flight_day_str, 200, source=source)
+                                    stats["with_data"] += 1
+                                    continue
 
-                            if flight_date >= thirty_days_ago:
-                                # Can get detailed track
-                                time.sleep(1)
-                                track_resp = client.get(
-                                    f"{base_url}/tracks/all",
-                                    params={"icao24": hex_code, "time": first_seen}
-                                )
-                                if track_resp.status_code == 200:
-                                    track = track_resp.json()
-                                    if track and track.get("path"):
-                                        data = _opensky_path_to_readsb(
-                                            track["path"],
-                                            track.get("callsign"),
-                                            track["startTime"]
-                                        )
-                                        db.insert_trace_day(hex_code, flight_day_str, data, source=source)
-                                        db.insert_fetch_log(hex_code, flight_day_str, 200, source=source)
-                                        stats["with_data"] += 1
-                                        continue
+                        # No detailed track available, log that we checked
+                        db.insert_fetch_log(hex_code, flight_day_str, 204, source=source)
 
-                            # No detailed track available, log that we checked
-                            db.insert_fetch_log(hex_code, flight_day_str, 204, source=source)
+                    for _day in window_days:
+                        stats["fetched"] += 1
+                        progress.advance(task)
 
-                        for day in window_days:
-                            stats["fetched"] += 1
-                            progress.advance(task)
-
-                    elif resp.status_code == 404:
-                        for day in window_days:
-                            db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
-                            stats["fetched"] += 1
-                            progress.advance(task)
-
-                    elif resp.status_code == 429:
-                        retry_after = resp.headers.get("x-rate-limit-retry-after-seconds", "60")
-                        wait = int(retry_after) if retry_after.isdigit() else 60
-                        progress.console.print(
-                            f"  [yellow]OpenSky rate limit hit, waiting {wait}s[/]"
-                        )
-                        time.sleep(wait)
-                        continue  # retry this window
-
-                    else:
-                        for day in window_days:
-                            db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
-                            stats["errors"] += 1
-                            stats["fetched"] += 1
-                            progress.advance(task)
-
-                except httpx.RequestError as e:
-                    progress.console.print(f"  [yellow]Network error: {e}[/]")
+                elif resp.status_code == 404:
                     for day in window_days:
+                        db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
+                        stats["fetched"] += 1
+                        progress.advance(task)
+
+                elif resp.status_code == 429:
+                    retry_after = resp.headers.get("x-rate-limit-retry-after-seconds", "60")
+                    wait = int(retry_after) if retry_after.isdigit() else 60
+                    progress.console.print(f"  [yellow]OpenSky rate limit hit, waiting {wait}s[/]")
+                    time.sleep(wait)
+                    continue  # retry this window
+
+                else:
+                    for day in window_days:
+                        db.insert_fetch_log(hex_code, day.isoformat(), resp.status_code, source=source)
                         stats["errors"] += 1
                         stats["fetched"] += 1
                         progress.advance(task)
 
-                time.sleep(1)  # be gentle with OpenSky
+            except httpx.RequestError as e:
+                progress.console.print(f"  [yellow]Network error: {e}[/]")
+                for _day in window_days:
+                    stats["errors"] += 1
+                    stats["fetched"] += 1
+                    progress.advance(task)
+
+            time.sleep(1)  # be gentle with OpenSky
+
+        db.commit()
 
     return stats

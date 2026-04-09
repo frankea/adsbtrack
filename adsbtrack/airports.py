@@ -1,3 +1,4 @@
+import contextlib
 import csv
 import io
 from math import asin, cos, radians, sin, sqrt
@@ -37,24 +38,29 @@ def download_airports(db: Database, config: Config):
                 continue
             elev = None
             if row.get("elevation_ft"):
-                try:
+                with contextlib.suppress(ValueError):
                     elev = int(row["elevation_ft"])
-                except ValueError:
-                    pass
-            airports.append((
-                row["ident"], row["type"], row["name"],
-                lat, lon, elev,
-                row.get("iso_country", ""), row.get("iso_region", ""),
-                row.get("municipality", ""), row.get("iata_code", ""),
-            ))
+            airports.append(
+                (
+                    row["ident"],
+                    row["type"],
+                    row["name"],
+                    lat,
+                    lon,
+                    elev,
+                    row.get("iso_country", ""),
+                    row.get("iso_region", ""),
+                    row.get("municipality", ""),
+                    row.get("iata_code", ""),
+                )
+            )
 
         db.insert_airports(airports)
         progress.update(task, completed=100)
     return len(airports)
 
 
-def find_nearest_airport(db: Database, lat: float, lon: float,
-                         config: Config) -> AirportMatch | None:
+def find_nearest_airport(db: Database, lat: float, lon: float, config: Config) -> AirportMatch | None:
     candidates = db.find_nearby_airports(lat, lon, delta=0.15, types=config.airport_types)
     if not candidates:
         # Widen search

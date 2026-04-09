@@ -27,7 +27,7 @@ SUFFIX_SIZE = 1 + len(CHARSET) * (1 + len(CHARSET))  # 601
 # bucket3: 10 possible digits * bucket4 + suffix_size (for when only 3 digits)
 # bucket2: 10 possible digits * bucket3 + suffix_size
 # bucket1: 10 possible digits * bucket2 + suffix_size
-BUCKET4_SIZE = 1 + len(CHARSET) + len(DIGITSET)          # 35
+BUCKET4_SIZE = 1 + len(CHARSET) + len(DIGITSET)  # 35
 BUCKET3_SIZE = len(DIGITSET) * BUCKET4_SIZE + SUFFIX_SIZE  # 951
 BUCKET2_SIZE = len(DIGITSET) * BUCKET3_SIZE + SUFFIX_SIZE  # 10111
 BUCKET1_SIZE = len(DIGITSET) * BUCKET2_SIZE + SUFFIX_SIZE  # 101711
@@ -53,9 +53,7 @@ def _suffix_offset(suffix: str) -> int:
 
     for ch in suffix:
         if ch not in CHARSET:
-            raise ValueError(
-                f"Invalid suffix letter '{ch}' (I and O are not allowed)"
-            )
+            raise ValueError(f"Invalid suffix letter '{ch}' (I and O are not allowed)")
 
     offset = (len(CHARSET) + 1) * CHARSET.index(suffix[0]) + 1
     if len(suffix) == 2:
@@ -94,18 +92,13 @@ def nnumber_to_icao(nnumber: str) -> str:
     # won't exceed 5 total characters after N.
     # Also, the first character must be a digit 1-9.
     if tail[0] not in DIGITSET or tail[0] == "0":
-        raise ValueError(
-            f"First character after N must be a digit 1-9: {nnumber}"
-        )
+        raise ValueError(f"First character after N must be a digit 1-9: {nnumber}")
 
     # Check format: digits then letters (no mixing)
     if len(tail) > 3:
         for i in range(1, len(tail) - 2):
             if tail[i] in CHARSET:
-                raise ValueError(
-                    f"Invalid N-number format (letters in wrong position): "
-                    f"{nnumber}"
-                )
+                raise ValueError(f"Invalid N-number format (letters in wrong position): {nnumber}")
 
     count = 1  # ICAO offset starts at 1 (a00001 = N1 with offset 0 doesn't exist, offset 1 = first valid)
 

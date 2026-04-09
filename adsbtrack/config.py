@@ -1,6 +1,5 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-
 
 SOURCE_URLS = {
     "adsbx": "https://globe.adsbexchange.com/globe_history",
@@ -14,7 +13,6 @@ SOURCE_URLS = {
 @dataclass
 class Config:
     db_path: Path = Path("adsbtrack.db")
-    cookies_path: Path = Path("cookies.json")
     credentials_path: Path = Path("credentials.json")
     airports_csv_url: str = "https://davidmegginson.github.io/ourairports-data/airports.csv"
     rate_limit: float = 0.5  # seconds between requests
@@ -22,3 +20,4 @@ class Config:
     rate_limit_recovery: int = 10  # successes before reducing delay
     airport_match_threshold_km: float = 10.0
     airport_types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")
+    landing_speed_threshold_kts: float = 80.0  # ground speed above which a "ground" alt reading is ignored

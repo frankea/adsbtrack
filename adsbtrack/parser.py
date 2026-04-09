@@ -1,6 +1,6 @@
 import json
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from .airports import find_nearest_airport
 from .config import Config
@@ -51,11 +51,14 @@ def _merge_trace_rows(rows: list) -> tuple[str, float, list]:
     for abs_ts, point in abs_points:
         lat = point[1]
         lon = point[2]
-        if (prev_ts is not None
-                and abs(abs_ts - prev_ts) < _DEDUP_TIME_SECS
-                and prev_lat is not None and prev_lon is not None
-                and abs(lat - prev_lat) < _DEDUP_DEG
-                and abs(lon - prev_lon) < _DEDUP_DEG):
+        if (
+            prev_ts is not None
+            and abs(abs_ts - prev_ts) < _DEDUP_TIME_SECS
+            and prev_lat is not None
+            and prev_lon is not None
+            and abs(lat - prev_lat) < _DEDUP_DEG
+            and abs(lon - prev_lon) < _DEDUP_DEG
+        ):
             continue
         merged.append((abs_ts, point))
         prev_ts = abs_ts
@@ -97,9 +100,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     pending_flight: Flight | None = None
     current_callsign = None
     prev_day_date = None
+    _prev_was_ground = False  # for gs=None hysteresis (require 2 consecutive ground points)
 
     for day_date, day_timestamp, trace in merged_days:
-
         # Reset state if there's a gap between trace days
         if prev_day_date is not None:
             prev = datetime.fromisoformat(prev_day_date)
@@ -111,6 +114,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     pending_flight = None
                 state = None
                 prev_ground_point = None
+                _prev_was_ground = False
 
         prev_day_date = day_date
 
@@ -138,7 +142,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     current_callsign = flight_id
 
             is_ground = alt == "ground"
-            abs_time = datetime.fromtimestamp(day_timestamp + time_offset, tz=timezone.utc)
+            abs_time = datetime.fromtimestamp(day_timestamp + time_offset, tz=UTC)
 
             if state is None:
                 if is_ground:
@@ -159,6 +163,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             if state == "ground" and not is_ground:
                 # TAKEOFF - use previous ground point for airport location
                 state = "airborne"
+                _prev_was_ground = False
                 if prev_ground_point:
                     to_lat, to_lon, to_time, to_date = prev_ground_point
                 else:
@@ -175,8 +180,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
             elif state == "airborne" and is_ground:
                 # Possible LANDING - check ground speed for hysteresis
-                if gs is not None and gs > 80:
+                if gs is not None and gs > config.landing_speed_threshold_kts:
                     continue
+                # When ground speed is unavailable (e.g. OpenSky data), require
+                # consecutive ground points to avoid false landings from momentary
+                # altitude glitches. We peek ahead by deferring the state change
+                # until we see a second ground point.
+                if gs is None and not _prev_was_ground:
+                    _prev_was_ground = True
+                    continue
+                _prev_was_ground = False
 
                 state = "ground"
                 if pending_flight:
@@ -201,12 +214,14 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     valid_flights = []
     for flight in flights:
         # Skip very short movements at the same location (taxi, ground tests)
-        if (flight.duration_minutes is not None
-                and flight.duration_minutes < MIN_FLIGHT_MINUTES
-                and flight.landing_lat is not None):
+        if (
+            flight.duration_minutes is not None
+            and flight.duration_minutes < MIN_FLIGHT_MINUTES
+            and flight.landing_lat is not None
+        ):
             from .airports import haversine_km
-            dist = haversine_km(flight.takeoff_lat, flight.takeoff_lon,
-                                flight.landing_lat, flight.landing_lon)
+
+            dist = haversine_km(flight.takeoff_lat, flight.takeoff_lon, flight.landing_lat, flight.landing_lon)
             if dist < 5:  # Less than 5km traveled — not a real flight
                 continue
         valid_flights.append(flight)

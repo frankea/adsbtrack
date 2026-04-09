@@ -1,6 +1,7 @@
 import json
+import shutil
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .models import Flight
@@ -74,6 +75,9 @@ CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
 CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
 """
 
+# Individual CREATE statements for safe execution (no implicit commit)
+_SCHEMA_STATEMENTS = [stmt.strip() for stmt in SCHEMA.split(";") if stmt.strip()]
+
 
 def _needs_source_migration(conn: sqlite3.Connection) -> bool:
     """Check if the source column is missing from trace_days."""
@@ -85,75 +89,104 @@ def _needs_source_migration(conn: sqlite3.Connection) -> bool:
     return "source" not in col_names
 
 
-def _migrate_add_source(conn: sqlite3.Connection):
-    """Add source column via rename-copy-drop (SQLite has no ALTER CONSTRAINT)."""
+def _migrate_add_source(conn: sqlite3.Connection, db_path: Path):
+    """Add source column via rename-copy-drop with backup and explicit transaction."""
     print("Migrating database schema...")
-    conn.executescript("""
-        -- trace_days migration
-        ALTER TABLE trace_days RENAME TO trace_days_old;
 
-        CREATE TABLE trace_days (
-            id INTEGER PRIMARY KEY,
-            icao TEXT NOT NULL,
-            date TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'adsbx',
-            registration TEXT,
-            type_code TEXT,
-            description TEXT,
-            owner_operator TEXT,
-            year TEXT,
-            timestamp REAL NOT NULL,
-            trace_json TEXT NOT NULL,
-            point_count INTEGER NOT NULL,
-            fetched_at TEXT NOT NULL,
-            UNIQUE(icao, date, source)
-        );
+    # Back up the database before migrating
+    backup_path = db_path.with_suffix(".db.bak")
+    shutil.copy2(db_path, backup_path)
+    print(f"  Backup saved to {backup_path}")
 
-        INSERT INTO trace_days
-            (icao, date, source, registration, type_code, description,
-             owner_operator, year, timestamp, trace_json, point_count, fetched_at)
-        SELECT icao, date, 'adsbx', registration, type_code, description,
-               owner_operator, year, timestamp, trace_json, point_count, fetched_at
-        FROM trace_days_old;
+    try:
+        conn.execute("BEGIN")
 
-        DROP TABLE trace_days_old;
+        # trace_days migration
+        conn.execute("ALTER TABLE trace_days RENAME TO trace_days_old")
+        conn.execute("""
+            CREATE TABLE trace_days (
+                id INTEGER PRIMARY KEY,
+                icao TEXT NOT NULL,
+                date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'adsbx',
+                registration TEXT,
+                type_code TEXT,
+                description TEXT,
+                owner_operator TEXT,
+                year TEXT,
+                timestamp REAL NOT NULL,
+                trace_json TEXT NOT NULL,
+                point_count INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL,
+                UNIQUE(icao, date, source)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO trace_days
+                (icao, date, source, registration, type_code, description,
+                 owner_operator, year, timestamp, trace_json, point_count, fetched_at)
+            SELECT icao, date, 'adsbx', registration, type_code, description,
+                   owner_operator, year, timestamp, trace_json, point_count, fetched_at
+            FROM trace_days_old
+        """)
+        conn.execute("DROP TABLE trace_days_old")
 
-        -- fetch_log migration
-        ALTER TABLE fetch_log RENAME TO fetch_log_old;
+        # fetch_log migration
+        conn.execute("ALTER TABLE fetch_log RENAME TO fetch_log_old")
+        conn.execute("""
+            CREATE TABLE fetch_log (
+                id INTEGER PRIMARY KEY,
+                icao TEXT NOT NULL,
+                date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'adsbx',
+                status INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL,
+                UNIQUE(icao, date, source)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO fetch_log
+                (icao, date, source, status, fetched_at)
+            SELECT icao, date, 'adsbx', status, fetched_at
+            FROM fetch_log_old
+        """)
+        conn.execute("DROP TABLE fetch_log_old")
 
-        CREATE TABLE fetch_log (
-            id INTEGER PRIMARY KEY,
-            icao TEXT NOT NULL,
-            date TEXT NOT NULL,
-            source TEXT NOT NULL DEFAULT 'adsbx',
-            status INTEGER NOT NULL,
-            fetched_at TEXT NOT NULL,
-            UNIQUE(icao, date, source)
-        );
+        # Recreate indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date)")
 
-        INSERT INTO fetch_log
-            (icao, date, source, status, fetched_at)
-        SELECT icao, date, 'adsbx', status, fetched_at
-        FROM fetch_log_old;
-
-        DROP TABLE fetch_log_old;
-
-        -- Recreate indexes
-        CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
-    """)
+        conn.execute("COMMIT")
+        print("  Migration complete.")
+    except Exception:
+        conn.execute("ROLLBACK")
+        print("  Migration failed, rolling back. Backup is at:", backup_path)
+        raise
 
 
 class Database:
     def __init__(self, db_path: Path):
+        self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.row_factory = sqlite3.Row
         # Migrate existing databases that lack the source column
         if _needs_source_migration(self.conn):
-            _migrate_add_source(self.conn)
-        self.conn.executescript(SCHEMA)
+            _migrate_add_source(self.conn, db_path)
+        for stmt in _SCHEMA_STATEMENTS:
+            self.conn.execute(stmt)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.conn.commit()
+        self.conn.close()
 
     def close(self):
         self.conn.close()
+
+    def commit(self):
+        self.conn.commit()
 
     # -- trace_days --
 
@@ -164,19 +197,24 @@ class Database:
                 year, timestamp, trace_json, point_count, fetched_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                icao, date, source, data.get("r"), data.get("t"), data.get("desc"),
-                data.get("ownOp"), data.get("year"), data["timestamp"],
-                json.dumps(data["trace"]), len(data["trace"]),
-                datetime.utcnow().isoformat(),
+                icao,
+                date,
+                source,
+                data.get("r"),
+                data.get("t"),
+                data.get("desc"),
+                data.get("ownOp"),
+                data.get("year"),
+                data["timestamp"],
+                json.dumps(data["trace"]),
+                len(data["trace"]),
+                datetime.now(UTC).isoformat(),
             ),
         )
-        self.conn.commit()
 
     def get_trace_days(self, icao: str) -> list[sqlite3.Row]:
         """Return ALL source rows -- parser merges them by date."""
-        return self.conn.execute(
-            "SELECT * FROM trace_days WHERE icao = ? ORDER BY date", (icao,)
-        ).fetchall()
+        return self.conn.execute("SELECT * FROM trace_days WHERE icao = ? ORDER BY date", (icao,)).fetchall()
 
     # -- fetch_log --
 
@@ -184,9 +222,8 @@ class Database:
         self.conn.execute(
             """INSERT OR REPLACE INTO fetch_log (icao, date, source, status, fetched_at)
                VALUES (?, ?, ?, ?, ?)""",
-            (icao, date, source, status, datetime.utcnow().isoformat()),
+            (icao, date, source, status, datetime.now(UTC).isoformat()),
         )
-        self.conn.commit()
 
     def get_fetched_dates(self, icao: str, source: str = "adsbx") -> set[str]:
         rows = self.conn.execute(
@@ -201,7 +238,6 @@ class Database:
 
     def clear_flights(self, icao: str):
         self.conn.execute("DELETE FROM flights WHERE icao = ?", (icao,))
-        self.conn.commit()
 
     def insert_flight(self, flight: Flight):
         self.conn.execute(
@@ -215,19 +251,27 @@ class Database:
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
-                flight.takeoff_lat, flight.takeoff_lon, flight.takeoff_date,
+                flight.takeoff_lat,
+                flight.takeoff_lon,
+                flight.takeoff_date,
                 flight.landing_time.isoformat() if flight.landing_time else None,
-                flight.landing_lat, flight.landing_lon, flight.landing_date,
-                flight.origin_icao, flight.origin_name, flight.origin_distance_km,
-                flight.destination_icao, flight.destination_name,
+                flight.landing_lat,
+                flight.landing_lon,
+                flight.landing_date,
+                flight.origin_icao,
+                flight.origin_name,
+                flight.origin_distance_km,
+                flight.destination_icao,
+                flight.destination_name,
                 flight.destination_distance_km,
-                flight.duration_minutes, flight.callsign,
+                flight.duration_minutes,
+                flight.callsign,
             ),
         )
-        self.conn.commit()
 
-    def get_flights(self, icao: str, from_date: str | None = None,
-                    to_date: str | None = None, airport: str | None = None) -> list[sqlite3.Row]:
+    def get_flights(
+        self, icao: str, from_date: str | None = None, to_date: str | None = None, airport: str | None = None
+    ) -> list[sqlite3.Row]:
         query = "SELECT * FROM flights WHERE icao = ?"
         params: list = [icao]
         if from_date:
@@ -243,9 +287,7 @@ class Database:
         return self.conn.execute(query, params).fetchall()
 
     def get_flight_count(self, icao: str) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) as cnt FROM flights WHERE icao = ?", (icao,)
-        ).fetchone()
+        row = self.conn.execute("SELECT COUNT(*) as cnt FROM flights WHERE icao = ?", (icao,)).fetchone()
         return row["cnt"]
 
     def get_top_airports(self, icao: str, limit: int = 10) -> list[sqlite3.Row]:
@@ -310,8 +352,13 @@ class Database:
         )
         self.conn.commit()
 
-    def find_nearby_airports(self, lat: float, lon: float, delta: float = 0.15,
-                             types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")) -> list[sqlite3.Row]:
+    def find_nearby_airports(
+        self,
+        lat: float,
+        lon: float,
+        delta: float = 0.15,
+        types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport"),
+    ) -> list[sqlite3.Row]:
         placeholders = ",".join("?" for _ in types)
         return self.conn.execute(
             f"""SELECT * FROM airports

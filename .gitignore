@@ -1,6 +1,7 @@
 __pycache__/
 *.pyc
 *.db
+*.db.bak
 cookies.json
 credentials.json
 airports.csv

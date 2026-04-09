@@ -23,6 +23,12 @@ cd adsbtrack
 uv sync
 ```
 
+Check version:
+
+```
+uv run adsbtrack --version
+```
+
 ## Usage
 
 ### Fetch trace data
@@ -191,6 +197,25 @@ Supported sources:
 | [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires API credentials |
 | Custom | `--url <base_url>` | Any readsb instance |
 
+### OpenSky credentials
+
+OpenSky requires API credentials. Set them as environment variables (preferred):
+
+```
+export OPENSKY_CLIENT_ID="your-client-id"
+export OPENSKY_CLIENT_SECRET="your-client-secret"
+```
+
+Or create a `credentials.json` file in the project directory:
+
+```json
+{"clientId": "your-client-id", "clientSecret": "your-client-secret"}
+```
+
+Environment variables take priority over the file if both are present.
+
+### Custom sources
+
 You can also point at any readsb-compatible instance with `--url`:
 
 ```
@@ -243,6 +268,35 @@ All data is stored in a local SQLite database (`adsbtrack.db`).
 | latitude_deg/longitude_deg | REAL | Coordinates |
 | municipality | TEXT | City |
 | iata_code | TEXT | IATA code |
+
+## Development
+
+Install dev dependencies:
+
+```
+uv sync --extra dev
+```
+
+Run tests:
+
+```
+uv run pytest
+```
+
+Lint and format:
+
+```
+uv run ruff check .
+uv run ruff format .
+```
+
+Type check:
+
+```
+uv run mypy adsbtrack
+```
+
+CI runs automatically on push and pull requests via GitHub Actions (Python 3.12 and 3.13).
 
 ## Notes
 

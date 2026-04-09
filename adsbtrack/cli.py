@@ -211,5 +211,29 @@ def lookup(tail_number):
     console.print(hex_code)
 
 
+@cli.command()
+@click.option("--hex", "hex_code", default=None, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help="FAA N-number")
+@click.option("--db", "db_path", default="adsbtrack.db")
+def links(hex_code, tail_number, db_path):
+    """Generate ADS-B Exchange trace URLs for each flight."""
+    hex_code = _resolve_hex(hex_code, tail_number)
+    db, _ = get_db_and_config(db_path, "cookies.json")
+    flights = db.get_flights(hex_code)
+
+    if not flights:
+        console.print("[yellow]No flights found[/]")
+        return
+
+    for f in flights:
+        flight_date = f["takeoff_time"][:10]
+        origin = f["origin_icao"] or "?"
+        dest = f["destination_icao"] or "?"
+        url = f"https://globe.adsbexchange.com/?icao={hex_code}&showTrace={flight_date}"
+        console.print(f"[cyan]{flight_date}[/] {origin} -> {dest}  [dim]{url}[/]")
+
+    db.close()
+
+
 if __name__ == "__main__":
     cli()

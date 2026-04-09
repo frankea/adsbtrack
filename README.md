@@ -137,10 +137,93 @@ Airport matching uses a bounding-box query against the OurAirports database foll
 
 ## Finding hex codes
 
-To look up the ICAO hex code for a US tail number (N-number):
+You can convert US N-numbers to hex codes directly:
+
+```
+uv run python -m adsbtrack.cli lookup --tail N512WB
+```
+
+Or use `--tail` instead of `--hex` on any command:
+
+```
+uv run python -m adsbtrack.cli fetch --tail N512WB --start 2020-01-01
+```
+
+External lookup sites:
 - [aircraftdata.org](https://aircraftdata.org) - search by N-number, shows Mode S hex
 - [FAA Aircraft Registry](https://registry.faa.gov/aircraftinquiry) - official source
 - [ADS-B Exchange](https://globe.adsbexchange.com/) - search box accepts tail numbers
+
+## Generate trace URLs
+
+Generate clickable ADS-B Exchange URLs for each flight to view the trace on the map:
+
+```
+uv run python -m adsbtrack.cli links --hex a66ad3
+```
+
+```
+2026-03-27 67FL -> KSPG  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
+2026-03-27 KSPG -> KHKY  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
+2026-03-28 KHKY -> KVNC  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-28
+```
+
+## Multiple data sources
+
+Fetch from adsb.fi for additional coverage from a different receiver network:
+
+```
+uv run python -m adsbtrack.cli fetch --hex a66ad3 --source adsbfi --start 2020-01-01
+```
+
+Traces from multiple sources are automatically merged during flight extraction. Supported sources: `adsbx` (default), `adsbfi`.
+
+## Database schema
+
+All data is stored in a local SQLite database (`adsbtrack.db`).
+
+**trace_days** - Raw daily trace data per aircraft per source
+| Column | Type | Description |
+|--------|------|-------------|
+| icao | TEXT | ICAO hex code |
+| date | TEXT | Date (YYYY-MM-DD) |
+| source | TEXT | Data source (adsbx, adsbfi) |
+| registration | TEXT | Tail number from trace metadata |
+| description | TEXT | Aircraft type |
+| owner_operator | TEXT | Owner from trace metadata |
+| timestamp | REAL | Base Unix timestamp for the day |
+| trace_json | TEXT | Raw trace points as JSON array |
+| point_count | INTEGER | Number of trace points |
+
+**flights** - Extracted flights with airport matching
+| Column | Type | Description |
+|--------|------|-------------|
+| icao | TEXT | ICAO hex code |
+| takeoff_time | TEXT | ISO timestamp |
+| takeoff_lat/lon | REAL | Takeoff coordinates |
+| landing_time | TEXT | ISO timestamp (null if signal lost) |
+| landing_lat/lon | REAL | Landing coordinates |
+| origin_icao | TEXT | Nearest airport ICAO code |
+| destination_icao | TEXT | Nearest airport ICAO code |
+| duration_minutes | REAL | Flight duration |
+| callsign | TEXT | Callsign from ADS-B |
+
+**fetch_log** - Tracks which dates have been fetched per source
+| Column | Type | Description |
+|--------|------|-------------|
+| icao | TEXT | ICAO hex code |
+| date | TEXT | Date checked |
+| source | TEXT | Data source |
+| status | INTEGER | HTTP status (200, 404, etc.) |
+
+**airports** - OurAirports database (~10k airports)
+| Column | Type | Description |
+|--------|------|-------------|
+| ident | TEXT | ICAO code (primary key) |
+| name | TEXT | Airport name |
+| latitude_deg/longitude_deg | REAL | Coordinates |
+| municipality | TEXT | City |
+| iata_code | TEXT | IATA code |
 
 ## Notes
 

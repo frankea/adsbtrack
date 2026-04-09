@@ -6,10 +6,13 @@ from rich.console import Console
 from rich.table import Table
 
 from .airports import download_airports
-from .config import Config
+from .config import SOURCE_URLS, Config
 from .db import Database
-from .fetcher import fetch_traces
+from .fetcher import fetch_traces, fetch_traces_opensky
+from .nnumber import nnumber_to_icao
 from .parser import extract_flights
+
+ALL_SOURCES = ["adsbx", "adsbfi", "opensky"]
 
 console = Console()
 
@@ -27,6 +30,24 @@ def ensure_airports(db: Database, config: Config):
         console.print(f"[green]Loaded {count} airports[/]")
 
 
+def _resolve_hex(hex_code: str | None, tail_number: str | None) -> str:
+    """Resolve an ICAO hex code from --hex or --tail options.
+
+    Exactly one of hex_code or tail_number must be provided.
+    """
+    if hex_code and tail_number:
+        raise click.UsageError("Provide either --hex or --tail, not both.")
+    if not hex_code and not tail_number:
+        raise click.UsageError("Provide either --hex or --tail.")
+    if tail_number:
+        try:
+            hex_code = nnumber_to_icao(tail_number)
+        except ValueError as e:
+            raise click.BadParameter(str(e), param_hint="--tail")
+        console.print(f"[dim]Converted {tail_number} to hex {hex_code}[/]")
+    return hex_code
+
+
 @click.group()
 def cli():
     """Track private plane travel history using ADS-B Exchange data."""
@@ -34,13 +55,17 @@ def cli():
 
 
 @cli.command()
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code (e.g. adf64f)")
+@click.option("--hex", "hex_code", default=None, help="ICAO hex code (e.g. adf64f)")
+@click.option("--tail", "tail_number", default=None, help="FAA N-number (e.g. N512WB), converted to hex automatically")
+@click.option("--source", type=click.Choice(ALL_SOURCES), default="adsbx", help="Data source (default: adsbx)")
 @click.option("--start", "start_date", default="2025-01-01", help="Start date (YYYY-MM-DD)")
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
 @click.option("--rate", default=0.5, help="Seconds between requests")
 @click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
-def fetch(hex_code, start_date, end_date, rate, db_path):
-    """Download trace data from ADS-B Exchange globe_history API."""
+def fetch(hex_code, tail_number, source, start_date, end_date, rate, db_path):
+    """Download trace data from ADS-B data sources."""
+    hex_code = _resolve_hex(hex_code, tail_number)
+
     db, config = get_db_and_config(db_path, "cookies.json")
     config.rate_limit = rate
 
@@ -49,8 +74,12 @@ def fetch(hex_code, start_date, end_date, rate, db_path):
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date) if end_date else date.today()
 
-    console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end}")
-    stats = fetch_traces(db, config, hex_code, start, end)
+    console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
+
+    if source == "opensky":
+        stats = fetch_traces_opensky(db, config, hex_code, start, end)
+    else:
+        stats = fetch_traces(db, config, hex_code, start, end, source=source)
 
     console.print(f"\n[green]Done![/] Fetched: {stats['fetched']}, "
                   f"With data: {stats['with_data']}, "
@@ -169,6 +198,17 @@ def status(hex_code, db_path):
         console.print(table)
 
     db.close()
+
+
+@cli.command()
+@click.option("--tail", "tail_number", required=True, help="FAA N-number (e.g. N512WB)")
+def lookup(tail_number):
+    """Convert an FAA N-number to an ICAO hex code."""
+    try:
+        hex_code = nnumber_to_icao(tail_number)
+    except ValueError as e:
+        raise click.BadParameter(str(e), param_hint="--tail")
+    console.print(hex_code)
 
 
 if __name__ == "__main__":

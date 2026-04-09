@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.db
 cookies.json
+credentials.json
 airports.csv
 *.egg-info/
 dist/

@@ -1,4 +1,5 @@
 import json
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 from .airports import find_nearest_airport
@@ -13,6 +14,64 @@ MAX_DAY_GAP = timedelta(days=2)
 # Minimum duration to consider a valid flight (filters taxi movements)
 MIN_FLIGHT_MINUTES = 5.0
 
+# Deduplication thresholds for merging multi-source trace points
+_DEDUP_TIME_SECS = 2.0
+_DEDUP_DEG = 0.001
+
+
+def _merge_trace_rows(rows: list) -> tuple[str, float, list]:
+    """Merge multiple trace_day rows for the same date from different sources.
+
+    Converts relative offsets to absolute timestamps, concatenates, sorts,
+    deduplicates (points within 2 seconds and 0.001 degrees are duplicates),
+    then converts back to offsets from the earliest timestamp.
+
+    Returns (date, base_timestamp, merged_trace).
+    """
+    if len(rows) == 1:
+        return rows[0]["date"], rows[0]["timestamp"], json.loads(rows[0]["trace_json"])
+
+    # Convert all points to absolute timestamps
+    abs_points = []
+    for row in rows:
+        base_ts = row["timestamp"]
+        trace = json.loads(row["trace_json"])
+        for point in trace:
+            abs_ts = base_ts + point[0]
+            abs_points.append((abs_ts, point))
+
+    # Sort by absolute timestamp
+    abs_points.sort(key=lambda x: x[0])
+
+    # Deduplicate: skip points too close in time and position to the previous kept point
+    merged = []
+    prev_ts = None
+    prev_lat = None
+    prev_lon = None
+    for abs_ts, point in abs_points:
+        lat = point[1]
+        lon = point[2]
+        if (prev_ts is not None
+                and abs(abs_ts - prev_ts) < _DEDUP_TIME_SECS
+                and prev_lat is not None and prev_lon is not None
+                and abs(lat - prev_lat) < _DEDUP_DEG
+                and abs(lon - prev_lon) < _DEDUP_DEG):
+            continue
+        merged.append((abs_ts, point))
+        prev_ts = abs_ts
+        prev_lat = lat
+        prev_lon = lon
+
+    # Convert back to relative offsets from the earliest base timestamp
+    base_timestamp = min(row["timestamp"] for row in rows)
+    result_trace = []
+    for abs_ts, point in merged:
+        new_point = list(point)
+        new_point[0] = abs_ts - base_timestamp
+        result_trace.append(new_point)
+
+    return rows[0]["date"], base_timestamp, result_trace
+
 
 def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
     if reprocess:
@@ -22,6 +81,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     if not trace_days:
         return 0
 
+    # Group by date and merge multi-source rows
+    by_date: dict[str, list] = defaultdict(list)
+    for row in trace_days:
+        by_date[row["date"]].append(row)
+
+    merged_days = []
+    for day_date in sorted(by_date.keys()):
+        date_str, base_ts, trace = _merge_trace_rows(by_date[day_date])
+        merged_days.append((date_str, base_ts, trace))
+
     flights: list[Flight] = []
     state = None  # None = unknown, "ground" or "airborne"
     prev_ground_point = None
@@ -29,10 +98,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     current_callsign = None
     prev_day_date = None
 
-    for day_row in trace_days:
-        day_date = day_row["date"]
-        day_timestamp = day_row["timestamp"]
-        trace = json.loads(day_row["trace_json"])
+    for day_date, day_timestamp, trace in merged_days:
 
         # Reset state if there's a gap between trace days
         if prev_day_date is not None:

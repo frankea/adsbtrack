@@ -12,7 +12,7 @@ from .fetcher import fetch_traces, fetch_traces_opensky
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
 
-ALL_SOURCES = ["adsbx", "adsbfi", "opensky"]
+ALL_SOURCES = list(SOURCE_URLS.keys()) + ["opensky"]
 
 console = Console()
 
@@ -58,11 +58,12 @@ def cli():
 @click.option("--hex", "hex_code", default=None, help="ICAO hex code (e.g. adf64f)")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number (e.g. N512WB), converted to hex automatically")
 @click.option("--source", type=click.Choice(ALL_SOURCES), default="adsbx", help="Data source (default: adsbx)")
+@click.option("--url", "custom_url", default=None, help="Custom readsb globe_history base URL")
 @click.option("--start", "start_date", default="2025-01-01", help="Start date (YYYY-MM-DD)")
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
 @click.option("--rate", default=0.5, help="Seconds between requests")
 @click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
-def fetch(hex_code, tail_number, source, start_date, end_date, rate, db_path):
+def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate, db_path):
     """Download trace data from ADS-B data sources."""
     hex_code = _resolve_hex(hex_code, tail_number)
 
@@ -74,7 +75,14 @@ def fetch(hex_code, tail_number, source, start_date, end_date, rate, db_path):
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date) if end_date else date.today()
 
-    console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
+    if custom_url:
+        # Register custom URL as a source
+        source_name = custom_url.split("//")[1].split("/")[0].replace(".", "_")
+        SOURCE_URLS[source_name] = custom_url
+        source = source_name
+        console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{custom_url}[/]")
+    else:
+        console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
 
     if source == "opensky":
         stats = fetch_traces_opensky(db, config, hex_code, start, end)

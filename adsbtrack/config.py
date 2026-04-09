@@ -5,6 +5,9 @@ from pathlib import Path
 SOURCE_URLS = {
     "adsbx": "https://globe.adsbexchange.com/globe_history",
     "adsbfi": "https://globe.adsb.fi/globe_history",
+    "airplaneslive": "https://globe.airplanes.live/globe_history",
+    "adsblol": "https://adsb.lol/globe_history",
+    "theairtraffic": "https://globe.theairtraffic.com/globe_history",
 }
 
 

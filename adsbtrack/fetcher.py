@@ -16,6 +16,9 @@ from .db import Database
 _SOURCE_REFERERS = {
     "adsbx": "https://globe.adsbexchange.com/",
     "adsbfi": "https://globe.adsb.fi/",
+    "airplaneslive": "https://globe.airplanes.live/",
+    "adsblol": "https://adsb.lol/",
+    "theairtraffic": "https://globe.theairtraffic.com/",
 }
 
 
@@ -43,6 +46,18 @@ def date_range(start: date, end: date) -> list[date]:
     return days
 
 
+def _referer_for_source(source: str) -> str:
+    """Derive a referer URL from the source name or its base URL."""
+    if source in _SOURCE_REFERERS:
+        return _SOURCE_REFERERS[source]
+    if source in SOURCE_URLS:
+        # Extract origin from base URL: https://globe.example.com/globe_history -> https://globe.example.com/
+        base = SOURCE_URLS[source]
+        parts = base.split("/")
+        return "/".join(parts[:3]) + "/"
+    return f"https://{source}/"
+
+
 def fetch_traces(db: Database, config: Config, hex_code: str,
                  start_date: date, end_date: date,
                  source: str = "adsbx") -> dict:
@@ -68,7 +83,7 @@ def fetch_traces(db: Database, config: Config, hex_code: str,
         "dnt": "1",
         "pragma": "no-cache",
         "priority": "u=1, i",
-        "referer": _SOURCE_REFERERS.get(source, f"https://{source}/") + f"?icao={hex_code}",
+        "referer": _referer_for_source(source) + f"?icao={hex_code}",
         "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Brave";v="146"',
         "sec-ch-ua-mobile": "?0",
         "sec-ch-ua-platform": '"macOS"',

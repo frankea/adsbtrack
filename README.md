@@ -1,12 +1,12 @@
 # adsbtrack
 
-Pull historical ADS-B trace data from [ADS-B Exchange](https://globe.adsbexchange.com/) and turn it into a structured flight history for any aircraft. Give it an ICAO hex code and a date range and it will fetch every day of trace data, extract individual flights, match takeoff/landing coordinates to airports, and give you travel pattern statistics.
+Pull historical ADS-B trace data from multiple tracking networks and turn it into a structured flight history for any aircraft. Give it an ICAO hex code and a date range and it will fetch every day of trace data, extract individual flights, match takeoff/landing coordinates to airports, and give you travel pattern statistics.
 
 Built for OSINT and aviation nerds who want to go beyond live tracking and dig into where an aircraft has actually been over months or years.
 
 ## What it does
 
-1. **Fetch** - Downloads daily trace files from the ADS-B Exchange globe_history endpoint
+1. **Fetch** - Downloads daily trace files from any readsb-based tracking network
 2. **Extract** - Parses raw trace points into discrete flights (takeoff/landing detection, ground speed hysteresis filtering)
 3. **Match** - Matches takeoff/landing coordinates to the nearest airport using the OurAirports database
 4. **Analyze** - Shows flight history, top airports, and database statistics
@@ -170,13 +170,32 @@ uv run python -m adsbtrack.cli links --hex a66ad3
 
 ## Multiple data sources
 
-Fetch from adsb.fi for additional coverage from a different receiver network:
+Fetch from different receiver networks for better coverage. All sources use the same [readsb](https://github.com/wiedehopf/readsb) globe_history format:
 
 ```
 uv run python -m adsbtrack.cli fetch --hex a66ad3 --source adsbfi --start 2020-01-01
+uv run python -m adsbtrack.cli fetch --hex a66ad3 --source airplaneslive --start 2020-01-01
 ```
 
-Traces from multiple sources are automatically merged during flight extraction. Supported sources: `adsbx` (default), `adsbfi`.
+Traces from multiple sources are automatically merged during flight extraction.
+
+Supported sources:
+
+| Source | Flag | Network |
+|--------|------|---------|
+| [ADS-B Exchange](https://globe.adsbexchange.com/) | `--source adsbx` | Default |
+| [adsb.fi](https://globe.adsb.fi/) | `--source adsbfi` | |
+| [airplanes.live](https://globe.airplanes.live/) | `--source airplaneslive` | |
+| [adsb.lol](https://adsb.lol/) | `--source adsblol` | |
+| [TheAirTraffic](https://globe.theairtraffic.com/) | `--source theairtraffic` | |
+| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires API credentials |
+| Custom | `--url <base_url>` | Any readsb instance |
+
+You can also point at any readsb-compatible instance with `--url`:
+
+```
+uv run python -m adsbtrack.cli fetch --hex a66ad3 --url https://your-instance/globe_history
+```
 
 ## Database schema
 
@@ -187,7 +206,7 @@ All data is stored in a local SQLite database (`adsbtrack.db`).
 |--------|------|-------------|
 | icao | TEXT | ICAO hex code |
 | date | TEXT | Date (YYYY-MM-DD) |
-| source | TEXT | Data source (adsbx, adsbfi) |
+| source | TEXT | Data source (adsbx, adsbfi, airplaneslive, etc.) |
 | registration | TEXT | Tail number from trace metadata |
 | description | TEXT | Aircraft type |
 | owner_operator | TEXT | Owner from trace metadata |
@@ -228,5 +247,5 @@ All data is stored in a local SQLite database (`adsbtrack.db`).
 ## Notes
 
 - Data availability depends on ADS-B receiver coverage. Flights over oceans or remote areas may have gaps.
-- The globe_history endpoint serves the same data as the "previous day" button in the ADS-B Exchange web UI.
+- All readsb-based sources (adsbx, adsbfi, airplanes.live, adsb.lol, theairtraffic) use the same globe_history endpoint format. Different networks have different receiver coverage, so fetching from multiple sources gives the best results.
 - Rate limiting is adaptive - if the server returns 429, the delay between requests automatically increases and then gradually recovers after consecutive successes.

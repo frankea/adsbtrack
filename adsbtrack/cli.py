@@ -45,7 +45,7 @@ def _resolve_hex(hex_code: str | None, tail_number: str | None) -> str:
         except ValueError as e:
             raise click.BadParameter(str(e), param_hint="--tail")
         console.print(f"[dim]Converted {tail_number} to hex {hex_code}[/]")
-    return hex_code
+    return hex_code.lower()
 
 
 @click.group()
@@ -109,6 +109,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
 @click.option("--cookies", default="cookies.json")
 def extract(hex_code, reprocess, db_path, cookies):
     """Process raw traces into flights."""
+    hex_code = hex_code.lower()
     db, config = get_db_and_config(db_path, cookies)
     ensure_airports(db, config)
 
@@ -125,6 +126,7 @@ def extract(hex_code, reprocess, db_path, cookies):
 @click.option("--db", "db_path", default="adsbtrack.db")
 def trips(hex_code, from_date, to_date, airport, db_path):
     """Show flight history."""
+    hex_code = hex_code.lower()
     db, _ = get_db_and_config(db_path, "cookies.json")
     flights = db.get_flights(hex_code, from_date, to_date, airport)
 
@@ -171,6 +173,7 @@ def trips(hex_code, from_date, to_date, airport, db_path):
 @click.option("--db", "db_path", default="adsbtrack.db")
 def status(hex_code, db_path):
     """Show database statistics."""
+    hex_code = hex_code.lower()
     db, _ = get_db_and_config(db_path, "cookies.json")
 
     total_fetched = db.get_total_days_fetched(hex_code)

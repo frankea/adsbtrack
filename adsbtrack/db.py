@@ -54,12 +54,15 @@ CREATE TABLE IF NOT EXISTS flights (
     duration_minutes REAL,
     callsign TEXT,
     landing_type TEXT DEFAULT 'unknown',
+    takeoff_type TEXT DEFAULT 'unknown',
     takeoff_confidence REAL,
     landing_confidence REAL,
     data_points INTEGER,
     sources TEXT,
     max_altitude INTEGER,
     ground_points_at_landing INTEGER,
+    ground_points_at_takeoff INTEGER,
+    baro_error_points INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -171,16 +174,20 @@ def _migrate_add_source(conn: sqlite3.Connection, db_path: Path):
 
 
 def _needs_quality_migration(conn: sqlite3.Connection) -> bool:
-    """Check if flight quality columns are missing from flights."""
+    """Check if any quality columns are missing from flights. The migration
+    itself is idempotent per column, so we can safely run it whenever the
+    latest column is missing."""
     cols = conn.execute("PRAGMA table_info(flights)").fetchall()
     if not cols:
         return False
     col_names = {row[1] for row in cols}
-    return "landing_type" not in col_names
+    # Check for the most recently added column
+    return "takeoff_type" not in col_names
 
 
 def _migrate_add_quality_columns(conn: sqlite3.Connection):
-    """Add flight quality metadata columns."""
+    """Add flight quality metadata columns. Idempotent - safe to run on
+    databases at any stage of the migration history."""
     new_columns = [
         ("landing_type", "TEXT DEFAULT 'unknown'"),
         ("takeoff_confidence", "REAL"),
@@ -189,6 +196,10 @@ def _migrate_add_quality_columns(conn: sqlite3.Connection):
         ("sources", "TEXT"),
         ("max_altitude", "INTEGER"),
         ("ground_points_at_landing", "INTEGER"),
+        # Debug/scoring columns added in v2
+        ("takeoff_type", "TEXT DEFAULT 'unknown'"),
+        ("ground_points_at_takeoff", "INTEGER"),
+        ("baro_error_points", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
         try:
@@ -292,9 +303,10 @@ class Database:
                 origin_icao, origin_name, origin_distance_km,
                 destination_icao, destination_name, destination_distance_km,
                 duration_minutes, callsign,
-                landing_type, takeoff_confidence, landing_confidence,
-                data_points, sources, max_altitude, ground_points_at_landing)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                landing_type, takeoff_type, takeoff_confidence, landing_confidence,
+                data_points, sources, max_altitude,
+                ground_points_at_landing, ground_points_at_takeoff, baro_error_points)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -314,12 +326,15 @@ class Database:
                 flight.duration_minutes,
                 flight.callsign,
                 flight.landing_type,
+                flight.takeoff_type,
                 flight.takeoff_confidence,
                 flight.landing_confidence,
                 flight.data_points,
                 flight.sources,
                 flight.max_altitude,
                 flight.ground_points_at_landing,
+                flight.ground_points_at_takeoff,
+                flight.baro_error_points,
             ),
         )
 

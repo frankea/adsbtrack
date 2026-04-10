@@ -3,28 +3,60 @@ from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
 from .airports import find_nearest_airport
-from .classifier import FlightMetrics, classify_landing, score_confidence
+from .classifier import (
+    FlightMetrics,
+    classify_ground_state,
+    classify_landing,
+    score_confidence,
+)
 from .config import Config
 from .db import Database
 from .models import Flight
 
-# Max gap between trace days before we reset state.
-# If data is sparse (monthly samples), a flight "spanning" months is an artifact.
-MAX_DAY_GAP = timedelta(days=2)
 
-# Minimum duration to consider a valid flight (filters taxi movements)
-MIN_FLIGHT_MINUTES = 5.0
+def _extract_point_fields(point: list) -> tuple[int | str | None, float | None, dict | None, int | None, float | None]:
+    """Return (baro_alt, gs, detail_dict, geom_alt, baro_rate) from a trace point.
 
-# Deduplication thresholds for merging multi-source trace points
-_DEDUP_TIME_SECS = 2.0
-_DEDUP_DEG = 0.001
+    Trace point layout (readsb globe_history format):
+      0: time_offset (seconds since day_timestamp)
+      1: lat
+      2: lon
+      3: baro_alt (int feet or the string 'ground')
+      4: ground speed (knots)
+      5: track
+      6: flags
+      7: baro vertical rate (ft/min, signed)
+      8: detail object (dict) or None
+      9: source tag
+     10: geom altitude (feet)
+     11: geom vertical rate
+     12-13: reserved
+
+    Older formats may have 7-9 elements; be defensive.
+    """
+    baro_alt = point[3]
+    gs = point[4] if len(point) > 4 else None
+
+    detail = None
+    if len(point) > 8 and isinstance(point[8], dict):
+        detail = point[8]
+
+    baro_rate = None
+    if len(point) > 7 and isinstance(point[7], (int, float)):
+        baro_rate = float(point[7])
+
+    geom_alt = None
+    if len(point) > 10 and isinstance(point[10], (int, float)):
+        geom_alt = int(point[10])
+
+    return baro_alt, gs, detail, geom_alt, baro_rate
 
 
-def _merge_trace_rows(rows: list) -> tuple[str, float, list, set[str]]:
+def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set[str]]:
     """Merge multiple trace_day rows for the same date from different sources.
 
     Converts relative offsets to absolute timestamps, concatenates, sorts,
-    deduplicates (points within 2 seconds and 0.001 degrees are duplicates),
+    deduplicates (points within dedup_time_secs and dedup_deg are duplicates),
     then converts back to offsets from the earliest timestamp.
 
     Returns (date, base_timestamp, merged_trace, source_names).
@@ -56,11 +88,11 @@ def _merge_trace_rows(rows: list) -> tuple[str, float, list, set[str]]:
         lon = point[2]
         if (
             prev_ts is not None
-            and abs(abs_ts - prev_ts) < _DEDUP_TIME_SECS
+            and abs(abs_ts - prev_ts) < config.dedup_time_secs
             and prev_lat is not None
             and prev_lon is not None
-            and abs(lat - prev_lat) < _DEDUP_DEG
-            and abs(lon - prev_lon) < _DEDUP_DEG
+            and abs(lat - prev_lat) < config.dedup_deg
+            and abs(lon - prev_lon) < config.dedup_deg
         ):
             continue
         merged.append((abs_ts, point))
@@ -87,6 +119,13 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     if not trace_days:
         return 0
 
+    # Figure out the aircraft type for endurance lookup
+    type_code = None
+    for row in trace_days:
+        if row["type_code"]:
+            type_code = row["type_code"]
+            break
+
     # Group by date and merge multi-source rows
     by_date: dict[str, list] = defaultdict(list)
     for row in trace_days:
@@ -95,37 +134,51 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     merged_days = []
     all_sources: set[str] = set()
     for day_date in sorted(by_date.keys()):
-        date_str, base_ts, trace, day_sources = _merge_trace_rows(by_date[day_date])
+        date_str, base_ts, trace, day_sources = _merge_trace_rows(by_date[day_date], config)
         merged_days.append((date_str, base_ts, trace))
         all_sources |= day_sources
 
+    max_day_gap = timedelta(days=config.max_day_gap_days)
+    max_point_gap_secs = config.max_point_gap_minutes * 60.0
+    post_landing_window_secs = config.post_landing_window_secs
+    post_landing_max_points = config.post_landing_max_points
+
     flights: list[Flight] = []
     metrics_list: list[FlightMetrics] = []
-    state = None  # None = unknown, "ground" or "airborne"
-    prev_ground_point = None
+
+    # State machine variables
+    state: str | None = None  # None / "ground" / "airborne" / "post_landing"
+    prev_ground_point = None  # (lat, lon, abs_time, day_date)
     pending_flight: Flight | None = None
     pending_metrics: FlightMetrics | None = None
-    current_callsign = None
-    prev_day_date = None
-    _prev_was_ground = False  # for gs=None hysteresis (require 2 consecutive ground points)
-    ground_count_before_takeoff = 0  # track ground points in current ground state
+    current_callsign: str | None = None
+    prev_day_date: str | None = None
+    ground_count_before_takeoff = 0
+    prev_point_ts: float | None = None
+    post_landing_start_ts: float | None = None
+
+    def _close_pending(reason: str) -> None:
+        """Finalize the current pending flight (if any) and reset state variables."""
+        nonlocal pending_flight, pending_metrics, state, prev_ground_point
+        nonlocal ground_count_before_takeoff, post_landing_start_ts
+        if pending_flight is not None:
+            flights.append(pending_flight)
+            metrics_list.append(pending_metrics or FlightMetrics())
+        pending_flight = None
+        pending_metrics = None
+        state = None
+        prev_ground_point = None
+        ground_count_before_takeoff = 0
+        post_landing_start_ts = None
 
     for day_date, day_timestamp, trace in merged_days:
-        # Reset state if there's a gap between trace days
+        # Reset state on large cross-day gap
         if prev_day_date is not None:
             prev = datetime.fromisoformat(prev_day_date)
             curr = datetime.fromisoformat(day_date)
-            if curr - prev > MAX_DAY_GAP:
-                # Save incomplete flight if any
-                if pending_flight:
-                    flights.append(pending_flight)
-                    metrics_list.append(pending_metrics or FlightMetrics())
-                    pending_flight = None
-                    pending_metrics = None
-                state = None
-                prev_ground_point = None
-                _prev_was_ground = False
-                ground_count_before_takeoff = 0
+            if curr - prev > max_day_gap:
+                _close_pending("day_gap")
+                prev_point_ts = None
 
         prev_day_date = day_date
 
@@ -133,18 +186,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             time_offset = point[0]
             lat = point[1]
             lon = point[2]
-            alt = point[3]
-            gs = point[4]  # ground speed in knots
-
-            # Detail object location varies by format version:
-            #   len 14 (current): index 8
-            #   len 9 (old):      index 8
-            #   len 7-8 (oldest): no detail object
-            detail = None
-            for idx in (8,):
-                if len(point) > idx and isinstance(point[idx], dict):
-                    detail = point[idx]
-                    break
+            baro_alt, gs, detail, geom_alt, baro_rate = _extract_point_fields(point)
+            abs_ts = day_timestamp + time_offset
+            abs_time = datetime.fromtimestamp(abs_ts, tz=UTC)
 
             # Update callsign from detail object when present
             if detail:
@@ -152,24 +196,52 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 if flight_id:
                     current_callsign = flight_id
 
-            is_ground = alt == "ground"
-            abs_time = datetime.fromtimestamp(day_timestamp + time_offset, tz=UTC)
+            # Intra-trace gap check: any gap longer than max_point_gap_minutes
+            # forces a flight close. Real operations rarely have more than a
+            # few minutes between trace points; multi-hour gaps are coverage
+            # holes that the state machine should not stitch across.
+            if prev_point_ts is not None and (abs_ts - prev_point_ts) > max_point_gap_secs:
+                _close_pending("intra_trace_gap")
+            prev_point_ts = abs_ts
 
-            # Record metrics for pending flight
-            if pending_metrics:
+            # Classify the point using baro + geom altitude fusion
+            point_state, point_reason = classify_ground_state(
+                baro_alt,
+                geom_alt,
+                gs,
+                landing_speed_threshold=config.landing_speed_threshold_kts,
+                baro_error_geom_threshold=config.baro_error_geom_threshold_ft,
+            )
+
+            # Record metrics for pending flight (all points, including ground)
+            if pending_metrics is not None:
                 pending_metrics.record_point(
-                    alt, gs, lat, lon,
-                    is_ground=is_ground,
-                    state=state,
+                    baro_alt=baro_alt,
+                    geom_alt=geom_alt,
+                    gs=gs,
+                    baro_rate=baro_rate,
+                    lat=lat,
+                    lon=lon,
+                    ts=abs_ts,
+                    ground_state=point_state,
+                    ground_reason=point_reason,
                     landing_speed_threshold=config.landing_speed_threshold_kts,
                 )
+
+            is_ground = point_state == "ground"
+            is_airborne = point_state == "airborne"
+
+            # ---- STATE TRANSITIONS ----
 
             if state is None:
                 if is_ground:
                     state = "ground"
                     prev_ground_point = (lat, lon, abs_time, day_date)
                     ground_count_before_takeoff += 1
-                else:
+                elif is_airborne:
+                    # First observed point is already airborne: this is a
+                    # "found_mid_flight" situation. Open a pending flight
+                    # so we can at least track signal loss.
                     state = "airborne"
                     pending_flight = Flight(
                         icao=hex_code,
@@ -180,79 +252,163 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                         callsign=current_callsign,
                     )
                     pending_metrics = FlightMetrics(sources=set(all_sources))
-                    pending_metrics.ground_points_at_takeoff = ground_count_before_takeoff
+                    pending_metrics.takeoff_type = "found_mid_flight"
+                    pending_metrics.ground_points_at_takeoff = 0
                     pending_metrics.record_point(
-                        alt, gs, lat, lon, is_ground=is_ground, state=state,
+                        baro_alt=baro_alt,
+                        geom_alt=geom_alt,
+                        gs=gs,
+                        baro_rate=baro_rate,
+                        lat=lat,
+                        lon=lon,
+                        ts=abs_ts,
+                        ground_state=point_state,
+                        ground_reason=point_reason,
                         landing_speed_threshold=config.landing_speed_threshold_kts,
                     )
                     ground_count_before_takeoff = 0
+                # else: unknown - leave state as None
                 continue
 
-            if state == "ground" and not is_ground:
-                # TAKEOFF - use previous ground point for airport location
-                state = "airborne"
-                _prev_was_ground = False
-                if prev_ground_point:
-                    to_lat, to_lon, to_time, to_date = prev_ground_point
-                else:
-                    to_lat, to_lon, to_time, to_date = lat, lon, abs_time, day_date
+            if state == "ground":
+                if is_airborne:
+                    # TAKEOFF observed: use the previous ground point for the airport fix
+                    if prev_ground_point:
+                        to_lat, to_lon, to_time, to_date = prev_ground_point
+                    else:
+                        to_lat, to_lon, to_time, to_date = lat, lon, abs_time, day_date
 
-                pending_flight = Flight(
-                    icao=hex_code,
-                    takeoff_time=to_time,
-                    takeoff_lat=to_lat,
-                    takeoff_lon=to_lon,
-                    takeoff_date=to_date,
-                    callsign=current_callsign,
+                    state = "airborne"
+                    pending_flight = Flight(
+                        icao=hex_code,
+                        takeoff_time=to_time,
+                        takeoff_lat=to_lat,
+                        takeoff_lon=to_lon,
+                        takeoff_date=to_date,
+                        callsign=current_callsign,
+                    )
+                    pending_metrics = FlightMetrics(sources=set(all_sources))
+                    pending_metrics.takeoff_type = "observed"
+                    pending_metrics.ground_points_at_takeoff = ground_count_before_takeoff
+                    pending_metrics.record_point(
+                        baro_alt=baro_alt,
+                        geom_alt=geom_alt,
+                        gs=gs,
+                        baro_rate=baro_rate,
+                        lat=lat,
+                        lon=lon,
+                        ts=abs_ts,
+                        ground_state=point_state,
+                        ground_reason=point_reason,
+                        landing_speed_threshold=config.landing_speed_threshold_kts,
+                    )
+                    ground_count_before_takeoff = 0
+                elif is_ground:
+                    ground_count_before_takeoff += 1
+                    prev_ground_point = (lat, lon, abs_time, day_date)
+                # unknown point: ignore
+                continue
+
+            if state == "airborne":
+                if is_ground:
+                    # LANDING transition. Record the landing info and enter
+                    # post-landing mode to collect a few more ground points.
+                    if pending_metrics is not None:
+                        pending_metrics.record_landing_ground_point(lat, lon)
+                    if pending_flight is not None:
+                        pending_flight.landing_time = abs_time
+                        pending_flight.landing_lat = lat
+                        pending_flight.landing_lon = lon
+                        pending_flight.landing_date = day_date
+                        if pending_flight.landing_time and pending_flight.takeoff_time:
+                            delta = (pending_flight.landing_time - pending_flight.takeoff_time).total_seconds()
+                            pending_flight.duration_minutes = round(delta / 60, 1)
+                    state = "post_landing"
+                    post_landing_start_ts = abs_ts
+                    prev_ground_point = (lat, lon, abs_time, day_date)
+                # else: still airborne or unknown - nothing to do
+                continue
+
+            if state == "post_landing":
+                window_expired = (
+                    post_landing_start_ts is not None
+                    and (abs_ts - post_landing_start_ts) > post_landing_window_secs
                 )
-                pending_metrics = FlightMetrics(sources=set(all_sources))
-                pending_metrics.ground_points_at_takeoff = ground_count_before_takeoff
-                pending_metrics.record_point(
-                    alt, gs, lat, lon, is_ground=is_ground, state=state,
-                    landing_speed_threshold=config.landing_speed_threshold_kts,
+                count_expired = (
+                    pending_metrics is not None
+                    and pending_metrics.ground_points_at_landing >= post_landing_max_points
                 )
-                ground_count_before_takeoff = 0
 
-            elif state == "airborne" and is_ground:
-                # Possible LANDING - check ground speed for hysteresis
-                if gs is not None and gs > config.landing_speed_threshold_kts:
-                    continue
-                # When ground speed is unavailable (e.g. OpenSky data), require
-                # consecutive ground points to avoid false landings from momentary
-                # altitude glitches. We peek ahead by deferring the state change
-                # until we see a second ground point.
-                if gs is None and not _prev_was_ground:
-                    _prev_was_ground = True
-                    continue
-                _prev_was_ground = False
-
-                # Record landing ground point in metrics
-                if pending_metrics:
-                    pending_metrics.record_landing_ground_point(lat, lon)
-
-                state = "ground"
-                ground_count_before_takeoff = 1  # this ground point counts for next takeoff
-                if pending_flight:
-                    pending_flight.landing_time = abs_time
-                    pending_flight.landing_lat = lat
-                    pending_flight.landing_lon = lon
-                    pending_flight.landing_date = day_date
-                    if pending_flight.landing_time and pending_flight.takeoff_time:
-                        delta = (pending_flight.landing_time - pending_flight.takeoff_time).total_seconds()
-                        pending_flight.duration_minutes = round(delta / 60, 1)
-                    flights.append(pending_flight)
-                    metrics_list.append(pending_metrics or FlightMetrics())
+                if is_airborne:
+                    # Aircraft took off again right after landing (touch and
+                    # go or quick stop). Close the current flight and start a
+                    # new pending flight immediately.
+                    finalized_flight = pending_flight
+                    finalized_metrics = pending_metrics
                     pending_flight = None
                     pending_metrics = None
+                    if finalized_flight is not None:
+                        flights.append(finalized_flight)
+                        metrics_list.append(finalized_metrics or FlightMetrics())
 
-            elif state == "ground" and is_ground:
-                ground_count_before_takeoff += 1
+                    state = "airborne"
+                    if prev_ground_point:
+                        to_lat, to_lon, to_time, to_date = prev_ground_point
+                    else:
+                        to_lat, to_lon, to_time, to_date = lat, lon, abs_time, day_date
+                    pending_flight = Flight(
+                        icao=hex_code,
+                        takeoff_time=to_time,
+                        takeoff_lat=to_lat,
+                        takeoff_lon=to_lon,
+                        takeoff_date=to_date,
+                        callsign=current_callsign,
+                    )
+                    pending_metrics = FlightMetrics(sources=set(all_sources))
+                    pending_metrics.takeoff_type = "observed"
+                    pending_metrics.ground_points_at_takeoff = 1
+                    pending_metrics.record_point(
+                        baro_alt=baro_alt,
+                        geom_alt=geom_alt,
+                        gs=gs,
+                        baro_rate=baro_rate,
+                        lat=lat,
+                        lon=lon,
+                        ts=abs_ts,
+                        ground_state=point_state,
+                        ground_reason=point_reason,
+                        landing_speed_threshold=config.landing_speed_threshold_kts,
+                    )
+                    ground_count_before_takeoff = 0
+                    post_landing_start_ts = None
+                    continue
 
-            if is_ground:
-                prev_ground_point = (lat, lon, abs_time, day_date)
+                if is_ground:
+                    # Collect another post-landing ground point
+                    if pending_metrics is not None:
+                        pending_metrics.record_landing_ground_point(lat, lon)
+                    prev_ground_point = (lat, lon, abs_time, day_date)
 
-    # Handle flight still in progress at end of data
-    if pending_flight:
+                if window_expired or count_expired:
+                    # Finalize the landing and fall back to ground state.
+                    # Remember the ground-point count before clearing metrics
+                    # so the next takeoff's ground_count_before_takeoff reflects
+                    # the points we collected during the post-landing window.
+                    pre_clear_gp = (
+                        pending_metrics.ground_points_at_landing if pending_metrics else 1
+                    )
+                    if pending_flight is not None:
+                        flights.append(pending_flight)
+                        metrics_list.append(pending_metrics or FlightMetrics())
+                    pending_flight = None
+                    pending_metrics = None
+                    state = "ground"
+                    ground_count_before_takeoff = max(1, pre_clear_gp)
+                    post_landing_start_ts = None
+                    continue
+
+    # End of all trace days: flush any pending flight
+    if pending_flight is not None:
         flights.append(pending_flight)
         metrics_list.append(pending_metrics or FlightMetrics())
 
@@ -260,16 +416,15 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     valid_flights = []
     valid_metrics = []
     for flight, metrics in zip(flights, metrics_list):
-        # Skip very short movements at the same location (taxi, ground tests)
         if (
             flight.duration_minutes is not None
-            and flight.duration_minutes < MIN_FLIGHT_MINUTES
+            and flight.duration_minutes < config.min_flight_minutes
             and flight.landing_lat is not None
         ):
             from .airports import haversine_km
 
             dist = haversine_km(flight.takeoff_lat, flight.takeoff_lon, flight.landing_lat, flight.landing_lon)
-            if dist < 5:  # Less than 5km traveled - not a real flight
+            if dist < config.min_flight_distance_km:
                 continue
         valid_flights.append(flight)
         valid_metrics.append(metrics)
@@ -278,30 +433,31 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     for flight, metrics in zip(valid_flights, valid_metrics):
         has_landing = flight.landing_lat is not None
 
-        # Classify landing type. Pass duration so the classifier can reject
-        # "landings" spanning data gaps (flights longer than max endurance).
+        flight.takeoff_type = metrics.takeoff_type
+
         flight.landing_type = classify_landing(
             metrics,
             has_landing,
             duration_minutes=flight.duration_minutes,
-            max_endurance_minutes=config.max_endurance_minutes,
+            type_code=type_code,
+            type_endurance_minutes=config.type_endurance_minutes,
+            default_endurance_minutes=config.max_endurance_minutes,
         )
 
-        # Match airports (skip destination for signal_lost flights)
+        # Match airports (skip destination for signal_lost / dropped_on_approach)
         origin = find_nearest_airport(db, flight.takeoff_lat, flight.takeoff_lon, config)
         if origin:
             flight.origin_icao = origin.ident
             flight.origin_name = origin.name
             flight.origin_distance_km = origin.distance_km
 
-        if has_landing and flight.landing_type != "signal_lost":
+        if has_landing and flight.landing_type not in ("signal_lost", "dropped_on_approach"):
             dest = find_nearest_airport(db, flight.landing_lat, flight.landing_lon, config)
             if dest:
                 flight.destination_icao = dest.ident
                 flight.destination_name = dest.name
                 flight.destination_distance_km = dest.distance_km
 
-        # Score confidence
         takeoff_conf, landing_conf = score_confidence(
             metrics,
             has_landing,
@@ -313,11 +469,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flight.takeoff_confidence = takeoff_conf
         flight.landing_confidence = landing_conf
 
-        # Store metrics summary
         flight.data_points = metrics.data_points
         flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
         flight.max_altitude = metrics.max_altitude if metrics.max_altitude > 0 else None
         flight.ground_points_at_landing = metrics.ground_points_at_landing
+        flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
+        flight.baro_error_points = metrics.baro_error_points
 
         db.insert_flight(flight)
 

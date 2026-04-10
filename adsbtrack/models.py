@@ -22,13 +22,16 @@ class Flight:
     duration_minutes: float | None = None
     callsign: str | None = None
     # Flight quality metadata
-    landing_type: str = "unknown"  # confirmed, signal_lost, uncertain, altitude_error
+    landing_type: str = "unknown"  # confirmed, signal_lost, dropped_on_approach, uncertain, altitude_error
+    takeoff_type: str = "unknown"  # observed, found_mid_flight
     takeoff_confidence: float | None = None
     landing_confidence: float | None = None
     data_points: int | None = None
     sources: str | None = None  # comma-separated source names
     max_altitude: int | None = None
     ground_points_at_landing: int | None = None
+    ground_points_at_takeoff: int | None = None
+    baro_error_points: int | None = None  # count of points where baro said ground but geom disagreed
 
 
 @dataclass

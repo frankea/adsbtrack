@@ -98,10 +98,20 @@ def _descent_trend(altitudes: list[int]) -> float:
     return 1.0  # climbing
 
 
-def classify_landing(metrics: FlightMetrics, has_landing: bool) -> str:
+def classify_landing(
+    metrics: FlightMetrics,
+    has_landing: bool,
+    duration_minutes: float | None = None,
+    max_endurance_minutes: float = 240.0,
+) -> str:
     """Classify how a flight ended.
 
     Returns one of: 'confirmed', 'signal_lost', 'uncertain', 'altitude_error'.
+
+    duration_minutes and max_endurance_minutes are used to catch false
+    "confirmed" landings caused by data gaps: if a flight's duration exceeds
+    the aircraft's typical maximum endurance, it is almost certainly a
+    state-machine artifact spanning a coverage gap, not a real flight.
     """
     # Check for altitude encoding errors first (Bell 407 problem)
     if metrics.data_points >= 10:
@@ -119,7 +129,18 @@ def classify_landing(metrics: FlightMetrics, has_landing: bool) -> str:
             return "signal_lost"
         if last_gs is not None and last_gs > 100:
             return "signal_lost"
+        # Reached cruise altitude at any point during the flight - must be
+        # signal loss even if the final recorded point was lower, because
+        # a plane that actually descended and landed would have produced a
+        # landing transition.
+        if metrics.max_altitude > 3000:
+            return "signal_lost"
 
+        return "uncertain"
+
+    # Duration sanity check: a "landing" after a flight longer than the
+    # aircraft's max endurance is a data-gap artifact, not a real landing.
+    if duration_minutes is not None and duration_minutes > max_endurance_minutes:
         return "uncertain"
 
     # Flight has landing data - score it

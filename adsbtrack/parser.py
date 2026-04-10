@@ -278,8 +278,14 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     for flight, metrics in zip(valid_flights, valid_metrics):
         has_landing = flight.landing_lat is not None
 
-        # Classify landing type
-        flight.landing_type = classify_landing(metrics, has_landing)
+        # Classify landing type. Pass duration so the classifier can reject
+        # "landings" spanning data gaps (flights longer than max endurance).
+        flight.landing_type = classify_landing(
+            metrics,
+            has_landing,
+            duration_minutes=flight.duration_minutes,
+            max_endurance_minutes=config.max_endurance_minutes,
+        )
 
         # Match airports (skip destination for signal_lost flights)
         origin = find_nearest_airport(db, flight.takeoff_lat, flight.takeoff_lon, config)

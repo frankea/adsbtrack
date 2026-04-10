@@ -1,6 +1,8 @@
 __pycache__/
 *.pyc
 *.db
+*.db-wal
+*.db-shm
 *.db.bak
 cookies.json
 credentials.json

@@ -200,8 +200,16 @@ def _migrate_add_quality_columns(conn: sqlite3.Connection):
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path)
+        # timeout is the builtin sqlite3 driver's lock wait; we also set
+        # PRAGMA busy_timeout below for safety. WAL mode allows multiple
+        # concurrent readers plus a single writer without blocking, which
+        # makes running multiple `adsbtrack fetch` sessions in parallel
+        # terminals work without "database is locked" errors.
+        self.conn = sqlite3.connect(db_path, timeout=30.0)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA journal_mode = WAL")
+        self.conn.execute("PRAGMA synchronous = NORMAL")
+        self.conn.execute("PRAGMA busy_timeout = 30000")
         # Migrate existing databases that lack the source column
         if _needs_source_migration(self.conn):
             _migrate_add_source(self.conn, db_path)

@@ -21,3 +21,4 @@ class Config:
     airport_match_threshold_km: float = 10.0
     airport_types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")
     landing_speed_threshold_kts: float = 80.0  # ground speed above which a "ground" alt reading is ignored
+    max_endurance_minutes: float = 240.0  # flights longer than this are data-gap artifacts, not real landings

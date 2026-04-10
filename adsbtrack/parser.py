@@ -156,11 +156,15 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     ground_count_before_takeoff = 0
     prev_point_ts: float | None = None
     post_landing_start_ts: float | None = None
+    # OpenSky data lacks ground speed. When gs is None, require two
+    # consecutive ground points before landing: the first sets this flag
+    # and is otherwise ignored; the second confirms the transition.
+    prev_was_ground_no_gs = False
 
     def _close_pending(reason: str) -> None:
         """Finalize the current pending flight (if any) and reset state variables."""
         nonlocal pending_flight, pending_metrics, state, prev_ground_point
-        nonlocal ground_count_before_takeoff, post_landing_start_ts
+        nonlocal ground_count_before_takeoff, post_landing_start_ts, prev_was_ground_no_gs
         if pending_flight is not None:
             flights.append(pending_flight)
             metrics_list.append(pending_metrics or FlightMetrics())
@@ -170,6 +174,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         prev_ground_point = None
         ground_count_before_takeoff = 0
         post_landing_start_ts = None
+        prev_was_ground_no_gs = False
 
     for day_date, day_timestamp, trace in merged_days:
         # Reset state on large cross-day gap
@@ -311,6 +316,15 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
             if state == "airborne":
                 if is_ground:
+                    # OpenSky hysteresis: when gs is None we require two
+                    # consecutive ground points to confirm a landing, because
+                    # single-point altitude glitches without a speed signal
+                    # are too risky to trust.
+                    if gs is None and not prev_was_ground_no_gs:
+                        prev_was_ground_no_gs = True
+                        continue
+                    prev_was_ground_no_gs = False
+
                     # LANDING transition. Record the landing info and enter
                     # post-landing mode to collect a few more ground points.
                     if pending_metrics is not None:
@@ -326,7 +340,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     state = "post_landing"
                     post_landing_start_ts = abs_ts
                     prev_ground_point = (lat, lon, abs_time, day_date)
-                # else: still airborne or unknown - nothing to do
+                else:
+                    # Still airborne or unknown - reset the OpenSky hysteresis
+                    prev_was_ground_no_gs = False
                 continue
 
             if state == "post_landing":
@@ -415,7 +431,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # Filter and classify
     valid_flights = []
     valid_metrics = []
-    for flight, metrics in zip(flights, metrics_list):
+    for flight, metrics in zip(flights, metrics_list, strict=True):
         if (
             flight.duration_minutes is not None
             and flight.duration_minutes < config.min_flight_minutes
@@ -430,7 +446,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         valid_metrics.append(metrics)
 
     # Classify, score confidence, match airports, and save
-    for flight, metrics in zip(valid_flights, valid_metrics):
+    for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
         has_landing = flight.landing_lat is not None
 
         flight.takeoff_type = metrics.takeoff_type

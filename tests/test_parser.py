@@ -14,10 +14,15 @@ from adsbtrack.parser import extract_flights
 
 
 def _make_config() -> Config:
+    # Tests use synthetic traces with sparse points (often hours apart)
+    # that would trip the intra-trace gap splitter. Disable gap splitting
+    # by setting a huge threshold so these tests can exercise the state
+    # machine without also re-testing gap handling.
     return Config(
         landing_speed_threshold_kts=80.0,
         airport_match_threshold_km=10.0,
         airport_types=("large_airport", "medium_airport", "small_airport"),
+        max_point_gap_minutes=10_000.0,
     )
 
 

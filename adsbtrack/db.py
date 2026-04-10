@@ -1,3 +1,4 @@
+import contextlib
 import json
 import shutil
 import sqlite3
@@ -202,10 +203,9 @@ def _migrate_add_quality_columns(conn: sqlite3.Connection):
         ("baro_error_points", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
-        try:
+        # "column already exists" is expected when re-running the migration.
+        with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(f"ALTER TABLE flights ADD COLUMN {col_name} {col_type}")
-        except sqlite3.OperationalError:
-            pass  # column already exists
 
 
 class Database:

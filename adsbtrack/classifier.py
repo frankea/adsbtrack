@@ -176,10 +176,10 @@ def classify_ground_state(
     if baro_is_ground and geom_high:
         return ("airborne", "baro_error")
 
-    # Speed override: baro says ground but ground speed is taxi speed or higher.
-    # Could be a taxi (still ground) or an altitude encoding glitch mid-cruise.
-    # Treat as airborne if speed is clearly flight-speed (>= landing threshold).
-    if baro_is_ground and gs is not None and gs >= landing_speed_threshold:
+    # Speed override: baro says ground but ground speed is clearly above
+    # landing threshold. Strict greater-than so gs exactly at the threshold
+    # is still treated as a valid landing (matches historical behavior).
+    if baro_is_ground and gs is not None and gs > landing_speed_threshold:
         return ("airborne", "speed_override")
 
     # Strong ground: baro says ground (and no overriding signals)

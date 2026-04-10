@@ -155,6 +155,8 @@ def trips(hex_code, from_date, to_date, airport, db_path):
         table.add_column("To", style="green")
         table.add_column("Duration", style="yellow")
         table.add_column("Callsign", style="dim")
+        table.add_column("Conf", justify="right")
+        table.add_column("Type", style="dim")
 
         for f in flights:
             takeoff = f["takeoff_time"][:10] if f["takeoff_time"] else "?"
@@ -162,12 +164,16 @@ def trips(hex_code, from_date, to_date, airport, db_path):
             if f["origin_name"]:
                 origin = f"{f['origin_icao']} ({f['origin_name']})"
 
+            landing_type = f["landing_type"] or "unknown"
+
             if f["destination_icao"]:
                 dest = f"{f['destination_icao']} ({f['destination_name']})"
+            elif landing_type == "signal_lost":
+                dest = "[red]signal lost[/]"
             elif f["landing_lat"] is not None:
                 dest = f"({f['landing_lat']:.2f}, {f['landing_lon']:.2f})"
             else:
-                dest = "[dim]in flight?[/]"
+                dest = "[yellow]uncertain[/]"
 
             duration = ""
             if f["duration_minutes"]:
@@ -176,7 +182,30 @@ def trips(hex_code, from_date, to_date, airport, db_path):
                 duration = f"{hours}h {mins}m" if hours else f"{mins}m"
 
             callsign = f["callsign"] or ""
-            table.add_row(takeoff, origin, dest, duration, callsign)
+
+            # Confidence display
+            conf = f["landing_confidence"]
+            if conf is not None:
+                pct = int(conf * 100)
+                if conf >= 0.8:
+                    conf_str = f"[green]{pct}%[/]"
+                elif conf >= 0.5:
+                    conf_str = f"[yellow]{pct}%[/]"
+                else:
+                    conf_str = f"[red]{pct}%[/]"
+            else:
+                conf_str = "[dim]--[/]"
+
+            # Landing type display
+            type_display = {
+                "confirmed": "[green]OK[/]",
+                "signal_lost": "[red]SIG LOST[/]",
+                "uncertain": "[yellow]UNCERT[/]",
+                "altitude_error": "[red]ALT ERR[/]",
+                "unknown": "[dim]--[/]",
+            }.get(landing_type, "[dim]--[/]")
+
+            table.add_row(takeoff, origin, dest, duration, callsign, conf_str, type_display)
 
         console.print(table)
         console.print(f"\nTotal: {len(flights)} flights")
@@ -210,6 +239,23 @@ def status(hex_code, db_path):
         console.print(f"  Days checked:  {total_fetched}")
         console.print(f"  Days w/ data:  {days_with_data}")
         console.print(f"  Total flights: {flight_count}")
+
+        # Data quality summary
+        quality = db.get_flight_quality_summary(hex_code)
+        if quality and any(k != "unknown" for k in quality):
+            console.print("\n[bold]Data quality:[/]\n")
+            type_labels = {
+                "confirmed": ("green", "Confirmed landings"),
+                "signal_lost": ("red", "Signal lost"),
+                "uncertain": ("yellow", "Uncertain"),
+                "altitude_error": ("red", "Altitude errors"),
+                "unknown": ("dim", "Unclassified"),
+            }
+            for lt, (color, label) in type_labels.items():
+                if lt in quality:
+                    q = quality[lt]
+                    pct = q["count"] / flight_count * 100 if flight_count > 0 else 0
+                    console.print(f"  [{color}]{label}:{' ' * (20 - len(label))}{q['count']:>4} ({pct:.0f}%)[/]")
 
         if top_airports:
             console.print("\n[bold]Top airports:[/]\n")

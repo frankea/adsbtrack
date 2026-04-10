@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS flights (
     destination_distance_km REAL,
     duration_minutes REAL,
     callsign TEXT,
+    landing_type TEXT DEFAULT 'unknown',
+    takeoff_confidence REAL,
+    landing_confidence REAL,
+    data_points INTEGER,
+    sources TEXT,
+    max_altitude INTEGER,
+    ground_points_at_landing INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -163,6 +170,33 @@ def _migrate_add_source(conn: sqlite3.Connection, db_path: Path):
         raise
 
 
+def _needs_quality_migration(conn: sqlite3.Connection) -> bool:
+    """Check if flight quality columns are missing from flights."""
+    cols = conn.execute("PRAGMA table_info(flights)").fetchall()
+    if not cols:
+        return False
+    col_names = {row[1] for row in cols}
+    return "landing_type" not in col_names
+
+
+def _migrate_add_quality_columns(conn: sqlite3.Connection):
+    """Add flight quality metadata columns."""
+    new_columns = [
+        ("landing_type", "TEXT DEFAULT 'unknown'"),
+        ("takeoff_confidence", "REAL"),
+        ("landing_confidence", "REAL"),
+        ("data_points", "INTEGER"),
+        ("sources", "TEXT"),
+        ("max_altitude", "INTEGER"),
+        ("ground_points_at_landing", "INTEGER"),
+    ]
+    for col_name, col_type in new_columns:
+        try:
+            conn.execute(f"ALTER TABLE flights ADD COLUMN {col_name} {col_type}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
+
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -171,6 +205,9 @@ class Database:
         # Migrate existing databases that lack the source column
         if _needs_source_migration(self.conn):
             _migrate_add_source(self.conn, db_path)
+        # Migrate to add flight quality columns
+        if _needs_quality_migration(self.conn):
+            _migrate_add_quality_columns(self.conn)
         for stmt in _SCHEMA_STATEMENTS:
             self.conn.execute(stmt)
 
@@ -246,8 +283,10 @@ class Database:
                 landing_time, landing_lat, landing_lon, landing_date,
                 origin_icao, origin_name, origin_distance_km,
                 destination_icao, destination_name, destination_distance_km,
-                duration_minutes, callsign)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                duration_minutes, callsign,
+                landing_type, takeoff_confidence, landing_confidence,
+                data_points, sources, max_altitude, ground_points_at_landing)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -266,6 +305,13 @@ class Database:
                 flight.destination_distance_km,
                 flight.duration_minutes,
                 flight.callsign,
+                flight.landing_type,
+                flight.takeoff_confidence,
+                flight.landing_confidence,
+                flight.data_points,
+                flight.sources,
+                flight.max_altitude,
+                flight.ground_points_at_landing,
             ),
         )
 
@@ -289,6 +335,21 @@ class Database:
     def get_flight_count(self, icao: str) -> int:
         row = self.conn.execute("SELECT COUNT(*) as cnt FROM flights WHERE icao = ?", (icao,)).fetchone()
         return row["cnt"]
+
+    def get_flight_quality_summary(self, icao: str) -> dict:
+        """Return landing type counts and average confidence for an aircraft."""
+        rows = self.conn.execute(
+            """SELECT landing_type, COUNT(*) as cnt,
+                      AVG(landing_confidence) as avg_conf
+               FROM flights WHERE icao = ?
+               GROUP BY landing_type""",
+            (icao,),
+        ).fetchall()
+        summary = {}
+        for row in rows:
+            lt = row["landing_type"] or "unknown"
+            summary[lt] = {"count": row["cnt"], "avg_confidence": round(row["avg_conf"] or 0, 2)}
+        return summary
 
     def get_top_airports(self, icao: str, limit: int = 10) -> list[sqlite3.Row]:
         return self.conn.execute(

@@ -21,6 +21,14 @@ class Flight:
     destination_distance_km: float | None = None
     duration_minutes: float | None = None
     callsign: str | None = None
+    # Flight quality metadata
+    landing_type: str = "unknown"  # confirmed, signal_lost, uncertain, altitude_error
+    takeoff_confidence: float | None = None
+    landing_confidence: float | None = None
+    data_points: int | None = None
+    sources: str | None = None  # comma-separated source names
+    max_altitude: int | None = None
+    ground_points_at_landing: int | None = None
 
 
 @dataclass

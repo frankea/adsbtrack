@@ -247,7 +247,7 @@ def descent_score(
         for i, p in enumerate(recent):
             if p.baro_rate is None:
                 continue
-            w = (i + 1.0)
+            w = i + 1.0
             total_w += w
             acc += p.baro_rate * w
         if total_w == 0:

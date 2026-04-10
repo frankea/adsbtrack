@@ -347,12 +347,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
             if state == "post_landing":
                 window_expired = (
-                    post_landing_start_ts is not None
-                    and (abs_ts - post_landing_start_ts) > post_landing_window_secs
+                    post_landing_start_ts is not None and (abs_ts - post_landing_start_ts) > post_landing_window_secs
                 )
                 count_expired = (
-                    pending_metrics is not None
-                    and pending_metrics.ground_points_at_landing >= post_landing_max_points
+                    pending_metrics is not None and pending_metrics.ground_points_at_landing >= post_landing_max_points
                 )
 
                 if is_airborne:
@@ -410,9 +408,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     # Remember the ground-point count before clearing metrics
                     # so the next takeoff's ground_count_before_takeoff reflects
                     # the points we collected during the post-landing window.
-                    pre_clear_gp = (
-                        pending_metrics.ground_points_at_landing if pending_metrics else 1
-                    )
+                    pre_clear_gp = pending_metrics.ground_points_at_landing if pending_metrics else 1
                     if pending_flight is not None:
                         flights.append(pending_flight)
                         metrics_list.append(pending_metrics or FlightMetrics())

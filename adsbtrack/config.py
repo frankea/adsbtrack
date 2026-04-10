@@ -20,9 +20,9 @@ TYPE_ENDURANCE_MINUTES: dict[str, float] = {
     "EC30": 180.0,  # Airbus EC130
     "EC35": 180.0,  # Airbus EC135
     "EC45": 180.0,  # Airbus EC145
-    "S76":  210.0,  # Sikorsky S-76
-    "S92":  300.0,  # Sikorsky S-92 (oil-rig variant has extended range)
-    "H60":  180.0,  # UH-60 Black Hawk
+    "S76": 210.0,  # Sikorsky S-76
+    "S92": 300.0,  # Sikorsky S-92 (oil-rig variant has extended range)
+    "H60": 180.0,  # UH-60 Black Hawk
     # Light piston / turboprop
     "C150": 240.0,
     "C172": 240.0,

@@ -32,6 +32,13 @@ class Flight:
     ground_points_at_landing: int | None = None
     ground_points_at_takeoff: int | None = None
     baro_error_points: int | None = None  # count of points where baro said ground but geom disagreed
+    # Last observed position regardless of landing outcome. For confirmed
+    # landings this equals landing_*; for signal_lost / dropped_on_approach
+    # it is the last recorded trace point before coverage dropped.
+    last_seen_lat: float | None = None
+    last_seen_lon: float | None = None
+    last_seen_alt_ft: int | None = None
+    last_seen_time: datetime | None = None
 
 
 @dataclass

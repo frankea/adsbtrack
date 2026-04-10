@@ -2,7 +2,7 @@ import json
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
-from .airports import find_nearest_airport
+from .airports import find_nearest_airport, haversine_km
 from .classifier import (
     FlightMetrics,
     classify_ground_state,
@@ -109,6 +109,114 @@ def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set
         result_trace.append(new_point)
 
     return rows[0]["date"], base_timestamp, result_trace, source_names
+
+
+def _stitch_fragments(
+    flights: list[Flight],
+    metrics_list: list[FlightMetrics],
+    config: Config,
+) -> tuple[list[Flight], list[FlightMetrics]]:
+    """Merge signal_lost / dropped_on_approach fragments with the next
+    found_mid_flight fragment when they are plausibly the same continuous
+    flight with a receiver gap in the middle.
+
+    Merge criteria (all must pass):
+      1. Previous flight has no landing transition (landing_lat is None) AND
+         takeoff_type == "observed" OR has a last_seen position.
+      2. Next flight has takeoff_type == "found_mid_flight".
+      3. Time gap between prev.last_seen_time and next.takeoff_time is < config.stitch_max_gap_minutes.
+      4. Great-circle distance between prev.last_seen_* and next.takeoff_*
+         is less than time_gap * cruise_speed * slack.
+      5. Altitude difference between prev.last_seen_alt_ft and next's first
+         airborne altitude is less than config.stitch_max_alt_delta_ft.
+
+    Merging is destructive: the merged flight inherits prev.takeoff_* (if
+    observed) and next.last_*, and its metrics are taken from the next
+    fragment (since the classifier needs the tail of the trace). The
+    takeoff_type of the merged flight becomes "observed" if prev observed
+    its takeoff, otherwise "found_mid_flight".
+    """
+    if len(flights) < 2:
+        return flights, metrics_list
+
+    max_gap_secs = config.stitch_max_gap_minutes * 60.0
+    max_alt_delta = config.stitch_max_alt_delta_ft
+    cruise_speed_kt = config.stitch_cruise_speed_kts
+    slack = config.stitch_distance_slack
+
+    # kt -> km/h factor 1.852, and km/h * hours = km. We just need
+    # distance_km = knots * hours * 1.852.
+    def _plausible_distance_km(gap_secs: float) -> float:
+        return (gap_secs / 3600.0) * cruise_speed_kt * 1.852 * slack
+
+    merged: list[tuple[Flight, FlightMetrics]] = []
+    i = 0
+    pairs = list(zip(flights, metrics_list, strict=True))
+    while i < len(pairs):
+        flight, metrics = pairs[i]
+
+        # Only attempt to stitch if this flight ended without a landing
+        # transition (signal_lost-ish, may be classified later).
+        if i + 1 < len(pairs) and flight.landing_lat is None and metrics.last_seen_ts is not None:
+            next_flight, next_metrics = pairs[i + 1]
+
+            if next_metrics.takeoff_type == "found_mid_flight" and next_metrics.first_point_ts is not None:
+                gap_secs = next_metrics.first_point_ts - metrics.last_seen_ts
+                if 0 <= gap_secs <= max_gap_secs:
+                    # Distance check
+                    if metrics.last_seen_lat is not None and metrics.last_seen_lon is not None:
+                        dist_km = haversine_km(
+                            metrics.last_seen_lat,
+                            metrics.last_seen_lon,
+                            next_flight.takeoff_lat,
+                            next_flight.takeoff_lon,
+                        )
+                        plausible = _plausible_distance_km(max(gap_secs, 60.0))
+                    else:
+                        dist_km = 0.0
+                        plausible = float("inf")
+
+                    # Altitude check
+                    alt_ok = True
+                    if metrics.last_seen_alt_ft is not None and next_metrics.last_airborne_alt is not None:
+                        alt_delta = abs(metrics.last_seen_alt_ft - next_metrics.last_airborne_alt)
+                        alt_ok = alt_delta <= max_alt_delta
+
+                    if dist_km <= plausible and alt_ok:
+                        # Merge: the next fragment inherits prev's takeoff
+                        # position and time (the originally-observed takeoff
+                        # if prev was observed, otherwise prev's first point).
+                        stitched = next_flight
+                        stitched.takeoff_time = flight.takeoff_time
+                        stitched.takeoff_lat = flight.takeoff_lat
+                        stitched.takeoff_lon = flight.takeoff_lon
+                        stitched.takeoff_date = flight.takeoff_date
+                        stitched.callsign = flight.callsign or next_flight.callsign
+
+                        # Metrics: carry forward sources and takeoff type
+                        next_metrics.sources |= metrics.sources
+                        if metrics.takeoff_type == "observed":
+                            next_metrics.takeoff_type = "observed"
+                            next_metrics.ground_points_at_takeoff = metrics.ground_points_at_takeoff
+                        # Use the earliest first_point_ts so duration covers
+                        # the full span including the coverage gap.
+                        if (
+                            metrics.first_point_ts is not None
+                            and next_metrics.first_point_ts is not None
+                            and metrics.first_point_ts < next_metrics.first_point_ts
+                        ):
+                            next_metrics.first_point_ts = metrics.first_point_ts
+
+                        merged.append((stitched, next_metrics))
+                        i += 2
+                        continue
+
+        merged.append((flight, metrics))
+        i += 1
+
+    stitched_flights = [p[0] for p in merged]
+    stitched_metrics = [p[1] for p in merged]
+    return stitched_flights, stitched_metrics
 
 
 def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
@@ -329,14 +437,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     # post-landing mode to collect a few more ground points.
                     if pending_metrics is not None:
                         pending_metrics.record_landing_ground_point(lat, lon)
+                        pending_metrics.landing_transition_ts = abs_ts
                     if pending_flight is not None:
                         pending_flight.landing_time = abs_time
                         pending_flight.landing_lat = lat
                         pending_flight.landing_lon = lon
                         pending_flight.landing_date = day_date
-                        if pending_flight.landing_time and pending_flight.takeoff_time:
-                            delta = (pending_flight.landing_time - pending_flight.takeoff_time).total_seconds()
-                            pending_flight.duration_minutes = round(delta / 60, 1)
                     state = "post_landing"
                     post_landing_start_ts = abs_ts
                     prev_ground_point = (lat, lon, abs_time, day_date)
@@ -349,9 +455,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 window_expired = (
                     post_landing_start_ts is not None and (abs_ts - post_landing_start_ts) > post_landing_window_secs
                 )
-                count_expired = (
-                    pending_metrics is not None and pending_metrics.ground_points_at_landing >= post_landing_max_points
-                )
+                # count_expired is re-evaluated after recording the current
+                # ground point below so the cap lands exactly on
+                # post_landing_max_points, not max+1.
 
                 if is_airborne:
                     # Aircraft took off again right after landing (touch and
@@ -403,6 +509,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                         pending_metrics.record_landing_ground_point(lat, lon)
                     prev_ground_point = (lat, lon, abs_time, day_date)
 
+                # Check count expiry *after* recording the point so the cap
+                # value is respected exactly (previously off-by-one).
+                count_expired = (
+                    pending_metrics is not None and pending_metrics.ground_points_at_landing >= post_landing_max_points
+                )
+
                 if window_expired or count_expired:
                     # Finalize the landing and fall back to ground state.
                     # Remember the ground-point count before clearing metrics
@@ -424,7 +536,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flights.append(pending_flight)
         metrics_list.append(pending_metrics or FlightMetrics())
 
-    # Filter and classify
+    # Compute durations for every flight from first/last trace point.
+    # Previously duration was only set on flights with a landing transition;
+    # signal_lost / dropped_on_approach flights got NULL. Now every flight
+    # with any data has a duration (time airborne or time observed).
+    for flight, metrics in zip(flights, metrics_list, strict=True):
+        if metrics.first_point_ts is not None and metrics.last_point_ts is not None:
+            span = metrics.last_point_ts - metrics.first_point_ts
+            flight.duration_minutes = round(span / 60.0, 1)
+
+    # Filter: drop taxi-length flights that barely moved
     valid_flights = []
     valid_metrics = []
     for flight, metrics in zip(flights, metrics_list, strict=True):
@@ -433,13 +554,24 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             and flight.duration_minutes < config.min_flight_minutes
             and flight.landing_lat is not None
         ):
-            from .airports import haversine_km
-
             dist = haversine_km(flight.takeoff_lat, flight.takeoff_lon, flight.landing_lat, flight.landing_lon)
             if dist < config.min_flight_distance_km:
                 continue
         valid_flights.append(flight)
         valid_metrics.append(metrics)
+
+    # Populate last_seen_* from metrics regardless of landing outcome
+    for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
+        if metrics.last_seen_ts is not None:
+            flight.last_seen_lat = metrics.last_seen_lat
+            flight.last_seen_lon = metrics.last_seen_lon
+            flight.last_seen_alt_ft = metrics.last_seen_alt_ft
+            flight.last_seen_time = datetime.fromtimestamp(metrics.last_seen_ts, tz=UTC)
+
+    # Run the stitch_fragments pass: merge signal_lost / dropped_on_approach
+    # followed by a found_mid_flight fragment when they are plausibly the
+    # same continuous flight with a coverage hole in the middle.
+    valid_flights, valid_metrics = _stitch_fragments(valid_flights, valid_metrics, config)
 
     # Classify, score confidence, match airports, and save
     for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
@@ -454,6 +586,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             type_code=type_code,
             type_endurance_minutes=config.type_endurance_minutes,
             default_endurance_minutes=config.max_endurance_minutes,
+            dropped_tail_window=config.dropped_tail_window,
+            dropped_tail_descent_min_count=config.dropped_tail_descent_min_count,
+            dropped_tail_descent_rate_fpm=config.dropped_tail_descent_rate_fpm,
+            dropped_max_alt_ft=config.dropped_max_alt_ft,
         )
 
         # Match airports (skip destination for signal_lost / dropped_on_approach)

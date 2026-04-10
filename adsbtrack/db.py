@@ -64,6 +64,10 @@ CREATE TABLE IF NOT EXISTS flights (
     ground_points_at_landing INTEGER,
     ground_points_at_takeoff INTEGER,
     baro_error_points INTEGER,
+    last_seen_lat REAL,
+    last_seen_lon REAL,
+    last_seen_alt_ft INTEGER,
+    last_seen_time TEXT,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -183,7 +187,7 @@ def _needs_quality_migration(conn: sqlite3.Connection) -> bool:
         return False
     col_names = {row[1] for row in cols}
     # Check for the most recently added column
-    return "takeoff_type" not in col_names
+    return "last_seen_time" not in col_names
 
 
 def _migrate_add_quality_columns(conn: sqlite3.Connection):
@@ -201,6 +205,11 @@ def _migrate_add_quality_columns(conn: sqlite3.Connection):
         ("takeoff_type", "TEXT DEFAULT 'unknown'"),
         ("ground_points_at_takeoff", "INTEGER"),
         ("baro_error_points", "INTEGER"),
+        # Last-seen snapshot added in v3 for signal_lost traceability
+        ("last_seen_lat", "REAL"),
+        ("last_seen_lon", "REAL"),
+        ("last_seen_alt_ft", "INTEGER"),
+        ("last_seen_time", "TEXT"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -305,8 +314,9 @@ class Database:
                 duration_minutes, callsign,
                 landing_type, takeoff_type, takeoff_confidence, landing_confidence,
                 data_points, sources, max_altitude,
-                ground_points_at_landing, ground_points_at_takeoff, baro_error_points)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ground_points_at_landing, ground_points_at_takeoff, baro_error_points,
+                last_seen_lat, last_seen_lon, last_seen_alt_ft, last_seen_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -335,6 +345,10 @@ class Database:
                 flight.ground_points_at_landing,
                 flight.ground_points_at_takeoff,
                 flight.baro_error_points,
+                flight.last_seen_lat,
+                flight.last_seen_lon,
+                flight.last_seen_alt_ft,
+                flight.last_seen_time.isoformat() if flight.last_seen_time else None,
             ),
         )
 

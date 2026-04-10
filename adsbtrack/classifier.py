@@ -43,7 +43,7 @@ class FlightMetrics:
 
     data_points: int = 0
     total_ground_points: int = 0  # any point where classify_ground_state said "ground"
-    baro_error_points: int = 0  # baro=ground but geom disagreed (airborne override)
+    baro_error_points: int = 0  # baro=ground but geom or gs disagreed (see record_point)
     sources: set[str] = field(default_factory=set)
     max_altitude: int = 0
     last_airborne_alt: int | None = None  # last airborne baro altitude
@@ -60,6 +60,20 @@ class FlightMetrics:
     recent_points: deque = field(default_factory=lambda: deque(maxlen=40))
     # Takeoff category: "observed" (saw ground -> airborne) or "found_mid_flight"
     takeoff_type: str = "unknown"
+    # First/last observed point timestamps - used to compute duration for
+    # signal_lost / dropped_on_approach flights that never transitioned to ground.
+    first_point_ts: float | None = None
+    last_point_ts: float | None = None
+    # Last-seen snapshot (may be airborne or ground). For confirmed landings
+    # this ends up equal to the landing point; for signal_lost it is where
+    # coverage dropped.
+    last_seen_lat: float | None = None
+    last_seen_lon: float | None = None
+    last_seen_alt_ft: int | None = None
+    last_seen_ts: float | None = None
+    # Transition timestamp of the airborne -> ground landing event. Used by
+    # the classifier to pick a pre-flare descent window.
+    landing_transition_ts: float | None = None
 
     def record_point(
         self,
@@ -78,9 +92,23 @@ class FlightMetrics:
         """Record a single trace point into the running metrics.
 
         ground_state is the output of classify_ground_state ("ground" / "airborne" / "unknown").
-        ground_reason is "ok" / "baro_error" / "insufficient".
+        ground_reason is "ok" / "baro_error" / "speed_override" / "insufficient".
         """
         self.data_points += 1
+        if self.first_point_ts is None:
+            self.first_point_ts = ts
+        self.last_point_ts = ts
+
+        # Last-seen snapshot (overwritten every point - this ends up holding
+        # the final observed position regardless of whether the flight lands).
+        self.last_seen_lat = lat
+        self.last_seen_lon = lon
+        self.last_seen_ts = ts
+        if isinstance(baro_alt, (int, float)):
+            self.last_seen_alt_ft = int(baro_alt)
+        elif isinstance(geom_alt, (int, float)):
+            self.last_seen_alt_ft = int(geom_alt)
+        # else: leave last_seen_alt_ft as-is so we keep the last known value
 
         # Rolling wall-clock window sample for descent analysis
         sample_baro_alt = None
@@ -98,10 +126,14 @@ class FlightMetrics:
 
         if ground_state == "ground":
             self.total_ground_points += 1
-            if ground_reason == "baro_error":
-                # Shouldn't happen: baro_error forces airborne. But count defensively.
-                self.baro_error_points += 1
-        elif ground_state == "airborne" and ground_reason == "baro_error":
+
+        # Count broken-encoder points under baro_error_points. Both baro_error
+        # (baro=ground with high geom altitude) and speed_override (baro=ground
+        # with flight-speed ground speed) are the same underlying fault: the
+        # barometric encoder claimed ground while other signals proved
+        # otherwise. Unify the bookkeeping so baro_error_points is a faithful
+        # count of broken encoder samples.
+        if ground_reason in ("baro_error", "speed_override"):
             self.baro_error_points += 1
 
         # Track last airborne signals for confidence scoring
@@ -122,7 +154,8 @@ class FlightMetrics:
             if baro_rate is not None:
                 self.last_airborne_baro_rate = baro_rate
 
-        # Legacy altitude_error heuristic: baro=ground + high gs
+        # Legacy altitude_error heuristic: baro=ground + high gs. Kept as a
+        # secondary signal but no longer the only trigger.
         if baro_alt == "ground" and gs is not None and gs > landing_speed_threshold:
             self.ground_speed_while_ground += 1
 
@@ -132,12 +165,50 @@ class FlightMetrics:
         self.landing_lons.append(lon)
 
     def landing_coord_spread(self) -> float:
-        """Max spread in degrees across landing ground points."""
+        """Max spread in degrees across landing ground points (legacy)."""
         if len(self.landing_lats) < 2:
             return 0.0
         lat_spread = max(self.landing_lats) - min(self.landing_lats)
         lon_spread = max(self.landing_lons) - min(self.landing_lons)
         return max(lat_spread, lon_spread)
+
+    def landing_max_jump_m(self) -> float:
+        """Max distance in meters between adjacent landing ground points.
+
+        This is a better signal than total spread because it catches receiver
+        noise (sudden jumps) without penalizing normal taxi motion. Aircraft
+        that taxi 1km after touchdown will have small per-sample jumps (a few
+        tens of meters each) even though their total spread is huge.
+        """
+        if len(self.landing_lats) < 2:
+            return 0.0
+        max_jump = 0.0
+        for i in range(1, len(self.landing_lats)):
+            d = _haversine_m(
+                self.landing_lats[i - 1],
+                self.landing_lons[i - 1],
+                self.landing_lats[i],
+                self.landing_lons[i],
+            )
+            if d > max_jump:
+                max_jump = d
+        return max_jump
+
+
+# ----------------------------------------------------------------------
+# Geographic helpers
+# ----------------------------------------------------------------------
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters between two lat/lon points."""
+    r = 6_371_000.0  # earth radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return 2 * r * math.asin(math.sqrt(a))
 
 
 # ----------------------------------------------------------------------
@@ -219,32 +290,16 @@ def _lerp(value: float, low: float, high: float) -> float:
     return max(0.0, min(1.0, (low - value) / (low - high)))
 
 
-def descent_score(
-    recent_points: deque,
-    *,
-    window_secs: float = 120.0,
-) -> float:
-    """Return a score in [0, 1] where 1.0 = strong descent, 0.0 = climbing/level.
-
-    Uses barometric vertical rate (ft/min) when available, averaged over a
-    wall-clock window. Falls back to a simple first/last altitude difference
-    if no vertical rate data is present.
-    """
-    if not recent_points:
+def _descent_score_from_window(window: list[_PointSample]) -> float:
+    """Core descent scoring used by descent_score and descent_score_preflare."""
+    if not window:
         return 0.5
 
-    points = list(recent_points)
-    cutoff = points[-1].ts - window_secs
-    recent = [p for p in points if p.ts >= cutoff]
-    if not recent:
-        return 0.5
-
-    rates = [p.baro_rate for p in recent if p.baro_rate is not None]
+    rates = [p.baro_rate for p in window if p.baro_rate is not None]
     if rates:
-        # Weight newer points slightly higher via their position in the window
         total_w = 0.0
         acc = 0.0
-        for i, p in enumerate(recent):
+        for i, p in enumerate(window):
             if p.baro_rate is None:
                 continue
             w = i + 1.0
@@ -256,14 +311,90 @@ def descent_score(
         # -800 ft/min or better = strong descent (1.0). 0 = level (0.0). Climbing = 0.0.
         return max(0.0, min(1.0, -avg_rate / 800.0))
 
-    # No vertical rate: use altitude delta across window
-    alts = [p.baro_alt for p in recent if p.baro_alt is not None]
+    alts = [p.baro_alt for p in window if p.baro_alt is not None]
     if len(alts) < 2:
         return 0.5
     delta = alts[-1] - alts[0]  # negative means descending
-    span_secs = max(1.0, recent[-1].ts - recent[0].ts)
+    span_secs = max(1.0, window[-1].ts - window[0].ts)
     rate = (delta / span_secs) * 60.0  # ft/min
     return max(0.0, min(1.0, -rate / 800.0))
+
+
+def descent_score(
+    recent_points: deque,
+    *,
+    window_secs: float = 120.0,
+) -> float:
+    """Return a score in [0, 1] where 1.0 = strong descent, 0.0 = climbing/level.
+
+    Uses barometric vertical rate (ft/min) when available, averaged over a
+    wall-clock window anchored at the last recorded point. Falls back to a
+    simple first/last altitude difference if no vertical rate data is present.
+
+    This is the "signal_lost" descent window: it looks at the very last
+    seconds of trace data to ask "was the aircraft descending when coverage
+    dropped?" For confirmed landings use descent_score_preflare() instead,
+    which skips the flare.
+    """
+    if not recent_points:
+        return 0.5
+
+    points = list(recent_points)
+    cutoff = points[-1].ts - window_secs
+    window = [p for p in points if p.ts >= cutoff]
+    return _descent_score_from_window(window)
+
+
+def descent_score_preflare(
+    recent_points: deque,
+    transition_ts: float,
+    *,
+    lookback_start_secs: float = 180.0,
+    lookback_end_secs: float = 30.0,
+) -> float:
+    """Descent score computed over a pre-flare window for confirmed landings.
+
+    For a touched-down flight, the 30 s immediately before the ground
+    transition is the flare (level-off, baro_rate near zero). Including it
+    in the descent score pushes the signal toward "level", which is wrong:
+    we want to confirm the approach, and the approach descent is the
+    minute or two before the flare. The default window is [30s, 180s]
+    before the transition.
+    """
+    if not recent_points:
+        return 0.5
+
+    cutoff_start = transition_ts - lookback_start_secs
+    cutoff_end = transition_ts - lookback_end_secs
+    points = list(recent_points)
+    window = [p for p in points if cutoff_start <= p.ts <= cutoff_end]
+    if not window:
+        # Not enough trace data before touchdown (short flight or sparse
+        # coverage). Fall back to the regular last-window score.
+        return descent_score(recent_points)
+    return _descent_score_from_window(window)
+
+
+def sustained_descent(
+    recent_points: deque,
+    *,
+    tail_window: int = 5,
+    min_count: int = 3,
+    descent_rate_fpm: float = -200.0,
+) -> bool:
+    """True if the last `tail_window` samples show sustained descent.
+
+    At least `min_count` of the final `tail_window` baro_rate readings must
+    be at or below `descent_rate_fpm` (ft/min; negative = descending).
+    Gates the dropped_on_approach classification so a window-averaged score
+    on an otherwise-climbing flight does not leak into dropped_on_approach.
+    """
+    if not recent_points:
+        return False
+    tail = [p.baro_rate for p in list(recent_points)[-tail_window:] if p.baro_rate is not None]
+    if len(tail) < min_count:
+        return False
+    return sum(1 for br in tail if br <= descent_rate_fpm) >= min_count
 
 
 def endurance_for(
@@ -290,25 +421,29 @@ def classify_landing(
     type_code: str | None = None,
     type_endurance_minutes: dict[str, float] | None = None,
     default_endurance_minutes: float = 240.0,
+    dropped_tail_window: int = 5,
+    dropped_tail_descent_min_count: int = 3,
+    dropped_tail_descent_rate_fpm: float = -200.0,
+    dropped_max_alt_ft: float = 5000.0,
 ) -> str:
     """Classify how a flight ended.
 
     Returns one of:
       - 'confirmed'           - clean landing with good supporting signals
       - 'signal_lost'         - aircraft was airborne at last contact (dropout)
-      - 'dropped_on_approach' - signal lost with clear descent trajectory
+      - 'dropped_on_approach' - signal lost with sustained descent at last contact
       - 'uncertain'           - ambiguous, duration artifact, or no data
       - 'altitude_error'      - baro altimeter clearly broken (Bell 407 pathology)
     """
-    # Altitude error detection. Two triggers:
-    # (a) Legacy: baro=ground + high gs (catches mid-cruise encoder glitches).
-    # (b) New: baro_error_points (hover-at-altitude) > 20% of ground-state points.
-    # Use total_ground_points as the denominator so short flights with mixed
-    # airborne data are not diluted.
+    # Altitude error detection. speed_override points are now counted under
+    # baro_error_points (see record_point), so the unified baro_error_ratio
+    # check catches both the hover pathology and the mid-cruise encoder
+    # glitch. Keep the legacy gs_ground_ratio as a safety net for flights
+    # whose speed_override points never landed in total_ground_points.
     if metrics.data_points >= 10:
         gs_ground_ratio = metrics.ground_speed_while_ground / max(1, metrics.total_ground_points)
         baro_error_ratio = metrics.baro_error_points / max(1, metrics.data_points)
-        if gs_ground_ratio > 0.20 or baro_error_ratio > 0.20:
+        if baro_error_ratio > 0.20 or gs_ground_ratio > 0.20:
             return "altitude_error"
 
     # Flight with no landing transition: signal loss or taxi-like
@@ -322,9 +457,19 @@ def classify_landing(
             or metrics.max_altitude > 3000
         )
         if looks_airborne:
-            # Distinguish mid-cruise dropout from on-approach dropout by descent signature
-            d_score = descent_score(metrics.recent_points)
-            if d_score > 0.5 and last_alt is not None and last_alt < 5000:
+            # dropped_on_approach requires *sustained* descent in the final
+            # samples, not a window-averaged descent that might reflect an
+            # earlier descent phase.
+            if (
+                last_alt is not None
+                and last_alt < dropped_max_alt_ft
+                and sustained_descent(
+                    metrics.recent_points,
+                    tail_window=dropped_tail_window,
+                    min_count=dropped_tail_descent_min_count,
+                    descent_rate_fpm=dropped_tail_descent_rate_fpm,
+                )
+            ):
                 return "dropped_on_approach"
             return "signal_lost"
         return "uncertain"
@@ -344,10 +489,13 @@ def classify_landing(
     alt_signal = _lerp(last_alt_ft, 500, 5000)  # 0.0 at 500, 1.0 at 5000
     factors.append((alt_signal, 3.0))
 
-    # Factor 2: last airborne ground speed (slower = better)
+    # Factor 2: last airborne ground speed (slower = better).
+    # Stretched range (180, 30) so jet approach speeds (120-150 kt) do not
+    # crush the signal. Light helicopters still max out at their natural
+    # 30-50 kt approach speeds.
     gs_signal = 0.0
     if metrics.last_airborne_gs is not None:
-        gs_signal = _lerp(metrics.last_airborne_gs, 30, 150)
+        gs_signal = _lerp(metrics.last_airborne_gs, 30, 180)
     factors.append((gs_signal, 2.5))
 
     # Factor 3: ground points collected at landing
@@ -355,14 +503,20 @@ def classify_landing(
     gp_signal = 1.0 if gp == 0 else (0.3 if gp == 1 else (0.1 if gp == 2 else 0.0))
     factors.append((gp_signal, 3.0))
 
-    # Factor 4: descent trend via baro_rate window
-    # _descent_trend semantics: 0 = descending (good), 1 = climbing (bad).
-    descent_signal = 1.0 - descent_score(metrics.recent_points)
+    # Factor 4: descent trend. For a confirmed landing use the pre-flare
+    # window so we score the approach descent, not the flare-level final
+    # seconds. Semantics: 0 = descending (good), 1 = climbing (bad).
+    if metrics.landing_transition_ts is not None:
+        d = descent_score_preflare(metrics.recent_points, metrics.landing_transition_ts)
+    else:
+        d = descent_score(metrics.recent_points)
+    descent_signal = 1.0 - d
     factors.append((descent_signal, 2.0))
 
-    # Factor 5: coordinate stability at landing
-    spread = metrics.landing_coord_spread()
-    coord_signal = _lerp(spread, 0.001, 0.01)
+    # Factor 5: coordinate stability. Use the per-sample max jump instead
+    # of the total spread so normal taxi motion does not score as noise.
+    max_jump_m = metrics.landing_max_jump_m()
+    coord_signal = _lerp(max_jump_m, 100.0, 500.0)  # 100m jump = 0.0, 500m+ = 1.0
     factors.append((coord_signal, 1.5))
 
     total_weight = sum(w for _, w in factors)
@@ -418,12 +572,21 @@ def score_confidence(
     else:
         factors = {}
 
-        # Descent signature (baro_rate window)
-        factors["descent"] = (descent_score(metrics.recent_points), 2.0)
+        # Descent signature: pre-flare window for confirmed landings so we
+        # score the approach descent, not the flare-level final seconds.
+        if metrics.landing_transition_ts is not None:
+            factors["descent"] = (
+                descent_score_preflare(metrics.recent_points, metrics.landing_transition_ts),
+                2.0,
+            )
+        else:
+            factors["descent"] = (descent_score(metrics.recent_points), 2.0)
 
-        # Approach speed (slower = better)
+        # Approach speed. Stretched range: 180 kt -> 0.0, 30 kt -> 1.0.
+        # Jets land at 120-150 kt so they now land in the 0.17-0.40 band
+        # instead of near-zero; helicopters at 25-50 kt still max out.
         if metrics.last_airborne_gs is not None:
-            factors["approach_spd"] = (_lerp(metrics.last_airborne_gs, 150, 40), 2.0)
+            factors["approach_spd"] = (_lerp(metrics.last_airborne_gs, 180, 30), 2.0)
         else:
             factors["approach_spd"] = (0.5, 2.0)
 
@@ -440,9 +603,11 @@ def score_confidence(
         else:
             factors["airport_prox"] = (0.3, 2.0)  # no airport match = weak signal
 
-        # Coordinate stability at landing
-        spread = metrics.landing_coord_spread()
-        factors["coord_stab"] = (1.0 - _lerp(spread, 0.0001, 0.001), 1.0)
+        # Coordinate stability: per-sample max jump (not total spread) so
+        # normal taxi motion does not register as receiver noise. Jumps
+        # below 200m are fine; 500m+ is noise; the lerp handles between.
+        max_jump_m = metrics.landing_max_jump_m()
+        factors["coord_stab"] = (1.0 - _lerp(max_jump_m, 200.0, 500.0), 1.0)
 
         # Post-landing points (we kept the flight open for a few ground points).
         # Even 1 point is meaningful - it confirmed the transition. 4+ points

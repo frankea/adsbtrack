@@ -17,12 +17,14 @@ def _make_config() -> Config:
     # Tests use synthetic traces with sparse points (often hours apart)
     # that would trip the intra-trace gap splitter. Disable gap splitting
     # by setting a huge threshold so these tests can exercise the state
-    # machine without also re-testing gap handling.
+    # machine without also re-testing gap handling. Also raise the path
+    # segment cap so path_length accumulates across sparse synthetic points.
     return Config(
         landing_speed_threshold_kts=80.0,
         airport_match_threshold_km=10.0,
         airport_types=("large_airport", "medium_airport", "small_airport"),
         max_point_gap_minutes=10_000.0,
+        path_max_segment_secs=10_000.0,
     )
 
 
@@ -535,3 +537,91 @@ def test_in_progress_flight_saved():
     flight = db.insert_flight.call_args[0][0]
     assert flight.landing_lat is None
     assert flight.landing_time is None
+
+
+# ---------------------------------------------------------------------------
+# v3: full detail payload populates all new Flight fields
+# ---------------------------------------------------------------------------
+
+
+def _rich_trace_point(time_offset, lat, lon, alt, gs=None, track=None, baro_rate=None, geom_alt=None, detail=None):
+    """Build a 12-element trace point with geom_alt and baro vertical rate."""
+    return [
+        time_offset,
+        lat,
+        lon,
+        alt,
+        gs,
+        track,
+        None,
+        baro_rate,
+        detail or {},
+        None,
+        geom_alt,
+        None,
+    ]
+
+
+def test_v3_rich_trace_populates_new_fields():
+    """A flight built from 12-element trace points with full detail dicts
+    should populate the v3 feature columns on the Flight row."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    detail_cruise = {
+        "flight": "TWY501  ",
+        "squawk": "1200",
+        "category": "A5",
+        "nav_altitude_mcp": 32000,
+        "nav_qnh": 1013.0,
+        "emergency": "none",
+        "true_heading": 90.0,
+    }
+
+    trace = [
+        _rich_trace_point(0, 40.0, -74.0, "ground", gs=0, track=90.0, detail={"flight": "TWY501  "}),
+        _rich_trace_point(
+            60, 40.001, -74.0, 2000, gs=150, track=90.0, baro_rate=1500, geom_alt=2100, detail=detail_cruise
+        ),
+        _rich_trace_point(
+            900, 40.5, -74.5, 30000, gs=450, track=90.0, baro_rate=0, geom_alt=30100, detail=detail_cruise
+        ),
+        _rich_trace_point(
+            1800, 41.0, -75.0, 30000, gs=450, track=90.0, baro_rate=0, geom_alt=30100, detail=detail_cruise
+        ),
+        _rich_trace_point(
+            3000, 41.5, -75.5, 5000, gs=250, track=90.0, baro_rate=-1200, geom_alt=5100, detail=detail_cruise
+        ),
+        _rich_trace_point(3600, 42.0, -76.0, "ground", gs=10, track=90.0, detail=detail_cruise),
+    ]
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    # Squawk tracking
+    assert flight.squawk_first == "1200"
+    assert flight.squawk_last == "1200"
+    assert flight.vfr_flight == 1
+    # Category
+    assert flight.category_do260 == "A5"
+    # Callsigns JSON
+    assert flight.callsigns is not None
+    assert "TWY501" in flight.callsigns
+    # Path metrics populated
+    assert flight.path_length_km is not None
+    assert flight.path_length_km > 0
+    # Mission classification: TWY prefix -> exec_charter
+    assert flight.mission_type == "exec_charter"
+    # Hover NULL for non-rotorcraft (C172 default type)
+    assert flight.max_hover_secs is None
+    # Day/night populated
+    assert flight.takeoff_is_night in (0, 1)
+    assert flight.landing_is_night in (0, 1)
+    # Headings populated
+    assert flight.takeoff_heading_deg is not None
+    assert abs(flight.takeoff_heading_deg - 90.0) < 5.0

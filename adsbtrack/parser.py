@@ -1,10 +1,13 @@
+import contextlib
 import json
 from collections import defaultdict
 from datetime import UTC, datetime, timedelta
 
+from . import features
 from .airports import find_nearest_airport, haversine_km
 from .classifier import (
     FlightMetrics,
+    PointData,
     classify_ground_state,
     classify_landing,
     score_confidence,
@@ -14,8 +17,8 @@ from .db import Database
 from .models import Flight
 
 
-def _extract_point_fields(point: list) -> tuple[int | str | None, float | None, dict | None, int | None, float | None]:
-    """Return (baro_alt, gs, detail_dict, geom_alt, baro_rate) from a trace point.
+def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> PointData:
+    """Parse a readsb trace point into a PointData dataclass.
 
     Trace point layout (readsb globe_history format):
       0: time_offset (seconds since day_timestamp)
@@ -36,8 +39,11 @@ def _extract_point_fields(point: list) -> tuple[int | str | None, float | None, 
     """
     baro_alt = point[3]
     gs = point[4] if len(point) > 4 else None
+    track = None
+    if len(point) > 5 and isinstance(point[5], (int, float)):
+        track = float(point[5])
 
-    detail = None
+    detail: dict | None = None
     if len(point) > 8 and isinstance(point[8], dict):
         detail = point[8]
 
@@ -45,11 +51,74 @@ def _extract_point_fields(point: list) -> tuple[int | str | None, float | None, 
     if len(point) > 7 and isinstance(point[7], (int, float)):
         baro_rate = float(point[7])
 
-    geom_alt = None
+    geom_alt: int | None = None
     if len(point) > 10 and isinstance(point[10], (int, float)):
         geom_alt = int(point[10])
 
-    return baro_alt, gs, detail, geom_alt, baro_rate
+    geom_rate: float | None = None
+    if len(point) > 11 and isinstance(point[11], (int, float)):
+        geom_rate = float(point[11])
+
+    # Rich detail fields (only ~22% of points have the full payload, so guard)
+    squawk: str | None = None
+    category: str | None = None
+    nav_altitude_mcp: int | None = None
+    nav_qnh: float | None = None
+    emergency_field: str | None = None
+    true_heading: float | None = None
+    callsign: str | None = None
+    if detail:
+        sq = detail.get("squawk")
+        if sq:
+            squawk = str(sq)
+        cat = detail.get("category")
+        if cat:
+            category = str(cat)
+        mcp = detail.get("nav_altitude_mcp")
+        if isinstance(mcp, (int, float)):
+            nav_altitude_mcp = int(mcp)
+        qnh = detail.get("nav_qnh")
+        if isinstance(qnh, (int, float)):
+            nav_qnh = float(qnh)
+        em = detail.get("emergency")
+        if em:
+            emergency_field = str(em)
+        th = detail.get("true_heading")
+        if isinstance(th, (int, float)):
+            true_heading = float(th)
+        fl = detail.get("flight", "")
+        if fl:
+            fl = fl.strip()
+            if fl:
+                callsign = fl
+        # Fall back to detail.alt_geom when the slot index 10 wasn't present
+        if geom_alt is None:
+            alt_geom = detail.get("alt_geom")
+            if isinstance(alt_geom, (int, float)):
+                geom_alt = int(alt_geom)
+        if geom_rate is None:
+            gr = detail.get("geom_rate")
+            if isinstance(gr, (int, float)):
+                geom_rate = float(gr)
+
+    return PointData(
+        ts=ts,
+        lat=lat,
+        lon=lon,
+        baro_alt=baro_alt,
+        gs=gs,
+        track=track,
+        geom_alt=geom_alt,
+        baro_rate=baro_rate,
+        geom_rate=geom_rate,
+        squawk=squawk,
+        category=category,
+        nav_altitude_mcp=nav_altitude_mcp,
+        nav_qnh=nav_qnh,
+        emergency_field=emergency_field,
+        true_heading=true_heading,
+        callsign=callsign,
+    )
 
 
 def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set[str]]:
@@ -207,6 +276,50 @@ def _stitch_fragments(
                         ):
                             next_metrics.first_point_ts = metrics.first_point_ts
 
+                        # v3: merge every accumulator so stitched flights
+                        # don't silently undercount. Path length sums,
+                        # phase counters sum, peak rates take the extremum,
+                        # squawk/callsign histories union.
+                        next_metrics.data_points += metrics.data_points
+                        next_metrics.path_length_km += metrics.path_length_km
+                        next_metrics.max_distance_from_origin_km = max(
+                            next_metrics.max_distance_from_origin_km,
+                            metrics.max_distance_from_origin_km,
+                        )
+                        next_metrics.climb_secs += metrics.climb_secs
+                        next_metrics.descent_secs += metrics.descent_secs
+                        next_metrics.level_secs += metrics.level_secs
+                        next_metrics.level_buf = metrics.level_buf + next_metrics.level_buf
+                        if metrics.peak_climb_fpm > next_metrics.peak_climb_fpm:
+                            next_metrics.peak_climb_fpm = metrics.peak_climb_fpm
+                        if metrics.peak_descent_fpm < next_metrics.peak_descent_fpm:
+                            next_metrics.peak_descent_fpm = metrics.peak_descent_fpm
+                        if metrics.max_hover_secs > next_metrics.max_hover_secs:
+                            next_metrics.max_hover_secs = metrics.max_hover_secs
+                        next_metrics.hover_episodes += metrics.hover_episodes
+                        next_metrics.squawk_1200_count += metrics.squawk_1200_count
+                        next_metrics.squawk_total_count += metrics.squawk_total_count
+                        if next_metrics.squawk_first is None:
+                            next_metrics.squawk_first = metrics.squawk_first
+                        next_metrics.squawk_changes += metrics.squawk_changes
+                        next_metrics.emergency_squawks_seen |= metrics.emergency_squawks_seen
+                        for cs in metrics.callsigns_seen:
+                            if cs not in next_metrics.callsigns_seen:
+                                next_metrics.callsigns_seen.insert(0, cs)
+                        next_metrics.callsign_changes += metrics.callsign_changes
+                        for cat, cnt in metrics.category_counts.items():
+                            next_metrics.category_counts[cat] = next_metrics.category_counts.get(cat, 0) + cnt
+                        if next_metrics.autopilot_target_alt_ft is None:
+                            next_metrics.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
+                        if next_metrics.emergency_flag is None and metrics.emergency_flag is not None:
+                            next_metrics.emergency_flag = metrics.emergency_flag
+                        # Max altitude of the merged flight is the max of both
+                        if metrics.max_altitude > next_metrics.max_altitude:
+                            next_metrics.max_altitude = metrics.max_altitude
+                        next_metrics.baro_error_points += metrics.baro_error_points
+                        next_metrics.total_ground_points += metrics.total_ground_points
+                        next_metrics.ground_speed_while_ground += metrics.ground_speed_while_ground
+
                         merged.append((stitched, next_metrics))
                         i += 2
                         continue
@@ -227,12 +340,22 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     if not trace_days:
         return 0
 
-    # Figure out the aircraft type for endurance lookup
-    type_code = None
-    for row in trace_days:
-        if row["type_code"]:
-            type_code = row["type_code"]
-            break
+    # v3: populate/refresh aircraft_registry and use the authoritative
+    # type_code for endurance, hover gating and mission rules. Fall back
+    # to the first row's type_code if the registry write fails (e.g. in
+    # tests using a MagicMock db).
+    type_code: str | None = None
+    try:
+        registry_row = db.upsert_aircraft_registry(hex_code, list(trace_days))
+    except Exception:
+        registry_row = None
+    if isinstance(registry_row, dict) and registry_row.get("type_code"):
+        type_code = registry_row["type_code"]
+    if type_code is None:
+        for row in trace_days:
+            if row["type_code"]:
+                type_code = row["type_code"]
+                break
 
     # Group by date and merge multi-source rows
     by_date: dict[str, list] = defaultdict(list)
@@ -299,15 +422,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             time_offset = point[0]
             lat = point[1]
             lon = point[2]
-            baro_alt, gs, detail, geom_alt, baro_rate = _extract_point_fields(point)
             abs_ts = day_timestamp + time_offset
             abs_time = datetime.fromtimestamp(abs_ts, tz=UTC)
+            point_data = _extract_point_fields(point, abs_ts, lat, lon)
+            baro_alt = point_data.baro_alt
+            gs = point_data.gs
+            geom_alt = point_data.geom_alt
 
-            # Update callsign from detail object when present
-            if detail:
-                flight_id = detail.get("flight", "").strip()
-                if flight_id:
-                    current_callsign = flight_id
+            # Update callsign from PointData
+            if point_data.callsign:
+                current_callsign = point_data.callsign
 
             # Intra-trace gap check: any gap longer than max_point_gap_minutes
             # forces a flight close. Real operations rarely have more than a
@@ -329,15 +453,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             # Record metrics for pending flight (all points, including ground)
             if pending_metrics is not None:
                 pending_metrics.record_point(
-                    baro_alt=baro_alt,
-                    geom_alt=geom_alt,
-                    gs=gs,
-                    baro_rate=baro_rate,
-                    lat=lat,
-                    lon=lon,
-                    ts=abs_ts,
+                    point_data,
                     ground_state=point_state,
                     ground_reason=point_reason,
+                    config=config,
                     landing_speed_threshold=config.landing_speed_threshold_kts,
                 )
 
@@ -368,15 +487,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     pending_metrics.takeoff_type = "found_mid_flight"
                     pending_metrics.ground_points_at_takeoff = 0
                     pending_metrics.record_point(
-                        baro_alt=baro_alt,
-                        geom_alt=geom_alt,
-                        gs=gs,
-                        baro_rate=baro_rate,
-                        lat=lat,
-                        lon=lon,
-                        ts=abs_ts,
+                        point_data,
                         ground_state=point_state,
                         ground_reason=point_reason,
+                        config=config,
                         landing_speed_threshold=config.landing_speed_threshold_kts,
                     )
                     ground_count_before_takeoff = 0
@@ -404,15 +518,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     pending_metrics.takeoff_type = "observed"
                     pending_metrics.ground_points_at_takeoff = ground_count_before_takeoff
                     pending_metrics.record_point(
-                        baro_alt=baro_alt,
-                        geom_alt=geom_alt,
-                        gs=gs,
-                        baro_rate=baro_rate,
-                        lat=lat,
-                        lon=lon,
-                        ts=abs_ts,
+                        point_data,
                         ground_state=point_state,
                         ground_reason=point_reason,
+                        config=config,
                         landing_speed_threshold=config.landing_speed_threshold_kts,
                     )
                     ground_count_before_takeoff = 0
@@ -488,15 +597,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     pending_metrics.takeoff_type = "observed"
                     pending_metrics.ground_points_at_takeoff = 1
                     pending_metrics.record_point(
-                        baro_alt=baro_alt,
-                        geom_alt=geom_alt,
-                        gs=gs,
-                        baro_rate=baro_rate,
-                        lat=lat,
-                        lon=lon,
-                        ts=abs_ts,
+                        point_data,
                         ground_state=point_state,
                         ground_reason=point_reason,
+                        config=config,
                         landing_speed_threshold=config.landing_speed_threshold_kts,
                     )
                     ground_count_before_takeoff = 0
@@ -624,6 +728,35 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
         flight.baro_error_points = metrics.baro_error_points
 
+        # v3 derived features - must run AFTER classify_landing + airport
+        # matching so mission/loiter/cruise/day-night all see final values.
+        features.derive_all(flight, metrics, config=config, type_code=type_code)
+
+        # v3 destination inference for dropped / signal_lost flights
+        if flight.landing_type in ("signal_lost", "dropped_on_approach") and flight.last_seen_lat is not None:
+            try:
+                candidates = db.find_nearby_airports(
+                    flight.last_seen_lat,
+                    flight.last_seen_lon,
+                    delta=config.prob_dest_search_delta,
+                    types=config.airport_types,
+                )
+            except Exception:
+                candidates = []
+            infer = features.infer_destination(
+                flight=flight,
+                metrics=metrics,
+                candidates=list(candidates),
+                config=config,
+            )
+            flight.probable_destination_icao = infer["probable_destination_icao"]
+            flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
+            flight.probable_destination_confidence = infer["probable_destination_confidence"]
+
         db.insert_flight(flight)
+
+    # v3: refresh materialized aircraft_stats for this ICAO
+    with contextlib.suppress(Exception):
+        db.refresh_aircraft_stats(hex_code)
 
     return len(valid_flights)

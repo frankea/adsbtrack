@@ -41,6 +41,66 @@ TYPE_ENDURANCE_MINUTES: dict[str, float] = {
 }
 
 
+# Type codes that are helicopters. Used by hover detection (only emit
+# max_hover_secs / hover_episodes on rotorcraft) and mission classification.
+HELICOPTER_TYPES: frozenset[str] = frozenset(
+    {
+        "B407",
+        "B429",
+        "B429E",
+        "EC30",
+        "EC35",
+        "EC45",
+        "EC20",
+        "EC25",
+        "EC75",
+        "S76",
+        "S92",
+        "H60",
+        "UH60",
+        "A109",
+        "A119",
+        "A139",
+        "A169",
+        "AS50",
+        "AS55",
+        "AS65",
+        "B06",
+        "B06T",
+        "B212",
+        "B412",
+    }
+)
+
+
+# Callsign prefix -> mission_type lookup. First match wins during mission
+# classification. Order of iteration not stable, so make sure prefixes are
+# disjoint.
+CALLSIGN_PREFIX_MISSIONS: dict[str, str] = {
+    "N911": "ems_hems",
+    "PHM": "offshore",
+    "PHI": "offshore",
+    "ERA": "offshore",
+    "BHI": "offshore",  # Bristow
+    "TWY": "exec_charter",
+    "GLF": "exec_charter",
+    "LJ": "exec_charter",
+    "NJE": "exec_charter",  # NetJets
+    "EJA": "exec_charter",  # NetJets legacy
+    "SCH": "training",
+    "SIK": "training",
+}
+
+
+# Emergency squawk severity. Higher value = more severe. Used to pick the
+# most-severe code when a flight sees multiple emergency squawks.
+EMERGENCY_SQUAWK_PRIORITY: dict[str, int] = {
+    "7500": 3,  # Hijack (most severe)
+    "7700": 2,  # General emergency
+    "7600": 1,  # Radio/comm failure
+}
+
+
 @dataclass
 class Config:
     db_path: Path = Path("adsbtrack.db")
@@ -98,3 +158,56 @@ class Config:
     dropped_tail_descent_min_count: int = 3
     dropped_tail_descent_rate_fpm: float = -200.0
     dropped_max_alt_ft: float = 5000.0
+
+    # --- v3 feature thresholds ---
+
+    # Path metrics
+    path_max_segment_secs: float = 60.0  # skip segments longer than this (coverage holes)
+
+    # Phase of flight attribution
+    phase_climb_fpm: float = 250.0  # >|this| fpm => climb or descent
+    phase_cruise_alt_ratio: float = 0.70  # cruise = level AND alt > ratio * max_altitude
+    phase_short_flight_min_secs: float = 120.0  # below this, cruise fields return NULL
+    phase_short_flight_min_alt: float = 500.0  # below this max altitude, cruise fields NULL
+
+    # Peak rate rolling window
+    peak_rate_window_secs: float = 30.0
+    peak_rate_min_samples: int = 3
+    peak_rate_min_span_secs: float = 20.0
+
+    # Hover detection (helicopter only)
+    hover_gs_threshold_kts: float = 5.0
+    hover_baro_rate_max_fpm: float = 100.0  # reject climb/descent samples pretending to hover
+    hover_min_duration_secs: float = 20.0
+
+    # Go-around detection
+    go_around_lookback_secs: float = 600.0
+    go_around_min_rebound_ft: float = 400.0
+    go_around_local_extremum_sep_ft: float = 50.0
+    go_around_local_extremum_window_secs: float = 30.0
+
+    # Heading aggregation (takeoff and landing)
+    heading_window_secs: float = 60.0
+    heading_min_gs_kts: float = 40.0
+
+    # Night detection: civil twilight cutoff in degrees
+    night_sun_altitude_deg: float = -6.0
+    # Quantization for LRU cache key on solar calls (coarser = more cache hits)
+    solar_cache_lat_lon_quant: float = 0.1  # degrees
+    solar_cache_ts_bucket_secs: float = 300.0  # 5 minutes
+    night_flight_ratio_threshold: float = 0.5
+
+    # Destination inference (for signal_lost / dropped_on_approach)
+    prob_dest_max_distance_km: float = 46.3  # 25 nm
+    prob_dest_search_delta: float = 0.5  # bbox degrees
+    prob_dest_alt_weight: float = 0.4
+    prob_dest_prox_weight: float = 0.4
+    prob_dest_descent_weight: float = 0.2
+
+    # approach_alts deque cap for go-around detection (samples, ~5s spacing)
+    approach_alts_maxlen: int = 240
+
+    # Helicopter types (mirror of HELICOPTER_TYPES for runtime access)
+    helicopter_types: frozenset[str] = field(default_factory=lambda: HELICOPTER_TYPES)
+    callsign_prefix_missions: dict[str, str] = field(default_factory=lambda: dict(CALLSIGN_PREFIX_MISSIONS))
+    emergency_squawk_priority: dict[str, int] = field(default_factory=lambda: dict(EMERGENCY_SQUAWK_PRIORITY))

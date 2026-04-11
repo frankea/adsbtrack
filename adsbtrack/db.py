@@ -68,7 +68,71 @@ CREATE TABLE IF NOT EXISTS flights (
     last_seen_lon REAL,
     last_seen_alt_ft INTEGER,
     last_seen_time TEXT,
+    squawk_first TEXT,
+    squawk_last TEXT,
+    squawk_changes INTEGER,
+    emergency_squawk TEXT,
+    vfr_flight INTEGER,
+    mission_type TEXT,
+    category_do260 TEXT,
+    autopilot_target_alt_ft INTEGER,
+    emergency_flag TEXT,
+    path_length_km REAL,
+    max_distance_km REAL,
+    loiter_ratio REAL,
+    path_efficiency REAL,
+    max_hover_secs INTEGER,
+    hover_episodes INTEGER,
+    go_around_count INTEGER,
+    takeoff_heading_deg REAL,
+    landing_heading_deg REAL,
+    climb_secs INTEGER,
+    cruise_secs INTEGER,
+    descent_secs INTEGER,
+    level_secs INTEGER,
+    cruise_alt_ft INTEGER,
+    cruise_gs_kt INTEGER,
+    peak_climb_fpm INTEGER,
+    peak_descent_fpm INTEGER,
+    takeoff_is_night INTEGER,
+    landing_is_night INTEGER,
+    night_flight INTEGER,
+    callsigns TEXT,
+    callsign_changes INTEGER,
+    probable_destination_icao TEXT,
+    probable_destination_distance_km REAL,
+    probable_destination_confidence REAL,
     UNIQUE(icao, takeoff_time)
+);
+
+CREATE TABLE IF NOT EXISTS aircraft_registry (
+    icao TEXT PRIMARY KEY,
+    registration TEXT,
+    type_code TEXT,
+    description TEXT,
+    owner_operator TEXT,
+    year TEXT,
+    last_updated TEXT,
+    metadata_drift_count INTEGER DEFAULT 0,
+    metadata_drift_values TEXT
+);
+
+CREATE TABLE IF NOT EXISTS aircraft_stats (
+    icao TEXT PRIMARY KEY,
+    registration TEXT,
+    type_code TEXT,
+    first_seen TEXT,
+    last_seen TEXT,
+    total_flights INTEGER,
+    confirmed_flights INTEGER,
+    total_hours REAL,
+    total_cycles INTEGER,
+    distinct_airports INTEGER,
+    distinct_callsigns INTEGER,
+    avg_flight_minutes REAL,
+    busiest_day_date TEXT,
+    busiest_day_count INTEGER,
+    updated_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS airports (
@@ -178,22 +242,13 @@ def _migrate_add_source(conn: sqlite3.Connection, db_path: Path):
         raise
 
 
-def _needs_quality_migration(conn: sqlite3.Connection) -> bool:
-    """Check if any quality columns are missing from flights. The migration
-    itself is idempotent per column, so we can safely run it whenever the
-    latest column is missing."""
-    cols = conn.execute("PRAGMA table_info(flights)").fetchall()
-    if not cols:
-        return False
-    col_names = {row[1] for row in cols}
-    # Check for the most recently added column
-    return "last_seen_time" not in col_names
-
-
-def _migrate_add_quality_columns(conn: sqlite3.Connection):
-    """Add flight quality metadata columns. Idempotent - safe to run on
-    databases at any stage of the migration history."""
+def _migrate_add_flight_columns(conn: sqlite3.Connection):
+    """Add all flight metadata columns. Idempotent - safe to run every
+    startup. Every ALTER TABLE ADD COLUMN is wrapped in suppress so the
+    "duplicate column name" error is swallowed cheaply. The list below is
+    the full history of column additions through v3."""
     new_columns = [
+        # v2 quality scoring
         ("landing_type", "TEXT DEFAULT 'unknown'"),
         ("takeoff_confidence", "REAL"),
         ("landing_confidence", "REAL"),
@@ -201,20 +256,58 @@ def _migrate_add_quality_columns(conn: sqlite3.Connection):
         ("sources", "TEXT"),
         ("max_altitude", "INTEGER"),
         ("ground_points_at_landing", "INTEGER"),
-        # Debug/scoring columns added in v2
         ("takeoff_type", "TEXT DEFAULT 'unknown'"),
         ("ground_points_at_takeoff", "INTEGER"),
         ("baro_error_points", "INTEGER"),
-        # Last-seen snapshot added in v3 for signal_lost traceability
         ("last_seen_lat", "REAL"),
         ("last_seen_lon", "REAL"),
         ("last_seen_alt_ft", "INTEGER"),
         ("last_seen_time", "TEXT"),
+        # v3 feature expansion
+        ("squawk_first", "TEXT"),
+        ("squawk_last", "TEXT"),
+        ("squawk_changes", "INTEGER"),
+        ("emergency_squawk", "TEXT"),
+        ("vfr_flight", "INTEGER"),
+        ("mission_type", "TEXT"),
+        ("category_do260", "TEXT"),
+        ("autopilot_target_alt_ft", "INTEGER"),
+        ("emergency_flag", "TEXT"),
+        ("path_length_km", "REAL"),
+        ("max_distance_km", "REAL"),
+        ("loiter_ratio", "REAL"),
+        ("path_efficiency", "REAL"),
+        ("max_hover_secs", "INTEGER"),
+        ("hover_episodes", "INTEGER"),
+        ("go_around_count", "INTEGER"),
+        ("takeoff_heading_deg", "REAL"),
+        ("landing_heading_deg", "REAL"),
+        ("climb_secs", "INTEGER"),
+        ("cruise_secs", "INTEGER"),
+        ("descent_secs", "INTEGER"),
+        ("level_secs", "INTEGER"),
+        ("cruise_alt_ft", "INTEGER"),
+        ("cruise_gs_kt", "INTEGER"),
+        ("peak_climb_fpm", "INTEGER"),
+        ("peak_descent_fpm", "INTEGER"),
+        ("takeoff_is_night", "INTEGER"),
+        ("landing_is_night", "INTEGER"),
+        ("night_flight", "INTEGER"),
+        ("callsigns", "TEXT"),
+        ("callsign_changes", "INTEGER"),
+        ("probable_destination_icao", "TEXT"),
+        ("probable_destination_distance_km", "REAL"),
+        ("probable_destination_confidence", "REAL"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(f"ALTER TABLE flights ADD COLUMN {col_name} {col_type}")
+
+
+def _flights_table_exists(conn: sqlite3.Connection) -> bool:
+    row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='flights'").fetchone()
+    return row is not None
 
 
 class Database:
@@ -233,11 +326,17 @@ class Database:
         # Migrate existing databases that lack the source column
         if _needs_source_migration(self.conn):
             _migrate_add_source(self.conn, db_path)
-        # Migrate to add flight quality columns
-        if _needs_quality_migration(self.conn):
-            _migrate_add_quality_columns(self.conn)
+        # Run the full column migration every startup. Each ALTER TABLE is
+        # wrapped in suppress so duplicate-column errors are ignored cheaply.
+        # This is much simpler than maintaining per-column sentinel checks.
+        if _flights_table_exists(self.conn):
+            _migrate_add_flight_columns(self.conn)
         for stmt in _SCHEMA_STATEMENTS:
             self.conn.execute(stmt)
+        # Also run the flight-column migration after CREATE TABLE so brand-new
+        # databases pick up any columns that might have been added since the
+        # schema string was last written (cheap, idempotent).
+        _migrate_add_flight_columns(self.conn)
 
     def __enter__(self):
         return self
@@ -315,8 +414,30 @@ class Database:
                 landing_type, takeoff_type, takeoff_confidence, landing_confidence,
                 data_points, sources, max_altitude,
                 ground_points_at_landing, ground_points_at_takeoff, baro_error_points,
-                last_seen_lat, last_seen_lon, last_seen_alt_ft, last_seen_time)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                last_seen_lat, last_seen_lon, last_seen_alt_ft, last_seen_time,
+                squawk_first, squawk_last, squawk_changes, emergency_squawk, vfr_flight,
+                mission_type, category_do260, autopilot_target_alt_ft, emergency_flag,
+                path_length_km, max_distance_km, loiter_ratio, path_efficiency,
+                max_hover_secs, hover_episodes, go_around_count,
+                takeoff_heading_deg, landing_heading_deg,
+                climb_secs, cruise_secs, descent_secs, level_secs,
+                cruise_alt_ft, cruise_gs_kt,
+                peak_climb_fpm, peak_descent_fpm,
+                takeoff_is_night, landing_is_night, night_flight,
+                callsigns, callsign_changes,
+                probable_destination_icao, probable_destination_distance_km, probable_destination_confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?, ?, ?,
+                       ?, ?,
+                       ?, ?, ?, ?,
+                       ?, ?,
+                       ?, ?,
+                       ?, ?, ?,
+                       ?, ?,
+                       ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -349,6 +470,40 @@ class Database:
                 flight.last_seen_lon,
                 flight.last_seen_alt_ft,
                 flight.last_seen_time.isoformat() if flight.last_seen_time else None,
+                flight.squawk_first,
+                flight.squawk_last,
+                flight.squawk_changes,
+                flight.emergency_squawk,
+                flight.vfr_flight,
+                flight.mission_type,
+                flight.category_do260,
+                flight.autopilot_target_alt_ft,
+                flight.emergency_flag,
+                flight.path_length_km,
+                flight.max_distance_km,
+                flight.loiter_ratio,
+                flight.path_efficiency,
+                flight.max_hover_secs,
+                flight.hover_episodes,
+                flight.go_around_count,
+                flight.takeoff_heading_deg,
+                flight.landing_heading_deg,
+                flight.climb_secs,
+                flight.cruise_secs,
+                flight.descent_secs,
+                flight.level_secs,
+                flight.cruise_alt_ft,
+                flight.cruise_gs_kt,
+                flight.peak_climb_fpm,
+                flight.peak_descent_fpm,
+                flight.takeoff_is_night,
+                flight.landing_is_night,
+                flight.night_flight,
+                flight.callsigns,
+                flight.callsign_changes,
+                flight.probable_destination_icao,
+                flight.probable_destination_distance_km,
+                flight.probable_destination_confidence,
             ),
         )
 
@@ -465,3 +620,164 @@ class Database:
                 AND type IN ({placeholders})""",
             (lat - delta, lat + delta, lon - delta, lon + delta, *types),
         ).fetchall()
+
+    # -- aircraft_registry (authoritative per-ICAO identity, v3) --
+
+    def upsert_aircraft_registry(self, icao: str, trace_rows: list[sqlite3.Row]) -> dict | None:
+        """Resolve authoritative metadata for an ICAO from trace_days rows.
+
+        Picks the most recently fetched row as the source of truth, and flags
+        metadata drift when any other row disagrees on type_code / description.
+        Returns the resolved row as a dict, or None if no rows were provided.
+        """
+        if not trace_rows:
+            return None
+        # Most recently fetched row wins
+        latest = max(trace_rows, key=lambda r: r["fetched_at"] or "")
+
+        # Detect drift: different non-null type_code/description/registration
+        drift_values: list[dict] = []
+        latest_type = latest["type_code"]
+        latest_desc = latest["description"]
+        seen_types: dict[tuple[str | None, str | None], int] = {}
+        for row in trace_rows:
+            tc = row["type_code"]
+            desc = row["description"]
+            key = (tc, desc)
+            seen_types[key] = seen_types.get(key, 0) + 1
+        drift_count = 0
+        for (tc, desc), count in seen_types.items():
+            if tc == latest_type and desc == latest_desc:
+                continue
+            if tc is None and desc is None:
+                continue
+            drift_count += count
+            drift_values.append({"type_code": tc, "description": desc, "count": count})
+
+        self.conn.execute(
+            """INSERT OR REPLACE INTO aircraft_registry
+               (icao, registration, type_code, description, owner_operator, year,
+                last_updated, metadata_drift_count, metadata_drift_values)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                icao,
+                latest["registration"],
+                latest["type_code"],
+                latest["description"],
+                latest["owner_operator"],
+                latest["year"],
+                datetime.now(UTC).isoformat(),
+                drift_count,
+                json.dumps(drift_values) if drift_values else None,
+            ),
+        )
+        return {
+            "icao": icao,
+            "registration": latest["registration"],
+            "type_code": latest["type_code"],
+            "description": latest["description"],
+            "owner_operator": latest["owner_operator"],
+            "year": latest["year"],
+            "metadata_drift_count": drift_count,
+        }
+
+    def get_aircraft_registry(self, icao: str) -> sqlite3.Row | None:
+        return self.conn.execute("SELECT * FROM aircraft_registry WHERE icao = ?", (icao,)).fetchone()
+
+    # -- aircraft_stats (materialized rollup, v3) --
+
+    def refresh_aircraft_stats(self, icao: str | None = None) -> int:
+        """Rebuild aircraft_stats rows from the current flights table.
+
+        If ``icao`` is given, only that aircraft is refreshed. Otherwise all
+        aircraft in the flights table get rolled up. Returns the number of
+        rows written.
+        """
+        where_clause = ""
+        params: list = []
+        if icao:
+            where_clause = "WHERE icao = ?"
+            params.append(icao)
+
+        # Aggregate core metrics in one sweep
+        core_rows = self.conn.execute(
+            f"""
+            SELECT icao,
+                   MIN(takeoff_date) AS first_seen,
+                   MAX(takeoff_date) AS last_seen,
+                   COUNT(*) AS total_flights,
+                   SUM(CASE WHEN landing_type = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_flights,
+                   SUM(COALESCE(duration_minutes, 0)) / 60.0 AS total_hours,
+                   AVG(duration_minutes) AS avg_flight_minutes
+            FROM flights
+            {where_clause}
+            GROUP BY icao
+            """,
+            params,
+        ).fetchall()
+
+        if not core_rows:
+            return 0
+
+        written = 0
+        now_iso = datetime.now(UTC).isoformat()
+        for row in core_rows:
+            this_icao = row["icao"]
+
+            distinct_airports_row = self.conn.execute(
+                """
+                SELECT COUNT(DISTINCT airport) AS cnt FROM (
+                    SELECT origin_icao AS airport FROM flights WHERE icao = ? AND origin_icao IS NOT NULL
+                    UNION
+                    SELECT destination_icao FROM flights WHERE icao = ? AND destination_icao IS NOT NULL
+                )
+                """,
+                (this_icao, this_icao),
+            ).fetchone()
+
+            distinct_callsigns_row = self.conn.execute(
+                "SELECT COUNT(DISTINCT callsign) AS cnt FROM flights WHERE icao = ? AND callsign IS NOT NULL",
+                (this_icao,),
+            ).fetchone()
+
+            busiest_row = self.conn.execute(
+                """
+                SELECT takeoff_date, COUNT(*) AS cnt
+                FROM flights
+                WHERE icao = ?
+                GROUP BY takeoff_date
+                ORDER BY cnt DESC, takeoff_date DESC
+                LIMIT 1
+                """,
+                (this_icao,),
+            ).fetchone()
+
+            registry = self.get_aircraft_registry(this_icao)
+
+            self.conn.execute(
+                """INSERT OR REPLACE INTO aircraft_stats
+                   (icao, registration, type_code, first_seen, last_seen,
+                    total_flights, confirmed_flights, total_hours, total_cycles,
+                    distinct_airports, distinct_callsigns, avg_flight_minutes,
+                    busiest_day_date, busiest_day_count, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    this_icao,
+                    registry["registration"] if registry else None,
+                    registry["type_code"] if registry else None,
+                    row["first_seen"],
+                    row["last_seen"],
+                    row["total_flights"],
+                    row["confirmed_flights"],
+                    round(row["total_hours"] or 0.0, 2),
+                    row["confirmed_flights"],  # cycles = confirmed landings
+                    distinct_airports_row["cnt"] if distinct_airports_row else 0,
+                    distinct_callsigns_row["cnt"] if distinct_callsigns_row else 0,
+                    round(row["avg_flight_minutes"] or 0.0, 1),
+                    busiest_row["takeoff_date"] if busiest_row else None,
+                    busiest_row["cnt"] if busiest_row else 0,
+                    now_iso,
+                ),
+            )
+            written += 1
+        return written

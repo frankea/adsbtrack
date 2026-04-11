@@ -182,6 +182,12 @@ def fetch_traces(
             stats["fetched"] += 1
             progress.advance(task)
 
+            # Commit after each day so the write transaction doesn't stay open
+            # across the rate-limit sleep. In WAL mode only one writer at a time
+            # can hold the lock, so holding it for >30s blocks any concurrent
+            # fetch past the busy_timeout.
+            db.commit()
+
             # Gradually recover delay after consecutive successes
             successes_since_backoff += 1
             if current_delay > config.rate_limit and successes_since_backoff >= config.rate_limit_recovery:
@@ -190,10 +196,6 @@ def fetch_traces(
                 progress.console.print(f"  [green]Rate recovering, delay now {current_delay:.1f}s[/]")
 
             time.sleep(current_delay)
-
-            # Commit periodically so progress is saved on interrupt
-            if stats["fetched"] % 50 == 0:
-                db.commit()
 
         db.commit()
 
@@ -274,10 +276,10 @@ def fetch_traces_adsblol(db: Database, config: Config, hex_code: str, start_date
 
             stats["fetched"] += 1
             progress.advance(task)
+            # Commit after each day so concurrent fetches on the same db
+            # don't block past the WAL busy_timeout.
+            db.commit()
             time.sleep(config.rate_limit)
-
-            if stats["fetched"] % 50 == 0:
-                db.commit()
 
         db.commit()
 

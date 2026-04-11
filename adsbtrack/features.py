@@ -1,0 +1,663 @@
+"""Per-flight derived features.
+
+Pure functions that take a ``FlightMetrics`` (and sometimes a ``Flight``
+plus small primitives like ``type_code``) and return derived values to
+populate on the Flight row. No database, no I/O, no ``Flight`` mutation
+except the convenience ``derive_all`` at the bottom which applies every
+feature to a Flight in one pass.
+
+The keystone data-extraction work happens in ``classifier.FlightMetrics``
+during the trace walk in ``parser.extract_flights``. This module is the
+"now turn all those raw counters into the columns the user sees" half.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+from collections import Counter
+from datetime import datetime
+from typing import TYPE_CHECKING
+
+from .airports import haversine_km
+from .classifier import _haversine_m, descent_score
+from .solar import is_night_at
+
+if TYPE_CHECKING:
+    from .classifier import FlightMetrics
+    from .config import Config
+    from .models import Flight
+
+
+# ----------------------------------------------------------------------
+# Mission classification (§2)
+# ----------------------------------------------------------------------
+
+
+def classify_mission(
+    *,
+    callsign: str | None,
+    origin_icao: str | None,
+    destination_icao: str | None,
+    max_altitude: int | None,
+    loiter_ratio: float | None,
+    cruise_gs_kt: int | None,
+    config: Config,
+) -> str:
+    """Return a mission_type enum string for the flight."""
+    if callsign:
+        cs = callsign.strip().upper()
+        # Prefix lookup
+        for prefix, mission in config.callsign_prefix_missions.items():
+            if cs.startswith(prefix):
+                return mission
+        # N911 prefix (already in the dict but keep as a secondary safety)
+        if cs.startswith("N911"):
+            return "ems_hems"
+        # MT suffix (MedTrans) but not LMT / RMT / AMT
+        if cs.endswith("MT") and not cs.endswith(("LMT", "RMT", "AMT")):
+            return "ems_hems"
+
+    # Physics rules
+    if loiter_ratio is not None and loiter_ratio > 3.0 and cruise_gs_kt is not None and cruise_gs_kt < 120:
+        return "survey"
+
+    if (
+        origin_icao is not None
+        and destination_icao is not None
+        and origin_icao == destination_icao
+        and max_altitude is not None
+        and max_altitude < 3000
+    ):
+        return "pattern"
+
+    if origin_icao is not None and destination_icao is not None and origin_icao != destination_icao:
+        return "transport"
+
+    return "unknown"
+
+
+# ----------------------------------------------------------------------
+# Path metrics (§3, §9)
+# ----------------------------------------------------------------------
+
+
+def compute_path_metrics(
+    metrics: FlightMetrics,
+    *,
+    origin_icao: str | None,
+    destination_icao: str | None,
+    takeoff_lat: float,
+    takeoff_lon: float,
+    landing_lat: float | None,
+    landing_lon: float | None,
+) -> dict:
+    """Return a dict of {path_length_km, max_distance_km, loiter_ratio, path_efficiency}."""
+    path_length_km = round(metrics.path_length_km, 2) if metrics.path_length_km > 0 else None
+    max_distance_km = round(metrics.max_distance_from_origin_km, 2) if metrics.max_distance_from_origin_km > 0 else None
+
+    loiter_ratio: float | None = None
+    if path_length_km is not None and max_distance_km is not None and max_distance_km > 0:
+        loiter_ratio = round(path_length_km / (2.0 * max_distance_km), 3)
+
+    path_efficiency: float | None = None
+    if (
+        path_length_km is not None
+        and path_length_km > 1.0
+        and origin_icao is not None
+        and destination_icao is not None
+        and origin_icao != destination_icao
+        and landing_lat is not None
+        and landing_lon is not None
+    ):
+        gc_km = haversine_km(takeoff_lat, takeoff_lon, landing_lat, landing_lon)
+        if gc_km > 0 and path_length_km > 0:
+            path_efficiency = round(min(1.0, gc_km / path_length_km), 3)
+
+    return {
+        "path_length_km": path_length_km,
+        "max_distance_km": max_distance_km,
+        "loiter_ratio": loiter_ratio,
+        "path_efficiency": path_efficiency,
+    }
+
+
+# ----------------------------------------------------------------------
+# Phase of flight budget (§7)
+# ----------------------------------------------------------------------
+
+
+def compute_phase_budget(metrics: FlightMetrics, *, config: Config) -> dict:
+    """Reconcile level samples into cruise/non-cruise using final max_altitude.
+
+    climb/descent/level seconds are already accumulated online; this function
+    splits the level bucket into cruise (alt > ratio * max) and plain level.
+    Short flights and low-ceiling flights return NULL cruise fields.
+    """
+    climb_secs = int(round(metrics.climb_secs))
+    descent_secs = int(round(metrics.descent_secs))
+    level_total = metrics.level_secs
+
+    max_alt = metrics.max_altitude or 0
+    min_secs = config.phase_short_flight_min_secs
+    min_alt = config.phase_short_flight_min_alt
+    ratio = config.phase_cruise_alt_ratio
+
+    duration_secs = 0.0
+    if metrics.first_point_ts is not None and metrics.last_point_ts is not None:
+        duration_secs = metrics.last_point_ts - metrics.first_point_ts
+
+    if max_alt < min_alt or duration_secs < min_secs or not metrics.level_buf:
+        return {
+            "climb_secs": climb_secs,
+            "descent_secs": descent_secs,
+            "level_secs": int(round(level_total)),
+            "cruise_secs": None,
+            "cruise_alt_ft": None,
+            "cruise_gs_kt": None,
+        }
+
+    cruise_threshold = max_alt * ratio
+    cruise_secs_val = 0.0
+    cruise_alt_sum = 0.0
+    cruise_alt_count = 0
+    cruise_gs_sum = 0.0
+    cruise_gs_count = 0
+    level_secs_val = 0.0
+    for dt, alt, gs in metrics.level_buf:
+        if alt >= cruise_threshold:
+            cruise_secs_val += dt
+            cruise_alt_sum += alt * dt
+            cruise_alt_count += int(round(dt))
+            if gs is not None:
+                cruise_gs_sum += gs * dt
+                cruise_gs_count += int(round(dt))
+        else:
+            level_secs_val += dt
+
+    cruise_alt_ft: int | None = None
+    if cruise_secs_val > 0 and cruise_alt_count > 0:
+        cruise_alt_ft = int(round(cruise_alt_sum / max(1, cruise_secs_val)))
+    cruise_gs_kt: int | None = None
+    if cruise_gs_count > 0:
+        cruise_gs_kt = int(round(cruise_gs_sum / max(1, cruise_secs_val)))
+
+    return {
+        "climb_secs": climb_secs,
+        "descent_secs": descent_secs,
+        "level_secs": int(round(level_secs_val)),
+        "cruise_secs": int(round(cruise_secs_val)),
+        "cruise_alt_ft": cruise_alt_ft,
+        "cruise_gs_kt": cruise_gs_kt,
+    }
+
+
+# ----------------------------------------------------------------------
+# Peak climb/descent (§8)
+# ----------------------------------------------------------------------
+
+
+def compute_peak_rates(metrics: FlightMetrics) -> dict:
+    """Read peak climb/descent from online accumulators."""
+    peak_climb = int(round(metrics.peak_climb_fpm)) if metrics.peak_climb_fpm > 0 else None
+    peak_descent = int(round(metrics.peak_descent_fpm)) if metrics.peak_descent_fpm < 0 else None
+    return {"peak_climb_fpm": peak_climb, "peak_descent_fpm": peak_descent}
+
+
+# ----------------------------------------------------------------------
+# Hover detection (§4)
+# ----------------------------------------------------------------------
+
+
+def compute_hover(metrics: FlightMetrics, *, type_code: str | None, config: Config) -> dict:
+    """Emit hover stats only for rotorcraft. NULL on everything else.
+
+    Any ongoing hover at end-of-flight is folded into the totals.
+    """
+    if type_code is None or type_code not in config.helicopter_types:
+        return {"max_hover_secs": None, "hover_episodes": None}
+
+    max_hover = metrics.max_hover_secs
+    episodes = metrics.hover_episodes
+
+    # Fold any ongoing hover at end of flight
+    if metrics._hover_start_ts is not None and metrics.last_point_ts is not None:
+        ongoing = metrics.last_point_ts - metrics._hover_start_ts
+        if ongoing >= config.hover_min_duration_secs:
+            episodes += 1
+            if ongoing > max_hover:
+                max_hover = ongoing
+
+    return {
+        "max_hover_secs": int(round(max_hover)) if max_hover > 0 else 0,
+        "hover_episodes": episodes,
+    }
+
+
+# ----------------------------------------------------------------------
+# Go-around detection (§5)
+# ----------------------------------------------------------------------
+
+
+def compute_go_around(metrics: FlightMetrics, *, landing_type: str, config: Config) -> int:
+    """Count go-arounds in the final approach window.
+
+    Only runs on confirmed landings - otherwise the "final descent" anchor
+    doesn't exist and the algorithm is meaningless.
+    """
+    if landing_type != "confirmed":
+        return 0
+    if not metrics.approach_alts or metrics.landing_transition_ts is None:
+        return 0
+
+    # Restrict to the final lookback window before landing.
+    cutoff = metrics.landing_transition_ts - config.go_around_lookback_secs
+    window = [(ts, alt) for (ts, alt) in metrics.approach_alts if cutoff <= ts <= metrics.landing_transition_ts]
+    if len(window) < 6:
+        return 0
+
+    min_rebound = config.go_around_min_rebound_ft
+    extremum_sep = config.go_around_local_extremum_sep_ft
+    extremum_window = config.go_around_local_extremum_window_secs
+
+    # Find local minima and maxima with neighbor-separation gating to reject
+    # baro noise. A point P is a local min if there exists at least one point
+    # within ±extremum_window seconds that is >= P.alt + extremum_sep; symmetric
+    # for local max.
+    n = len(window)
+    is_min = [False] * n
+    is_max = [False] * n
+    for i in range(n):
+        ts_i, alt_i = window[i]
+        lower = None
+        upper = None
+        for j in range(n):
+            if i == j:
+                continue
+            ts_j, alt_j = window[j]
+            if abs(ts_j - ts_i) > extremum_window:
+                continue
+            if lower is None or alt_j < lower:
+                lower = alt_j
+            if upper is None or alt_j > upper:
+                upper = alt_j
+        if lower is not None and upper is not None:
+            # Local min if neighbors include at least one higher by >= extremum_sep
+            if upper - alt_i >= extremum_sep and alt_i <= lower + 1e-6:
+                is_min[i] = True
+            # Local max if neighbors include at least one lower by >= extremum_sep
+            if alt_i - lower >= extremum_sep and alt_i >= upper - 1e-6:
+                is_max[i] = True
+
+    # Walk forward: consume each (min A, max B) pair where B-A >= min_rebound
+    count = 0
+    i = 0
+    while i < n:
+        if not is_min[i]:
+            i += 1
+            continue
+        min_alt = window[i][1]
+        # Find next local max after i
+        j = i + 1
+        while j < n and not is_max[j]:
+            j += 1
+        if j >= n:
+            break
+        max_alt = window[j][1]
+        if max_alt - min_alt >= min_rebound:
+            count += 1
+        i = j + 1
+
+    return count
+
+
+# ----------------------------------------------------------------------
+# Takeoff / landing heading (§6)
+# ----------------------------------------------------------------------
+
+
+def _circular_mean_deg(headings: list[float]) -> float | None:
+    if not headings:
+        return None
+    xs = sum(math.sin(math.radians(h)) for h in headings)
+    ys = sum(math.cos(math.radians(h)) for h in headings)
+    if xs == 0 and ys == 0:
+        return None
+    deg = math.degrees(math.atan2(xs, ys))
+    return (deg + 360.0) % 360.0
+
+
+def compute_headings(metrics: FlightMetrics, *, config: Config) -> dict:
+    min_gs = config.heading_min_gs_kts
+    heading_window = config.heading_window_secs
+
+    # Takeoff: use already-collected takeoff_tracks buffer, filter by gs
+    takeoff_tracks = [h for (_ts, h, gs) in metrics.takeoff_tracks if gs is None or gs > min_gs]
+    takeoff_heading = _circular_mean_deg(takeoff_tracks)
+
+    # Landing: restrict to the final heading_window seconds before landing
+    landing_heading: float | None = None
+    if metrics.landing_tracks and metrics.landing_transition_ts is not None:
+        cutoff = metrics.landing_transition_ts - heading_window
+        final_tracks = [
+            h
+            for (ts, h, gs) in metrics.landing_tracks
+            if cutoff <= ts <= metrics.landing_transition_ts and (gs is None or gs > min_gs)
+        ]
+        landing_heading = _circular_mean_deg(final_tracks)
+
+    return {
+        "takeoff_heading_deg": round(takeoff_heading, 1) if takeoff_heading is not None else None,
+        "landing_heading_deg": round(landing_heading, 1) if landing_heading is not None else None,
+    }
+
+
+# ----------------------------------------------------------------------
+# DO-260 category (§10)
+# ----------------------------------------------------------------------
+
+
+def classify_category_do260(metrics: FlightMetrics) -> str | None:
+    if not metrics.category_counts:
+        return None
+    counter = Counter(metrics.category_counts)
+    # most_common returns sorted by count desc; break ties lexicographically
+    top = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    return top[0][0]
+
+
+# ----------------------------------------------------------------------
+# Squawk summary (§1)
+# ----------------------------------------------------------------------
+
+
+def compute_squawk_summary(metrics: FlightMetrics, *, config: Config) -> dict:
+    emergency = None
+    if metrics.emergency_squawks_seen:
+        # Pick most severe by priority
+        prio = config.emergency_squawk_priority
+        emergency = max(metrics.emergency_squawks_seen, key=lambda s: prio.get(s, 0))
+
+    vfr = None
+    if metrics.squawk_total_count > 0:
+        vfr = 1 if metrics.squawk_1200_count / metrics.squawk_total_count >= 0.8 else 0
+
+    return {
+        "squawk_first": metrics.squawk_first,
+        "squawk_last": metrics.squawk_last,
+        "squawk_changes": metrics.squawk_changes if metrics.squawk_total_count > 0 else None,
+        "emergency_squawk": emergency,
+        "vfr_flight": vfr,
+    }
+
+
+# ----------------------------------------------------------------------
+# Callsigns history (§12)
+# ----------------------------------------------------------------------
+
+
+def compute_callsigns_summary(metrics: FlightMetrics) -> dict:
+    if not metrics.callsigns_seen:
+        return {"callsigns": None, "callsign_changes": None}
+    unique = sorted(set(metrics.callsigns_seen))
+    return {
+        "callsigns": json.dumps(unique, ensure_ascii=True),
+        "callsign_changes": metrics.callsign_changes,
+    }
+
+
+# ----------------------------------------------------------------------
+# Day / night (§11)
+# ----------------------------------------------------------------------
+
+
+def compute_day_night(
+    *,
+    takeoff_time: datetime,
+    takeoff_lat: float,
+    takeoff_lon: float,
+    landing_time: datetime | None,
+    landing_lat: float | None,
+    landing_lon: float | None,
+    metrics: FlightMetrics,
+    config: Config,
+) -> dict:
+    takeoff_night = (
+        1
+        if is_night_at(
+            takeoff_time,
+            takeoff_lat,
+            takeoff_lon,
+            threshold_deg=config.night_sun_altitude_deg,
+            lat_lon_quant_deg=config.solar_cache_lat_lon_quant,
+            ts_bucket_secs=config.solar_cache_ts_bucket_secs,
+        )
+        else 0
+    )
+
+    landing_night: int | None = None
+    if landing_time is not None and landing_lat is not None and landing_lon is not None:
+        landing_night = (
+            1
+            if is_night_at(
+                landing_time,
+                landing_lat,
+                landing_lon,
+                threshold_deg=config.night_sun_altitude_deg,
+                lat_lon_quant_deg=config.solar_cache_lat_lon_quant,
+                ts_bucket_secs=config.solar_cache_ts_bucket_secs,
+            )
+            else 0
+        )
+
+    # Per-point aggregate using recent_points. This is only the tail of the
+    # flight (recent_points deque), which is a reasonable approximation for
+    # "most of the flight" on short flights and for "the cruise + descent"
+    # on long ones. For perfect fidelity we'd keep a full list; we accept the
+    # approximation as the cost of bounded memory.
+    night_count = 0
+    day_count = 0
+    for sample in metrics.recent_points:
+        if metrics.last_seen_lat is None or metrics.last_seen_lon is None:
+            break
+        try:
+            dt = datetime.fromtimestamp(sample.ts)
+        except (OSError, OverflowError, ValueError):
+            continue
+        if is_night_at(
+            dt,
+            metrics.last_seen_lat,
+            metrics.last_seen_lon,
+            threshold_deg=config.night_sun_altitude_deg,
+            lat_lon_quant_deg=config.solar_cache_lat_lon_quant,
+            ts_bucket_secs=config.solar_cache_ts_bucket_secs,
+        ):
+            night_count += 1
+        else:
+            day_count += 1
+    total = night_count + day_count
+    night_flight: int | None = None
+    if total > 0:
+        night_flight = 1 if (night_count / total) >= config.night_flight_ratio_threshold else 0
+
+    return {
+        "takeoff_is_night": takeoff_night,
+        "landing_is_night": landing_night,
+        "night_flight": night_flight,
+    }
+
+
+# ----------------------------------------------------------------------
+# Destination inference (§15)
+# ----------------------------------------------------------------------
+
+
+def infer_destination(
+    *,
+    flight: Flight,
+    metrics: FlightMetrics,
+    candidates: list,
+    config: Config,
+) -> dict:
+    """Compute probable destination for signal_lost / dropped_on_approach.
+
+    ``candidates`` is a list of airport rows (as returned by
+    ``db.find_nearby_airports``) that parser.py has already queried around
+    the last-seen position. This function is pure - no db calls.
+    """
+    if flight.landing_type not in ("signal_lost", "dropped_on_approach"):
+        return {
+            "probable_destination_icao": None,
+            "probable_destination_distance_km": None,
+            "probable_destination_confidence": None,
+        }
+    if flight.last_seen_lat is None or flight.last_seen_lon is None or not candidates:
+        return {
+            "probable_destination_icao": None,
+            "probable_destination_distance_km": None,
+            "probable_destination_confidence": None,
+        }
+
+    max_km = config.prob_dest_max_distance_km
+    best = None
+    best_dist = float("inf")
+    for ap in candidates:
+        d_m = _haversine_m(flight.last_seen_lat, flight.last_seen_lon, ap["latitude_deg"], ap["longitude_deg"])
+        d_km = d_m / 1000.0
+        if d_km <= max_km and d_km < best_dist:
+            best = ap
+            best_dist = d_km
+
+    if best is None:
+        return {
+            "probable_destination_icao": None,
+            "probable_destination_distance_km": None,
+            "probable_destination_confidence": None,
+        }
+
+    # Confidence factors
+    alt = flight.last_seen_alt_ft or 5000
+    alt_factor = max(0.0, min(1.0, (5000.0 - alt) / 4500.0))  # 500ft->1.0, 5000ft->0.0
+    prox_factor = max(0.0, min(1.0, 1.0 - best_dist / max_km))
+    descent_factor = descent_score(metrics.recent_points)
+
+    confidence = (
+        alt_factor * config.prob_dest_alt_weight
+        + prox_factor * config.prob_dest_prox_weight
+        + descent_factor * config.prob_dest_descent_weight
+    )
+
+    return {
+        "probable_destination_icao": best["ident"],
+        "probable_destination_distance_km": round(best_dist, 2),
+        "probable_destination_confidence": round(confidence, 2),
+    }
+
+
+# ----------------------------------------------------------------------
+# One-call application
+# ----------------------------------------------------------------------
+
+
+def derive_all(
+    flight: Flight,
+    metrics: FlightMetrics,
+    *,
+    config: Config,
+    type_code: str | None,
+) -> None:
+    """Mutate ``flight`` in-place with all derived v3 features.
+
+    Must be called AFTER ``classify_landing`` has set ``flight.landing_type``
+    and airport matching has populated origin/destination.
+
+    Destination inference is NOT run here - it needs a candidates list from
+    the database. Call ``infer_destination`` separately in the parser.
+    """
+    # Path metrics
+    path = compute_path_metrics(
+        metrics,
+        origin_icao=flight.origin_icao,
+        destination_icao=flight.destination_icao,
+        takeoff_lat=flight.takeoff_lat,
+        takeoff_lon=flight.takeoff_lon,
+        landing_lat=flight.landing_lat,
+        landing_lon=flight.landing_lon,
+    )
+    flight.path_length_km = path["path_length_km"]
+    flight.max_distance_km = path["max_distance_km"]
+    flight.loiter_ratio = path["loiter_ratio"]
+    flight.path_efficiency = path["path_efficiency"]
+
+    # Phase budget (gate altitude-derived fields for altitude_error flights)
+    if flight.landing_type != "altitude_error":
+        phase = compute_phase_budget(metrics, config=config)
+        flight.climb_secs = phase["climb_secs"]
+        flight.descent_secs = phase["descent_secs"]
+        flight.level_secs = phase["level_secs"]
+        flight.cruise_secs = phase["cruise_secs"]
+        flight.cruise_alt_ft = phase["cruise_alt_ft"]
+        flight.cruise_gs_kt = phase["cruise_gs_kt"]
+
+        peak = compute_peak_rates(metrics)
+        flight.peak_climb_fpm = peak["peak_climb_fpm"]
+        flight.peak_descent_fpm = peak["peak_descent_fpm"]
+
+    # Hover (rotorcraft only)
+    hov = compute_hover(metrics, type_code=type_code, config=config)
+    flight.max_hover_secs = hov["max_hover_secs"]
+    flight.hover_episodes = hov["hover_episodes"]
+
+    # Go-around (confirmed landings only)
+    flight.go_around_count = compute_go_around(metrics, landing_type=flight.landing_type, config=config)
+
+    # Headings
+    headings = compute_headings(metrics, config=config)
+    flight.takeoff_heading_deg = headings["takeoff_heading_deg"]
+    flight.landing_heading_deg = headings["landing_heading_deg"]
+
+    # Squawks
+    sq = compute_squawk_summary(metrics, config=config)
+    flight.squawk_first = sq["squawk_first"]
+    flight.squawk_last = sq["squawk_last"]
+    flight.squawk_changes = sq["squawk_changes"]
+    flight.emergency_squawk = sq["emergency_squawk"]
+    flight.vfr_flight = sq["vfr_flight"]
+
+    # Callsigns
+    cs = compute_callsigns_summary(metrics)
+    flight.callsigns = cs["callsigns"]
+    flight.callsign_changes = cs["callsign_changes"]
+
+    # DO-260 category
+    flight.category_do260 = classify_category_do260(metrics)
+
+    # Autopilot + detail emergency
+    flight.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
+    flight.emergency_flag = metrics.emergency_flag
+
+    # Mission
+    flight.mission_type = classify_mission(
+        callsign=flight.callsign,
+        origin_icao=flight.origin_icao,
+        destination_icao=flight.destination_icao,
+        max_altitude=flight.max_altitude,
+        loiter_ratio=flight.loiter_ratio,
+        cruise_gs_kt=flight.cruise_gs_kt,
+        config=config,
+    )
+
+    # Day / night
+    day_night = compute_day_night(
+        takeoff_time=flight.takeoff_time,
+        takeoff_lat=flight.takeoff_lat,
+        takeoff_lon=flight.takeoff_lon,
+        landing_time=flight.landing_time,
+        landing_lat=flight.landing_lat,
+        landing_lon=flight.landing_lon,
+        metrics=metrics,
+        config=config,
+    )
+    flight.takeoff_is_night = day_night["takeoff_is_night"]
+    flight.landing_is_night = day_night["landing_is_night"]
+    flight.night_flight = day_night["night_flight"]

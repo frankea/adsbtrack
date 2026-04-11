@@ -26,6 +26,35 @@ from collections import deque
 from dataclasses import dataclass, field
 
 
+@dataclass(slots=True, frozen=True)
+class PointData:
+    """All fields extracted from a single readsb trace point.
+
+    Produced by `parser._extract_point_fields`, consumed by
+    `FlightMetrics.record_point`. A frozen slotted dataclass keeps the
+    hot-loop memory footprint small and catches accidental mutation.
+
+    Fields that are not present in a given trace point are None.
+    """
+
+    ts: float  # absolute unix timestamp
+    lat: float
+    lon: float
+    baro_alt: int | str | None  # int ft or the literal string 'ground'
+    gs: float | None
+    track: float | None  # ground track, degrees true
+    geom_alt: int | None
+    baro_rate: float | None
+    geom_rate: float | None
+    squawk: str | None
+    category: str | None  # DO-260B category code, e.g. "A7"
+    nav_altitude_mcp: int | None  # autopilot selected altitude
+    nav_qnh: float | None
+    emergency_field: str | None  # detail.emergency ("none", "general", "lifeguard", ...)
+    true_heading: float | None
+    callsign: str | None  # detail.flight (stripped)
+
+
 @dataclass
 class _PointSample:
     """A lightweight snapshot of a trace point kept for descent scoring."""
@@ -56,8 +85,11 @@ class FlightMetrics:
     landing_lats: list[float] = field(default_factory=list)
     landing_lons: list[float] = field(default_factory=list)
     # Rolling wall-clock window of recent points for descent analysis.
-    # Only the last ~300 seconds are needed; we keep the last 40 points as a cap.
-    recent_points: deque = field(default_factory=lambda: deque(maxlen=40))
+    # Bumped from 40 to 240 in v3 so go-around detection can walk back 600s.
+    recent_points: deque = field(default_factory=lambda: deque(maxlen=240))
+    # Dedicated (ts, alt) deque for go-around detection. Separate from
+    # recent_points so the two use-cases don't constrain each other.
+    approach_alts: deque = field(default_factory=lambda: deque(maxlen=240))
     # Takeoff category: "observed" (saw ground -> airborne) or "found_mid_flight"
     takeoff_type: str = "unknown"
     # First/last observed point timestamps - used to compute duration for
@@ -75,26 +107,101 @@ class FlightMetrics:
     # the classifier to pick a pre-flare descent window.
     landing_transition_ts: float | None = None
 
+    # --- v3 accumulators ---
+
+    # Squawk tracking
+    squawk_first: str | None = None
+    squawk_last: str | None = None
+    squawk_changes: int = 0
+    squawk_1200_count: int = 0
+    squawk_total_count: int = 0
+    emergency_squawks_seen: set[str] = field(default_factory=set)
+
+    # Callsign history (observed callsigns across the flight in order of
+    # first appearance; distinct only)
+    callsigns_seen: list[str] = field(default_factory=list)
+    callsign_changes: int = 0
+
+    # Path length and position tracking
+    origin_lat: float | None = None
+    origin_lon: float | None = None
+    path_length_km: float = 0.0
+    max_distance_from_origin_km: float = 0.0
+    _prev_path_lat: float | None = None
+    _prev_path_lon: float | None = None
+    _prev_path_ts: float | None = None
+
+    # Phase of flight: integer-second counters for climb/descent/level;
+    # cruise is computed in a post-pass from level_buf once max_altitude is known
+    climb_secs: float = 0.0
+    descent_secs: float = 0.0
+    level_secs: float = 0.0
+    # Each entry: (dt_secs, alt_ft, gs_kt). Only level-phase samples.
+    level_buf: list[tuple[float, int, float | None]] = field(default_factory=list)
+
+    # Peak climb/descent over a rolling 30s window. The window is maintained
+    # during record_point as (ts, rate_fpm) tuples; rate is chosen as
+    # geom_rate > baro_rate > derived. Peaks are best 30s-mean observed.
+    _rate_window: deque = field(default_factory=deque)
+    peak_climb_fpm: float = 0.0
+    peak_descent_fpm: float = 0.0
+
+    # Hover state machine
+    _hover_start_ts: float | None = None
+    max_hover_secs: float = 0.0
+    hover_episodes: int = 0
+
+    # DO-260 category histogram
+    category_counts: dict[str, int] = field(default_factory=dict)
+
+    # Autopilot target altitude: last nav_altitude_mcp seen before the first
+    # sustained descent (heuristic for "intended cruise alt").
+    _sustained_descent_hit: bool = False
+    autopilot_target_alt_ft: int | None = None
+
+    # Emergency field (distinct from squawk). Holds the latest non-"none" value.
+    emergency_flag: str | None = None
+
+    # Night-at-point counter (incremented externally via record_solar if used)
+    night_point_count: int = 0
+    day_point_count: int = 0
+
+    # Tracks near takeoff / landing, for heading computation. Stored as
+    # (ts, track_deg, gs) tuples for later filtering in features.compute_headings.
+    takeoff_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
+    landing_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
+
     def record_point(
         self,
+        point: PointData,
         *,
-        baro_alt: int | str | None,
-        geom_alt: int | None,
-        gs: float | None,
-        baro_rate: float | None,
-        lat: float,
-        lon: float,
-        ts: float,
         ground_state: str,
         ground_reason: str,
+        config: _ConfigLike | None = None,
         landing_speed_threshold: float = 80.0,
     ) -> None:
         """Record a single trace point into the running metrics.
 
-        ground_state is the output of classify_ground_state ("ground" / "airborne" / "unknown").
-        ground_reason is "ok" / "baro_error" / "speed_override" / "insufficient".
+        Takes a PointData object plus the ground classification produced by
+        classify_ground_state. The optional ``config`` object supplies
+        thresholds for phase, peak-rate, and hover accumulators; if None
+        sensible defaults are used.
+
+        ``landing_speed_threshold`` is kept as a keyword for backwards
+        compatibility with older call sites that only supplied the legacy
+        scalar knob.
         """
+        ts = point.ts
+        lat = point.lat
+        lon = point.lon
+        baro_alt = point.baro_alt
+        geom_alt = point.geom_alt
+        gs = point.gs
+        baro_rate = point.baro_rate
+        geom_rate = point.geom_rate
+
         self.data_points += 1
+        prev_ts = self.last_point_ts
         if self.first_point_ts is None:
             self.first_point_ts = ts
         self.last_point_ts = ts
@@ -124,15 +231,20 @@ class FlightMetrics:
             )
         )
 
+        # Approach altitudes deque for go-around detection: prefer geom_alt,
+        # fall back to baro_alt when airborne
+        airborne_alt: int | None = None
+        if isinstance(geom_alt, (int, float)):
+            airborne_alt = int(geom_alt)
+        elif isinstance(baro_alt, (int, float)):
+            airborne_alt = int(baro_alt)
+        if airborne_alt is not None:
+            self.approach_alts.append((ts, airborne_alt))
+
         if ground_state == "ground":
             self.total_ground_points += 1
 
-        # Count broken-encoder points under baro_error_points. Both baro_error
-        # (baro=ground with high geom altitude) and speed_override (baro=ground
-        # with flight-speed ground speed) are the same underlying fault: the
-        # barometric encoder claimed ground while other signals proved
-        # otherwise. Unify the bookkeeping so baro_error_points is a faithful
-        # count of broken encoder samples.
+        # Count broken-encoder points under baro_error_points.
         if ground_reason in ("baro_error", "speed_override"):
             self.baro_error_points += 1
 
@@ -154,10 +266,182 @@ class FlightMetrics:
             if baro_rate is not None:
                 self.last_airborne_baro_rate = baro_rate
 
-        # Legacy altitude_error heuristic: baro=ground + high gs. Kept as a
-        # secondary signal but no longer the only trigger.
+        # Legacy altitude_error heuristic: baro=ground + high gs.
         if baro_alt == "ground" and gs is not None and gs > landing_speed_threshold:
             self.ground_speed_while_ground += 1
+
+        # --- v3 accumulators ---
+
+        # Origin (first observed point, used for max_distance_from_origin)
+        if self.origin_lat is None:
+            self.origin_lat = lat
+            self.origin_lon = lon
+
+        # Path length: sum haversine of successive points, skipping coverage holes
+        max_seg_secs = (
+            config.path_max_segment_secs if config is not None and hasattr(config, "path_max_segment_secs") else 60.0
+        )
+        if self._prev_path_lat is not None and self._prev_path_lon is not None and self._prev_path_ts is not None:
+            dt = ts - self._prev_path_ts
+            if 0.0 < dt <= max_seg_secs:
+                seg_m = _haversine_m(self._prev_path_lat, self._prev_path_lon, lat, lon)
+                self.path_length_km += seg_m / 1000.0
+        self._prev_path_lat = lat
+        self._prev_path_lon = lon
+        self._prev_path_ts = ts
+
+        if self.origin_lat is not None and self.origin_lon is not None:
+            dist_from_origin_m = _haversine_m(self.origin_lat, self.origin_lon, lat, lon)
+            dist_km = dist_from_origin_m / 1000.0
+            if dist_km > self.max_distance_from_origin_km:
+                self.max_distance_from_origin_km = dist_km
+
+        # Squawk tracking
+        sq = point.squawk
+        if sq:
+            self.squawk_total_count += 1
+            if self.squawk_first is None:
+                self.squawk_first = sq
+            if self.squawk_last is not None and sq != self.squawk_last:
+                self.squawk_changes += 1
+            self.squawk_last = sq
+            if sq == "1200":
+                self.squawk_1200_count += 1
+            if sq in ("7500", "7600", "7700"):
+                self.emergency_squawks_seen.add(sq)
+
+        # Callsign history
+        cs = point.callsign
+        if cs:
+            cs = cs.strip()
+            if cs:
+                if not self.callsigns_seen:
+                    self.callsigns_seen.append(cs)
+                elif self.callsigns_seen[-1] != cs:
+                    self.callsign_changes += 1
+                    if cs not in self.callsigns_seen:
+                        self.callsigns_seen.append(cs)
+
+        # DO-260B category
+        if point.category:
+            self.category_counts[point.category] = self.category_counts.get(point.category, 0) + 1
+
+        # Emergency (detail field, not squawk)
+        if point.emergency_field and point.emergency_field.lower() not in ("none", ""):
+            self.emergency_flag = point.emergency_field
+
+        # Choose a rate signal for phase and peak-rate work: geom_rate > baro_rate.
+        # If neither is available for this point we fall through to "level" in
+        # phase attribution, which is the safer default.
+        chosen_rate: float | None = None
+        if geom_rate is not None:
+            chosen_rate = float(geom_rate)
+        elif baro_rate is not None:
+            chosen_rate = float(baro_rate)
+
+        # Phase of flight attribution (airborne samples only)
+        phase_climb_fpm = config.phase_climb_fpm if config is not None and hasattr(config, "phase_climb_fpm") else 250.0
+        if ground_state == "airborne" and prev_ts is not None:
+            dt = ts - prev_ts
+            if 0.0 < dt <= max_seg_secs:
+                if chosen_rate is not None and chosen_rate > phase_climb_fpm:
+                    self.climb_secs += dt
+                elif chosen_rate is not None and chosen_rate < -phase_climb_fpm:
+                    self.descent_secs += dt
+                else:
+                    self.level_secs += dt
+                    if airborne_alt is not None:
+                        self.level_buf.append((dt, airborne_alt, gs))
+
+        # Peak rate: 30s rolling window mean
+        peak_win_secs = (
+            config.peak_rate_window_secs if config is not None and hasattr(config, "peak_rate_window_secs") else 30.0
+        )
+        peak_min_samples = (
+            config.peak_rate_min_samples if config is not None and hasattr(config, "peak_rate_min_samples") else 3
+        )
+        peak_min_span = (
+            config.peak_rate_min_span_secs
+            if config is not None and hasattr(config, "peak_rate_min_span_secs")
+            else 20.0
+        )
+        if chosen_rate is not None and ground_state == "airborne":
+            self._rate_window.append((ts, chosen_rate))
+            cutoff = ts - peak_win_secs
+            while self._rate_window and self._rate_window[0][0] < cutoff:
+                self._rate_window.popleft()
+            if len(self._rate_window) >= peak_min_samples:
+                span = self._rate_window[-1][0] - self._rate_window[0][0]
+                if span >= peak_min_span:
+                    mean_rate = sum(r for _, r in self._rate_window) / len(self._rate_window)
+                    if mean_rate > self.peak_climb_fpm:
+                        self.peak_climb_fpm = mean_rate
+                    if mean_rate < self.peak_descent_fpm:
+                        self.peak_descent_fpm = mean_rate
+
+        # Hover state machine (any rotorcraft gating happens in features.py;
+        # here we just collect the raw stats so features.compute_hover can
+        # decide whether to emit).
+        hover_gs = (
+            config.hover_gs_threshold_kts if config is not None and hasattr(config, "hover_gs_threshold_kts") else 5.0
+        )
+        hover_baro_max = (
+            config.hover_baro_rate_max_fpm
+            if config is not None and hasattr(config, "hover_baro_rate_max_fpm")
+            else 100.0
+        )
+        hover_min_dur = (
+            config.hover_min_duration_secs
+            if config is not None and hasattr(config, "hover_min_duration_secs")
+            else 20.0
+        )
+        is_hover_now = (
+            ground_state == "airborne"
+            and gs is not None
+            and gs < hover_gs
+            and (baro_rate is None or abs(baro_rate) < hover_baro_max)
+        )
+        if is_hover_now:
+            if self._hover_start_ts is None:
+                self._hover_start_ts = ts
+        else:
+            if self._hover_start_ts is not None:
+                hover_dur = (prev_ts if prev_ts is not None else ts) - self._hover_start_ts
+                if hover_dur >= hover_min_dur:
+                    self.hover_episodes += 1
+                    if hover_dur > self.max_hover_secs:
+                        self.max_hover_secs = hover_dur
+                self._hover_start_ts = None
+
+        # Autopilot target altitude: record the last MCP altitude observed
+        # before a sustained descent begins. Once a sustained descent has been
+        # detected we stop updating so we preserve "intended cruise alt".
+        if not self._sustained_descent_hit and point.nav_altitude_mcp is not None and ground_state == "airborne":
+            self.autopilot_target_alt_ft = int(point.nav_altitude_mcp)
+        if chosen_rate is not None and chosen_rate < -500.0 and ground_state == "airborne":
+            self._sustained_descent_hit = True
+
+        # Tracks for heading computation: record (ts, track, gs) during
+        # the first and last wall-clock windows around takeoff and landing.
+        # Takeoff window is "the first N seconds after takeoff was observed"
+        # which we approximate here by capturing the first N seconds of any
+        # airborne point stream. Landing window is "the last N seconds"
+        # which we capture unconditionally — features.compute_headings will
+        # filter by the landing transition timestamp.
+        if point.track is not None and ground_state == "airborne":
+            heading_window = (
+                config.heading_window_secs if config is not None and hasattr(config, "heading_window_secs") else 60.0
+            )
+            # First-60-seconds buffer (takeoff): only accept if within the
+            # heading window from the first observed airborne point.
+            if self.first_point_ts is not None and (ts - self.first_point_ts) <= heading_window:
+                self.takeoff_tracks.append((ts, float(point.track), gs))
+            # Landing buffer: always append; features.compute_headings slices
+            # by the final landing_transition_ts. Keep bounded.
+            self.landing_tracks.append((ts, float(point.track), gs))
+            if len(self.landing_tracks) > 240:
+                # Keep the most recent 240 points only
+                self.landing_tracks = self.landing_tracks[-240:]
 
     def record_landing_ground_point(self, lat: float, lon: float) -> None:
         self.ground_points_at_landing += 1
@@ -193,6 +477,20 @@ class FlightMetrics:
             if d > max_jump:
                 max_jump = d
         return max_jump
+
+
+# Minimal protocol so FlightMetrics.record_point can accept a Config-like
+# object without importing the real Config (keeps classifier.py standalone).
+class _ConfigLike:  # pragma: no cover - structural
+    path_max_segment_secs: float
+    phase_climb_fpm: float
+    peak_rate_window_secs: float
+    peak_rate_min_samples: int
+    peak_rate_min_span_secs: float
+    hover_gs_threshold_kts: float
+    hover_baro_rate_max_fpm: float
+    hover_min_duration_secs: float
+    heading_window_secs: float
 
 
 # ----------------------------------------------------------------------

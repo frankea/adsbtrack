@@ -155,8 +155,26 @@ def trips(hex_code, from_date, to_date, airport, db_path):
         table.add_column("To", style="green")
         table.add_column("Duration", style="yellow")
         table.add_column("Callsign", style="dim")
+        table.add_column("Mission", style="magenta")
         table.add_column("Conf", justify="right")
         table.add_column("Type", style="dim")
+
+        mission_display = {
+            "ems_hems": "EMS",
+            "offshore": "OFFSH",
+            "exec_charter": "CHRT",
+            "training": "TRAIN",
+            "survey": "SRVY",
+            "pattern": "PATRN",
+            "transport": "XFER",
+            "unknown": "",
+        }
+
+        def _col(row, name, default=None):
+            try:
+                return row[name]
+            except (KeyError, IndexError):
+                return default
 
         for f in flights:
             takeoff = f["takeoff_time"][:10] if f["takeoff_time"] else "?"
@@ -168,6 +186,8 @@ def trips(hex_code, from_date, to_date, airport, db_path):
 
             if f["destination_icao"]:
                 dest = f"{f['destination_icao']} ({f['destination_name']})"
+            elif landing_type == "dropped_on_approach" and _col(f, "probable_destination_icao"):
+                dest = f"[yellow]~{_col(f, 'probable_destination_icao')}[/]"
             elif landing_type == "signal_lost":
                 dest = "[red]signal lost[/]"
             elif f["landing_lat"] is not None:
@@ -182,6 +202,9 @@ def trips(hex_code, from_date, to_date, airport, db_path):
                 duration = f"{hours}h {mins}m" if hours else f"{mins}m"
 
             callsign = f["callsign"] or ""
+
+            mission = _col(f, "mission_type") or ""
+            mission = mission_display.get(mission, mission)
 
             # Confidence display
             conf = f["landing_confidence"]
@@ -200,12 +223,13 @@ def trips(hex_code, from_date, to_date, airport, db_path):
             type_display = {
                 "confirmed": "[green]OK[/]",
                 "signal_lost": "[red]SIG LOST[/]",
+                "dropped_on_approach": "[yellow]DROP[/]",
                 "uncertain": "[yellow]UNCERT[/]",
                 "altitude_error": "[red]ALT ERR[/]",
                 "unknown": "[dim]--[/]",
             }.get(landing_type, "[dim]--[/]")
 
-            table.add_row(takeoff, origin, dest, duration, callsign, conf_str, type_display)
+            table.add_row(takeoff, origin, dest, duration, callsign, mission, conf_str, type_display)
 
         console.print(table)
         console.print(f"\nTotal: {len(flights)} flights")
@@ -247,6 +271,7 @@ def status(hex_code, db_path):
             type_labels = {
                 "confirmed": ("green", "Confirmed landings"),
                 "signal_lost": ("red", "Signal lost"),
+                "dropped_on_approach": ("yellow", "Dropped on approach"),
                 "uncertain": ("yellow", "Uncertain"),
                 "altitude_error": ("red", "Altitude errors"),
                 "unknown": ("dim", "Unclassified"),
@@ -255,7 +280,50 @@ def status(hex_code, db_path):
                 if lt in quality:
                     q = quality[lt]
                     pct = q["count"] / flight_count * 100 if flight_count > 0 else 0
-                    console.print(f"  [{color}]{label}:{' ' * (20 - len(label))}{q['count']:>4} ({pct:.0f}%)[/]")
+                    console.print(f"  [{color}]{label}:{' ' * (22 - len(label))}{q['count']:>4} ({pct:.0f}%)[/]")
+
+        # v3: mission type breakdown
+        mission_rows = db.conn.execute(
+            "SELECT mission_type, COUNT(*) as cnt FROM flights WHERE icao = ? GROUP BY mission_type ORDER BY cnt DESC",
+            (hex_code,),
+        ).fetchall()
+        if mission_rows and any(r["mission_type"] for r in mission_rows):
+            console.print("\n[bold]Mission breakdown:[/]\n")
+            for row in mission_rows:
+                mt = row["mission_type"] or "(none)"
+                pct = row["cnt"] / flight_count * 100 if flight_count > 0 else 0
+                console.print(f"  {mt:<18}{row['cnt']:>4} ({pct:.0f}%)")
+
+        # v3: aircraft_stats rollup
+        try:
+            stats_row = db.conn.execute("SELECT * FROM aircraft_stats WHERE icao = ?", (hex_code,)).fetchone()
+        except Exception:
+            stats_row = None
+        if stats_row:
+            console.print("\n[bold]Utilization:[/]\n")
+            console.print(f"  Total hours:      {stats_row['total_hours'] or 0:.1f}")
+            console.print(f"  Cycles:           {stats_row['total_cycles'] or 0}")
+            console.print(f"  Avg flight:       {stats_row['avg_flight_minutes'] or 0:.1f} min")
+            console.print(f"  Distinct airports: {stats_row['distinct_airports'] or 0}")
+            console.print(f"  Distinct callsigns: {stats_row['distinct_callsigns'] or 0}")
+            if stats_row["busiest_day_date"]:
+                console.print(
+                    f"  Busiest day:      {stats_row['busiest_day_date']} ({stats_row['busiest_day_count']} flights)"
+                )
+
+        # v3: emergency / night indicators
+        night_count = db.conn.execute(
+            "SELECT COUNT(*) FROM flights WHERE icao = ? AND night_flight = 1", (hex_code,)
+        ).fetchone()[0]
+        emergency_count = db.conn.execute(
+            "SELECT COUNT(*) FROM flights WHERE icao = ? AND emergency_squawk IS NOT NULL", (hex_code,)
+        ).fetchone()[0]
+        if night_count > 0 or emergency_count > 0:
+            console.print("\n[bold]Indicators:[/]\n")
+            if night_count > 0:
+                console.print(f"  Night flights:    {night_count}")
+            if emergency_count > 0:
+                console.print(f"  [red]Emergency squawks: {emergency_count}[/]")
 
         if top_airports:
             console.print("\n[bold]Top airports:[/]\n")

@@ -43,24 +43,51 @@ def classify_mission(
     loiter_ratio: float | None,
     cruise_gs_kt: int | None,
     config: Config,
+    owner_operator: str | None = None,
+    type_code: str | None = None,
 ) -> str:
-    """Return a mission_type enum string for the flight."""
+    """Return a mission_type enum string for the flight.
+
+    v4 (§3.6): added owner_operator and type_code inputs so the offshore
+    classifier can fall back to operator name (PHI/ERA/Bristow), and the
+    `training` enum value is now distinct from `survey`.
+    """
+    # 1. Operator-based offshore: catches PHI/ERA/Bristow flights even when
+    #    the callsign is just a tail number. Runs before pattern/transport
+    #    rules so it doesn't lose to a same-airport check.
+    if owner_operator:
+        op_upper = owner_operator.upper()
+        for kw in config.offshore_operator_keywords:
+            if kw in op_upper:
+                return "offshore"
+
+    # 2. Callsign-based classification
     if callsign:
         cs = callsign.strip().upper()
-        # Prefix lookup
         for prefix, mission in config.callsign_prefix_missions.items():
             if cs.startswith(prefix):
                 return mission
-        # N911 prefix (already in the dict but keep as a secondary safety)
         if cs.startswith("N911"):
             return "ems_hems"
-        # MT suffix (MedTrans) but not LMT / RMT / AMT
         if cs.endswith("MT") and not cs.endswith(("LMT", "RMT", "AMT")):
             return "ems_hems"
 
-    # Physics rules
+    # 3. Physics rules
+    # Survey: high loiter + low cruise speed (geometric pattern)
     if loiter_ratio is not None and loiter_ratio > 3.0 and cruise_gs_kt is not None and cruise_gs_kt < 120:
         return "survey"
+
+    # Training: same airport + low altitude on a known primary trainer.
+    is_trainer_type = type_code in ("C150", "C152", "C172", "C162", "PA28", "DA20", "DA40")
+    if (
+        origin_icao is not None
+        and destination_icao is not None
+        and origin_icao == destination_icao
+        and max_altitude is not None
+        and max_altitude < 5000
+        and is_trainer_type
+    ):
+        return "training"
 
     if (
         origin_icao is not None
@@ -73,6 +100,13 @@ def classify_mission(
 
     if origin_icao is not None and destination_icao is not None and origin_icao != destination_icao:
         return "transport"
+
+    # 4. Tail-only callsign with at least one airport assigned: bias to
+    #    transport so we don't dump it in unknown by default.
+    if callsign and (origin_icao is not None or destination_icao is not None):
+        cs_upper = callsign.strip().upper()
+        if cs_upper.startswith("N") and cs_upper[1:].isalnum():
+            return "transport"
 
     return "unknown"
 
@@ -335,16 +369,27 @@ def compute_headings(metrics: FlightMetrics, *, config: Config) -> dict:
     takeoff_tracks = [h for (_ts, h, gs) in metrics.takeoff_tracks if gs is None or gs > min_gs]
     takeoff_heading = _circular_mean_deg(takeoff_tracks)
 
-    # Landing: restrict to the final heading_window seconds before landing
+    # Landing heading (v4 fix §1.4): the round-3 spec only looked at the
+    # last 60 s before touchdown filtered to gs > 40 kt. Helicopters land
+    # vertically with gs ≈ 0 for the final 30-60 s, so the median was over
+    # an empty set on 1,922 confirmed rotorcraft landings. Fix: walk
+    # backwards in widening windows (60s, 120s, 240s, 600s) until we find
+    # at least 3 qualifying tracks. Drop the gs threshold to >10 kt for
+    # the fallback windows since helicopters approach slowly.
     landing_heading: float | None = None
     if metrics.landing_tracks and metrics.landing_transition_ts is not None:
-        cutoff = metrics.landing_transition_ts - heading_window
-        final_tracks = [
-            h
-            for (ts, h, gs) in metrics.landing_tracks
-            if cutoff <= ts <= metrics.landing_transition_ts and (gs is None or gs > min_gs)
-        ]
-        landing_heading = _circular_mean_deg(final_tracks)
+        windows = [(heading_window, min_gs), (120.0, 10.0), (240.0, 10.0), (600.0, 10.0)]
+        for window_secs, gs_floor in windows:
+            cutoff = metrics.landing_transition_ts - window_secs
+            final_tracks = [
+                h
+                for (ts, h, gs) in metrics.landing_tracks
+                if cutoff <= ts <= metrics.landing_transition_ts and (gs is None or gs > gs_floor)
+            ]
+            if len(final_tracks) >= 3:
+                landing_heading = _circular_mean_deg(final_tracks)
+                if landing_heading is not None:
+                    break
 
     return {
         "takeoff_heading_deg": round(takeoff_heading, 1) if takeoff_heading is not None else None,
@@ -398,11 +443,15 @@ def compute_squawk_summary(metrics: FlightMetrics, *, config: Config) -> dict:
 
 def compute_callsigns_summary(metrics: FlightMetrics) -> dict:
     if not metrics.callsigns_seen:
-        return {"callsigns": None, "callsign_changes": None}
+        return {"callsigns": None, "callsign_changes": None, "callsign_count": None}
     unique = sorted(set(metrics.callsigns_seen))
     return {
         "callsigns": json.dumps(unique, ensure_ascii=True),
+        # v4 (§1.8): callsign_changes counts transitions in the trace
+        # (TWY501 -> GS501 -> TWY501 = 2 changes), distinct from callsign_count
+        # which is the size of the deduplicated set.
         "callsign_changes": metrics.callsign_changes,
+        "callsign_count": len(unique),
     }
 
 
@@ -565,11 +614,16 @@ def derive_all(
     *,
     config: Config,
     type_code: str | None,
+    owner_operator: str | None = None,
 ) -> None:
     """Mutate ``flight`` in-place with all derived v3 features.
 
     Must be called AFTER ``classify_landing`` has set ``flight.landing_type``
     and airport matching has populated origin/destination.
+
+    v4 (§3.6): owner_operator is now passed through to the mission classifier
+    so PHI/ERA/Bristow flights are correctly tagged offshore even when their
+    callsign is just a tail number.
 
     Destination inference is NOT run here - it needs a candidates list from
     the database. Call ``infer_destination`` separately in the parser.
@@ -628,6 +682,7 @@ def derive_all(
     cs = compute_callsigns_summary(metrics)
     flight.callsigns = cs["callsigns"]
     flight.callsign_changes = cs["callsign_changes"]
+    flight.callsign_count = cs["callsign_count"]
 
     # DO-260 category
     flight.category_do260 = classify_category_do260(metrics)
@@ -636,7 +691,7 @@ def derive_all(
     flight.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
     flight.emergency_flag = metrics.emergency_flag
 
-    # Mission
+    # Mission (v4 §3.6: now consults owner_operator and type_code)
     flight.mission_type = classify_mission(
         callsign=flight.callsign,
         origin_icao=flight.origin_icao,
@@ -645,16 +700,23 @@ def derive_all(
         loiter_ratio=flight.loiter_ratio,
         cruise_gs_kt=flight.cruise_gs_kt,
         config=config,
+        owner_operator=owner_operator,
+        type_code=type_code,
     )
 
-    # Day / night
+    # Day / night.
+    # v4 fix (§1.5): COALESCE landing_time/lat with last_seen so dropped /
+    # signal_lost / uncertain flights still get a landing_is_night value.
+    eff_landing_time = flight.landing_time or flight.last_seen_time
+    eff_landing_lat = flight.landing_lat if flight.landing_lat is not None else flight.last_seen_lat
+    eff_landing_lon = flight.landing_lon if flight.landing_lon is not None else flight.last_seen_lon
     day_night = compute_day_night(
         takeoff_time=flight.takeoff_time,
         takeoff_lat=flight.takeoff_lat,
         takeoff_lon=flight.takeoff_lon,
-        landing_time=flight.landing_time,
-        landing_lat=flight.landing_lat,
-        landing_lon=flight.landing_lon,
+        landing_time=eff_landing_time,
+        landing_lat=eff_landing_lat,
+        landing_lon=eff_landing_lon,
         metrics=metrics,
         config=config,
     )

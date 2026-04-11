@@ -345,16 +345,25 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # to the first row's type_code if the registry write fails (e.g. in
     # tests using a MagicMock db).
     type_code: str | None = None
+    owner_operator: str | None = None
     try:
         registry_row = db.upsert_aircraft_registry(hex_code, list(trace_days))
     except Exception:
         registry_row = None
-    if isinstance(registry_row, dict) and registry_row.get("type_code"):
-        type_code = registry_row["type_code"]
+    if isinstance(registry_row, dict):
+        if registry_row.get("type_code"):
+            type_code = registry_row["type_code"]
+        if registry_row.get("owner_operator"):
+            owner_operator = registry_row["owner_operator"]
     if type_code is None:
         for row in trace_days:
             if row["type_code"]:
                 type_code = row["type_code"]
+                break
+    if owner_operator is None:
+        for row in trace_days:
+            if row["owner_operator"]:
+                owner_operator = row["owner_operator"]
                 break
 
     # Group by date and merge multi-source rows
@@ -730,7 +739,13 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
         # v3 derived features - must run AFTER classify_landing + airport
         # matching so mission/loiter/cruise/day-night all see final values.
-        features.derive_all(flight, metrics, config=config, type_code=type_code)
+        features.derive_all(
+            flight,
+            metrics,
+            config=config,
+            type_code=type_code,
+            owner_operator=owner_operator,
+        )
 
         # v3 destination inference for dropped / signal_lost flights
         if flight.landing_type in ("signal_lost", "dropped_on_approach") and flight.last_seen_lat is not None:

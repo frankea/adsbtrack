@@ -320,15 +320,42 @@ def test_circular_mean_empty_returns_none():
 
 def test_compute_headings_filters_by_gs():
     m = FlightMetrics()
-    # Taxi samples (low gs) should be dropped; only fast samples counted
-    m.takeoff_tracks = [(0.0, 90.0, 10.0), (10.0, 90.0, 50.0)]
-    m.landing_tracks = [(100.0, 270.0, 50.0), (110.0, 270.0, 5.0)]
+    # Taxi samples (low gs) should be dropped; only fast samples counted.
+    # Need at least 3 qualifying tracks per the v4 fallback gate.
+    m.takeoff_tracks = [(0.0, 90.0, 50.0), (10.0, 90.0, 60.0), (20.0, 90.0, 55.0), (5.0, 90.0, 10.0)]
+    m.landing_tracks = [
+        (100.0, 270.0, 50.0),
+        (105.0, 270.0, 55.0),
+        (110.0, 270.0, 60.0),
+        (115.0, 270.0, 5.0),
+    ]
     m.landing_transition_ts = 120.0
     r = compute_headings(m, config=_cfg())
     assert r["takeoff_heading_deg"] is not None
     assert abs(r["takeoff_heading_deg"] - 90.0) < 1.0
     assert r["landing_heading_deg"] is not None
     assert abs(r["landing_heading_deg"] - 270.0) < 1.0
+
+
+def test_compute_headings_helicopter_fallback():
+    """v4 §1.4: helicopters land with gs ≈ 0; fallback should walk back to
+    a window with non-zero gs and use that for the landing heading."""
+    m = FlightMetrics()
+    m.landing_tracks = [
+        # Approach 4 minutes before touchdown (still moving forward)
+        (-200.0, 180.0, 25.0),
+        (-190.0, 180.0, 22.0),
+        (-180.0, 180.0, 18.0),
+        # Final hover/vertical descent (gs ≈ 0)
+        (-30.0, 0.0, 1.0),
+        (-15.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+    ]
+    m.landing_transition_ts = 0.0
+    r = compute_headings(m, config=_cfg())
+    # Should use the 180° approach heading, not be NULL
+    assert r["landing_heading_deg"] is not None
+    assert abs(r["landing_heading_deg"] - 180.0) < 1.0
 
 
 # ---------------------------------------------------------------------------

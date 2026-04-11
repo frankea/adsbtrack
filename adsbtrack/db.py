@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS flights (
     night_flight INTEGER,
     callsigns TEXT,
     callsign_changes INTEGER,
+    callsign_count INTEGER,
     probable_destination_icao TEXT,
     probable_destination_distance_km REAL,
     probable_destination_confidence REAL,
@@ -114,7 +115,9 @@ CREATE TABLE IF NOT EXISTS aircraft_registry (
     year TEXT,
     last_updated TEXT,
     metadata_drift_count INTEGER DEFAULT 0,
-    metadata_drift_values TEXT
+    metadata_drift_values TEXT,
+    confirmation_rate REAL,
+    signal_quality_tier TEXT
 );
 
 CREATE TABLE IF NOT EXISTS aircraft_stats (
@@ -132,6 +135,10 @@ CREATE TABLE IF NOT EXISTS aircraft_stats (
     avg_flight_minutes REAL,
     busiest_day_date TEXT,
     busiest_day_count INTEGER,
+    home_base_icao TEXT,
+    home_base_share REAL,
+    second_base_icao TEXT,
+    second_base_share REAL,
     updated_at TEXT
 );
 
@@ -295,6 +302,7 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("night_flight", "INTEGER"),
         ("callsigns", "TEXT"),
         ("callsign_changes", "INTEGER"),
+        ("callsign_count", "INTEGER"),
         ("probable_destination_icao", "TEXT"),
         ("probable_destination_distance_km", "REAL"),
         ("probable_destination_confidence", "REAL"),
@@ -308,6 +316,30 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
 def _flights_table_exists(conn: sqlite3.Connection) -> bool:
     row = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='flights'").fetchone()
     return row is not None
+
+
+def _migrate_add_v4_columns(conn: sqlite3.Connection):
+    """Add v4 columns to aircraft_registry and aircraft_stats. Idempotent.
+
+    Safe to run on every startup; duplicate-column errors are suppressed.
+    """
+    registry_columns = [
+        ("confirmation_rate", "REAL"),
+        ("signal_quality_tier", "TEXT"),
+    ]
+    for col_name, col_type in registry_columns:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(f"ALTER TABLE aircraft_registry ADD COLUMN {col_name} {col_type}")
+
+    stats_columns = [
+        ("home_base_icao", "TEXT"),
+        ("home_base_share", "REAL"),
+        ("second_base_icao", "TEXT"),
+        ("second_base_share", "REAL"),
+    ]
+    for col_name, col_type in stats_columns:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(f"ALTER TABLE aircraft_stats ADD COLUMN {col_name} {col_type}")
 
 
 class Database:
@@ -337,6 +369,8 @@ class Database:
         # databases pick up any columns that might have been added since the
         # schema string was last written (cheap, idempotent).
         _migrate_add_flight_columns(self.conn)
+        # v4: aircraft_registry / aircraft_stats column additions
+        _migrate_add_v4_columns(self.conn)
 
     def __enter__(self):
         return self
@@ -424,7 +458,7 @@ class Database:
                 cruise_alt_ft, cruise_gs_kt,
                 peak_climb_fpm, peak_descent_fpm,
                 takeoff_is_night, landing_is_night, night_flight,
-                callsigns, callsign_changes,
+                callsigns, callsign_changes, callsign_count,
                 probable_destination_icao, probable_destination_distance_km, probable_destination_confidence)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
@@ -436,7 +470,7 @@ class Database:
                        ?, ?,
                        ?, ?,
                        ?, ?, ?,
-                       ?, ?,
+                       ?, ?, ?,
                        ?, ?, ?)""",
             (
                 flight.icao,
@@ -501,6 +535,7 @@ class Database:
                 flight.night_flight,
                 flight.callsigns,
                 flight.callsign_changes,
+                flight.callsign_count,
                 flight.probable_destination_icao,
                 flight.probable_destination_distance_km,
                 flight.probable_destination_confidence,
@@ -626,33 +661,57 @@ class Database:
     def upsert_aircraft_registry(self, icao: str, trace_rows: list[sqlite3.Row]) -> dict | None:
         """Resolve authoritative metadata for an ICAO from trace_days rows.
 
-        Picks the most recently fetched row as the source of truth, and flags
-        metadata drift when any other row disagrees on type_code / description.
-        Returns the resolved row as a dict, or None if no rows were provided.
+        v4 fix (§1.9): pick the type_code / description that appears most
+        often across all trace_days rows ("majority vote"), breaking ties by
+        the most recent fetch. Previously this was "most recent fetch wins"
+        which let a single new FAA registration silently overwrite hundreds
+        of historical observations (adf64f flipped from GLF6 to GA8C with
+        453 votes ignored). Registration / owner / year still come from the
+        latest row since those track ownership changes correctly.
         """
         if not trace_rows:
             return None
-        # Most recently fetched row wins
+        # Most recently fetched row - still used for ownership-tracked fields
         latest = max(trace_rows, key=lambda r: r["fetched_at"] or "")
 
-        # Detect drift: different non-null type_code/description/registration
-        drift_values: list[dict] = []
-        latest_type = latest["type_code"]
-        latest_desc = latest["description"]
-        seen_types: dict[tuple[str | None, str | None], int] = {}
+        # Tally (type_code, description) pairs across all rows; remember
+        # the latest fetch_at per pair so we can break ties by recency.
+        seen_types: dict[tuple[str | None, str | None], dict] = {}
         for row in trace_rows:
             tc = row["type_code"]
             desc = row["description"]
             key = (tc, desc)
-            seen_types[key] = seen_types.get(key, 0) + 1
+            entry = seen_types.setdefault(key, {"count": 0, "latest_ts": ""})
+            entry["count"] += 1
+            ts = row["fetched_at"] or ""
+            if ts > entry["latest_ts"]:
+                entry["latest_ts"] = ts
+
+        # Pick the winning (type_code, description) by count desc, then by
+        # latest_ts desc. Skip the (None, None) bucket as a candidate -
+        # it's a "no metadata" row, not a real type vote.
+        candidates = [(k, v) for k, v in seen_types.items() if k != (None, None)]
+        winner_type: str | None = None
+        winner_desc: str | None = None
+        if candidates:
+            # Stable: sort with the recency tie-break first, then count.
+            candidates.sort(key=lambda kv: kv[1]["latest_ts"], reverse=True)
+            candidates.sort(key=lambda kv: kv[1]["count"], reverse=True)
+            winner_type, winner_desc = candidates[0][0]
+        else:
+            winner_type = latest["type_code"]
+            winner_desc = latest["description"]
+
+        # Drift = everything that wasn't the winner (and wasn't the empty bucket)
+        drift_values: list[dict] = []
         drift_count = 0
-        for (tc, desc), count in seen_types.items():
-            if tc == latest_type and desc == latest_desc:
+        for (tc, desc), entry in seen_types.items():
+            if (tc, desc) == (winner_type, winner_desc):
                 continue
             if tc is None and desc is None:
                 continue
-            drift_count += count
-            drift_values.append({"type_code": tc, "description": desc, "count": count})
+            drift_count += entry["count"]
+            drift_values.append({"type_code": tc, "description": desc, "count": entry["count"]})
 
         self.conn.execute(
             """INSERT OR REPLACE INTO aircraft_registry
@@ -662,8 +721,8 @@ class Database:
             (
                 icao,
                 latest["registration"],
-                latest["type_code"],
-                latest["description"],
+                winner_type,
+                winner_desc,
                 latest["owner_operator"],
                 latest["year"],
                 datetime.now(UTC).isoformat(),
@@ -674,8 +733,8 @@ class Database:
         return {
             "icao": icao,
             "registration": latest["registration"],
-            "type_code": latest["type_code"],
-            "description": latest["description"],
+            "type_code": winner_type,
+            "description": winner_desc,
             "owner_operator": latest["owner_operator"],
             "year": latest["year"],
             "metadata_drift_count": drift_count,
@@ -752,6 +811,32 @@ class Database:
                 (this_icao,),
             ).fetchone()
 
+            # v4 (§3.2): home base = airport with the most takeoffs.
+            # Compute the top two by takeoff count and their share of total
+            # takeoffs that have an origin assigned.
+            base_rows = self.conn.execute(
+                """
+                SELECT origin_icao, COUNT(*) AS cnt
+                FROM flights
+                WHERE icao = ? AND origin_icao IS NOT NULL
+                GROUP BY origin_icao
+                ORDER BY cnt DESC
+                LIMIT 2
+                """,
+                (this_icao,),
+            ).fetchall()
+            origin_total_row = self.conn.execute(
+                "SELECT COUNT(*) AS cnt FROM flights WHERE icao = ? AND origin_icao IS NOT NULL",
+                (this_icao,),
+            ).fetchone()
+            origin_total = origin_total_row["cnt"] if origin_total_row else 0
+            home_base_icao = base_rows[0]["origin_icao"] if base_rows else None
+            home_base_share = round(base_rows[0]["cnt"] / origin_total, 3) if base_rows and origin_total else None
+            second_base_icao = base_rows[1]["origin_icao"] if len(base_rows) > 1 else None
+            second_base_share = (
+                round(base_rows[1]["cnt"] / origin_total, 3) if len(base_rows) > 1 and origin_total else None
+            )
+
             registry = self.get_aircraft_registry(this_icao)
 
             self.conn.execute(
@@ -759,8 +844,10 @@ class Database:
                    (icao, registration, type_code, first_seen, last_seen,
                     total_flights, confirmed_flights, total_hours, total_cycles,
                     distinct_airports, distinct_callsigns, avg_flight_minutes,
-                    busiest_day_date, busiest_day_count, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    busiest_day_date, busiest_day_count,
+                    home_base_icao, home_base_share, second_base_icao, second_base_share,
+                    updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     this_icao,
                     registry["registration"] if registry else None,
@@ -776,8 +863,36 @@ class Database:
                     round(row["avg_flight_minutes"] or 0.0, 1),
                     busiest_row["takeoff_date"] if busiest_row else None,
                     busiest_row["cnt"] if busiest_row else 0,
+                    home_base_icao,
+                    home_base_share,
+                    second_base_icao,
+                    second_base_share,
                     now_iso,
                 ),
+            )
+
+            # v4 (§3.1): write confirmation_rate and signal_quality_tier
+            # back to aircraft_registry. Tier thresholds per round-4 spec:
+            # excellent (>50%), good (30-50%), poor (10-30%), very_poor (<10%).
+            total_flights = row["total_flights"] or 0
+            confirmed_flights = row["confirmed_flights"] or 0
+            confirmation_rate: float | None = None
+            signal_quality_tier: str | None = None
+            if total_flights > 0:
+                confirmation_rate = round(confirmed_flights / total_flights, 3)
+                if confirmation_rate >= 0.50:
+                    signal_quality_tier = "excellent"
+                elif confirmation_rate >= 0.30:
+                    signal_quality_tier = "good"
+                elif confirmation_rate >= 0.10:
+                    signal_quality_tier = "poor"
+                else:
+                    signal_quality_tier = "very_poor"
+            self.conn.execute(
+                """UPDATE aircraft_registry
+                   SET confirmation_rate = ?, signal_quality_tier = ?
+                   WHERE icao = ?""",
+                (confirmation_rate, signal_quality_tier, this_icao),
             )
             written += 1
         return written

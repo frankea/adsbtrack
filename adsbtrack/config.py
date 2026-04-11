@@ -84,12 +84,33 @@ CALLSIGN_PREFIX_MISSIONS: dict[str, str] = {
     "BHI": "offshore",  # Bristow
     "TWY": "exec_charter",
     "GLF": "exec_charter",
+    "GS5": "exec_charter",  # round-4 §3.6: alt callsign for Solairus aircraft
     "LJ": "exec_charter",
     "NJE": "exec_charter",  # NetJets
     "EJA": "exec_charter",  # NetJets legacy
+    "QE7": "exec_charter",  # round-4 §3.6: Qatari amiri 7-prefix
+    "A7": "exec_charter",  # round-4 §3.6: Qatari nationality prefix on tail-number callsigns
     "SCH": "training",
     "SIK": "training",
 }
+
+
+# v4 (§3.6): owner_operator substring keywords for the offshore mission.
+# Used by classify_mission as a fallback when the callsign prefix doesn't
+# match. PHI Aviation, ERA, Bristow, Cougar, CHC are the major offshore
+# helicopter operators in the dataset.
+OFFSHORE_OPERATOR_KEYWORDS: tuple[str, ...] = (
+    "PHI AVIATION",
+    "PHI INC",
+    "PETROLEUM HELICOPTER",
+    "ERA HELICOPTER",
+    "ERA AVIATION",
+    "BRISTOW",
+    "COUGAR HELI",
+    "CHC HELI",
+    "OMNI HELI",
+    "ROTORCRAFT LEASING",
+)
 
 
 # Emergency squawk severity. Higher value = more severe. Used to pick the
@@ -170,10 +191,12 @@ class Config:
     phase_short_flight_min_secs: float = 120.0  # below this, cruise fields return NULL
     phase_short_flight_min_alt: float = 500.0  # below this max altitude, cruise fields NULL
 
-    # Peak rate rolling window
-    peak_rate_window_secs: float = 30.0
-    peak_rate_min_samples: int = 3
-    peak_rate_min_span_secs: float = 20.0
+    # Peak rate rolling window. v4 fix (§1.7): bumped from 30s/3pt to 60s/4pt
+    # to suppress 1-2 point baro spikes that pegged peaks at impossible values
+    # (e.g. PC12 at -21,312 fpm, GLF6 at +16,448 fpm).
+    peak_rate_window_secs: float = 60.0
+    peak_rate_min_samples: int = 4
+    peak_rate_min_span_secs: float = 30.0
 
     # Hover detection (helicopter only)
     hover_gs_threshold_kts: float = 5.0
@@ -211,3 +234,4 @@ class Config:
     helicopter_types: frozenset[str] = field(default_factory=lambda: HELICOPTER_TYPES)
     callsign_prefix_missions: dict[str, str] = field(default_factory=lambda: dict(CALLSIGN_PREFIX_MISSIONS))
     emergency_squawk_priority: dict[str, int] = field(default_factory=lambda: dict(EMERGENCY_SQUAWK_PRIORITY))
+    offshore_operator_keywords: tuple[str, ...] = field(default_factory=lambda: tuple(OFFSHORE_OPERATOR_KEYWORDS))

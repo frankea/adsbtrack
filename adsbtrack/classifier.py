@@ -272,20 +272,28 @@ class FlightMetrics:
 
         # --- v3 accumulators ---
 
+        # Phase / peak rate gap threshold: anything above this is treated
+        # as a coverage hole and gets special-cased downstream.
+        max_seg_secs = (
+            config.path_max_segment_secs if config is not None and hasattr(config, "path_max_segment_secs") else 60.0
+        )
+
         # Origin (first observed point, used for max_distance_from_origin)
         if self.origin_lat is None:
             self.origin_lat = lat
             self.origin_lon = lon
 
-        # Path length: sum haversine of successive points, skipping coverage holes
-        max_seg_secs = (
-            config.path_max_segment_secs if config is not None and hasattr(config, "path_max_segment_secs") else 60.0
-        )
-        if self._prev_path_lat is not None and self._prev_path_lon is not None and self._prev_path_ts is not None:
-            dt = ts - self._prev_path_ts
-            if 0.0 < dt <= max_seg_secs:
-                seg_m = _haversine_m(self._prev_path_lat, self._prev_path_lon, lat, lon)
-                self.path_length_km += seg_m / 1000.0
+        # Path length and max-distance-from-origin: walk the same iterator.
+        # v4 fix: drop the dt-based gap filter on path length so the two
+        # quantities can never get out of sync. The state machine has already
+        # split flights at multi-hour gaps via max_point_gap_minutes; within
+        # a single flight every consecutive segment is real motion. Coverage
+        # holes get bridged by the haversine of (prev, curr), which is the
+        # great-circle minimum the aircraft could have travelled - a safe
+        # lower bound. Round-3 spec was wrong here.
+        if self._prev_path_lat is not None and self._prev_path_lon is not None:
+            seg_m = _haversine_m(self._prev_path_lat, self._prev_path_lon, lat, lon)
+            self.path_length_km += seg_m / 1000.0
         self._prev_path_lat = lat
         self._prev_path_lon = lon
         self._prev_path_ts = ts
@@ -339,31 +347,62 @@ class FlightMetrics:
         elif baro_rate is not None:
             chosen_rate = float(baro_rate)
 
-        # Phase of flight attribution (airborne samples only)
+        # Phase of flight attribution (airborne samples only).
+        # v4 fix (§1.2): when there's a coverage gap between airborne points,
+        # attribute the gap to cruise (if both bracketing alts are above 70%
+        # of running max_altitude) or level. Stops the phase sum from
+        # silently undercounting on long flights.
         phase_climb_fpm = config.phase_climb_fpm if config is not None and hasattr(config, "phase_climb_fpm") else 250.0
+        cruise_ratio = (
+            config.phase_cruise_alt_ratio if config is not None and hasattr(config, "phase_cruise_alt_ratio") else 0.70
+        )
         if ground_state == "airborne" and prev_ts is not None:
             dt = ts - prev_ts
-            if 0.0 < dt <= max_seg_secs:
-                if chosen_rate is not None and chosen_rate > phase_climb_fpm:
-                    self.climb_secs += dt
-                elif chosen_rate is not None and chosen_rate < -phase_climb_fpm:
-                    self.descent_secs += dt
+            if dt > 0:
+                if dt <= max_seg_secs:
+                    # Normal point: attribute to climb/descent/level by rate
+                    if chosen_rate is not None and chosen_rate > phase_climb_fpm:
+                        self.climb_secs += dt
+                    elif chosen_rate is not None and chosen_rate < -phase_climb_fpm:
+                        self.descent_secs += dt
+                    else:
+                        self.level_secs += dt
+                        if airborne_alt is not None:
+                            self.level_buf.append((dt, airborne_alt, gs))
                 else:
-                    self.level_secs += dt
-                    if airborne_alt is not None:
-                        self.level_buf.append((dt, airborne_alt, gs))
+                    # Coverage gap: attribute to cruise (level_buf with the
+                    # bracketing altitude) if both endpoints are at cruise
+                    # altitude, otherwise level. Cap the per-gap attribution
+                    # at the configured intra-trace splitter so we never
+                    # silently swallow multi-day gaps.
+                    cap_secs = min(dt, max(max_seg_secs * 30, 1800.0))
+                    if (
+                        airborne_alt is not None
+                        and self.last_airborne_alt is not None
+                        and self.max_altitude > 0
+                        and airborne_alt >= cruise_ratio * self.max_altitude
+                        and self.last_airborne_alt >= cruise_ratio * self.max_altitude
+                    ):
+                        self.level_secs += cap_secs
+                        self.level_buf.append((cap_secs, airborne_alt, gs))
+                    else:
+                        self.level_secs += cap_secs
 
-        # Peak rate: 30s rolling window mean
+        # Peak rate: rolling window mean.
+        # v4 fix (§1.7): bumped window from 30s to 60s and min samples from
+        # 3 to 4 so that 1-2 point baro spikes can't peg the peak. Also
+        # filters obvious outliers (>3x median absolute) before computing
+        # the mean to suppress single-sample contamination.
         peak_win_secs = (
-            config.peak_rate_window_secs if config is not None and hasattr(config, "peak_rate_window_secs") else 30.0
+            config.peak_rate_window_secs if config is not None and hasattr(config, "peak_rate_window_secs") else 60.0
         )
         peak_min_samples = (
-            config.peak_rate_min_samples if config is not None and hasattr(config, "peak_rate_min_samples") else 3
+            config.peak_rate_min_samples if config is not None and hasattr(config, "peak_rate_min_samples") else 4
         )
         peak_min_span = (
             config.peak_rate_min_span_secs
             if config is not None and hasattr(config, "peak_rate_min_span_secs")
-            else 20.0
+            else 30.0
         )
         if chosen_rate is not None and ground_state == "airborne":
             self._rate_window.append((ts, chosen_rate))
@@ -373,11 +412,17 @@ class FlightMetrics:
             if len(self._rate_window) >= peak_min_samples:
                 span = self._rate_window[-1][0] - self._rate_window[0][0]
                 if span >= peak_min_span:
-                    mean_rate = sum(r for _, r in self._rate_window) / len(self._rate_window)
-                    if mean_rate > self.peak_climb_fpm:
-                        self.peak_climb_fpm = mean_rate
-                    if mean_rate < self.peak_descent_fpm:
-                        self.peak_descent_fpm = mean_rate
+                    rates = sorted(r for _, r in self._rate_window)
+                    n = len(rates)
+                    median = rates[n // 2] if n % 2 else (rates[n // 2 - 1] + rates[n // 2]) / 2
+                    abs_median = max(1.0, abs(median))
+                    filtered = [r for r in rates if abs(r - median) <= 3.0 * abs_median + 500.0]
+                    if len(filtered) >= peak_min_samples:
+                        mean_rate = sum(filtered) / len(filtered)
+                        if mean_rate > self.peak_climb_fpm:
+                            self.peak_climb_fpm = mean_rate
+                        if mean_rate < self.peak_descent_fpm:
+                            self.peak_descent_fpm = mean_rate
 
         # Hover state machine (any rotorcraft gating happens in features.py;
         # here we just collect the raw stats so features.compute_hover can
@@ -413,10 +458,25 @@ class FlightMetrics:
                         self.max_hover_secs = hover_dur
                 self._hover_start_ts = None
 
-        # Autopilot target altitude: record the last MCP altitude observed
-        # before a sustained descent begins. Once a sustained descent has been
-        # detected we stop updating so we preserve "intended cruise alt".
-        if not self._sustained_descent_hit and point.nav_altitude_mcp is not None and ground_state == "airborne":
+        # Autopilot target altitude (v4 fix §1.6).
+        # The intended-cruise altitude is the MCP setting at top of climb /
+        # while in cruise. The original v3 implementation captured the
+        # descent target because pilots set the descent FL on the MCP before
+        # top-of-descent while still nominally "level". Fix: only capture
+        # when MCP is within ±500 ft of the current altitude AND aircraft
+        # is at >= 85% of running max AND not descending fast. Once a
+        # sustained descent has begun we stop updating - that locks in the
+        # latest cruise-altitude selection before top of descent.
+        if (
+            not self._sustained_descent_hit
+            and point.nav_altitude_mcp is not None
+            and ground_state == "airborne"
+            and self.max_altitude > 0
+            and isinstance(baro_alt, (int, float))
+            and baro_alt >= 0.85 * self.max_altitude
+            and abs(int(point.nav_altitude_mcp) - int(baro_alt)) < 500
+            and (chosen_rate is None or chosen_rate > -250.0)
+        ):
             self.autopilot_target_alt_ft = int(point.nav_altitude_mcp)
         if chosen_rate is not None and chosen_rate < -500.0 and ground_state == "airborne":
             self._sustained_descent_hit = True

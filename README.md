@@ -176,6 +176,8 @@ ADS-B Exchange and sibling trackers store daily trace files for every aircraft t
 
 When multiple data sources are fetched for the same aircraft, traces are merged by absolute timestamp and deduplicated (points within 1 second and 0.001° of each other are collapsed). Different receiver networks catch different points for the same flight, so combining them improves coverage.
 
+The single-source path runs through the same sort + dedupe pipeline, so trace files that contain out-of-order or "phantom" points (cache glitches in readsb's `trace_full` output that occasionally write prior-day leakage with deeply negative offsets) are reordered into chronological order before the state machine sees them. Without this, a phantom point can overwrite the pending flight's `last_point_ts` with a timestamp earlier than its `first_point_ts` and produce a negative `duration_minutes`.
+
 ### Flight extraction
 
 The extractor walks through the merged trace points in chronological order and runs a state machine (`None` → `ground` → `airborne` → `post_landing` → `ground`...) that detects takeoff and landing transitions.
@@ -195,20 +197,20 @@ This catches tricky cases the old "baro says ground" heuristic missed:
 
 A few other things the state machine does:
 
-- **Intra-trace gap splitting**: any gap longer than 30 minutes between consecutive points closes the pending flight. Real operations have 3.5 min median max gaps; multi-hour gaps are coverage holes that should not be stitched across.
+- **Intra-trace gap splitting**: any gap longer than 30 minutes between consecutive points (absolute value - a backwards-in-time jump also triggers a close) finalizes the pending flight. Real operations have 3.5 min median max gaps; multi-hour gaps are coverage holes that should not be stitched across.
 - **Post-landing window**: after a ground transition, the flight stays "open" for up to 60 seconds or 5 more ground points. This populates landing-quality metrics (`ground_points_at_landing`, per-sample coordinate stability) with real data instead of always being 1/0.
 - **Touch-and-go detection**: an airborne point inside the post-landing window finalizes the current flight and immediately opens a new one.
-- **Short-movement filter**: flights shorter than 5 minutes that travel less than 5 km are filtered out as taxi movements.
+- **Short-movement filter**: flights shorter than 5 minutes that travel less than 5 km are filtered out as taxi movements. Single-point "flights" left over from phantom trace points are also dropped.
 
 ### Fragment stitching
 
 After extraction, a post-processing pass walks each aircraft's flights chronologically and merges pairs where a previous flight ended without a landing and the next flight starts with `takeoff_type = found_mid_flight`, within:
 
-- **90 minutes** between the previous flight's last-seen point and the next flight's first point
+- **Type-endurance-aware time gap**: `max(stitch_max_gap_minutes, endurance_for(type_code) × stitch_endurance_ratio)`. The default `stitch_max_gap_minutes` is 90, which is the right window for light GA. For long-endurance types that regularly have multi-hour coverage gaps during one operational mission (KC-135R at 720 min, KC-46 at 780 min, C-5M at 900 min, GLF6 at 900 min, etc.), the effective window scales up automatically. With the default `stitch_endurance_ratio = 0.4`, a KC-135R gets a 288-minute stitch window while a Cessna 172 stays at 96 minutes. Without this scaling, a tanker orbit over restricted airspace shows up as two signal-lost fragments instead of one continuous flight.
 - **Great-circle distance** less than `cruise_speed × time_gap × 1.2` (with 300 kt as the upper bound)
 - **Altitude delta** under 3000 ft
 
-The stitched flight inherits the original takeoff position and time, which recovers the actual origin airport for flights that would otherwise be classified as mid-flight fragments.
+The stitched flight inherits the original takeoff position and time, which recovers the actual origin airport for flights that would otherwise be classified as mid-flight fragments. Duration is recomputed after merging so the wall-clock span covers the coverage gap.
 
 ### Airport matching
 
@@ -240,7 +242,7 @@ Takeoff type similarly distinguishes `observed` (we saw the ground→airborne tr
 
 The geometric mean lets any single failing factor drag the whole score down, which catches "this looks like a landing by 5 metrics but the descent trace is missing" cases that a simple average would gloss over.
 
-**Max endurance is per aircraft type**: a 240 min global cap would reject legitimate Gulfstream transcons, so the classifier consults a type_code lookup (B407=180, S92=300, PC12=420, GLF6=900, etc.). Flights longer than the type's endurance become `uncertain` rather than `confirmed`.
+**Max endurance is per aircraft type**: a 240 min global cap would reject legitimate Gulfstream transcons, so the classifier consults a type_code lookup (B407=180, S92=300, PC12=420, GLF6=900, KC-135R=720, C-17=720, KC-46=780, C-5M=900, etc.). Flights longer than the type's endurance become `uncertain` rather than `confirmed`. The same lookup feeds the type-endurance-aware fragment stitcher, so long-endurance types can merge across the wider coverage gaps that are normal on their operational missions.
 
 ## Derived per-flight features
 
@@ -313,6 +315,28 @@ uv run python -m adsbtrack.cli links --hex a66ad3
 2026-03-27 67FL -> KSPG  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
 2026-03-27 KSPG -> KHKY  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
 2026-03-28 KHKY -> KVNC  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-28
+```
+
+Pass `--urls-only` to emit one raw URL per line with no prefix or markup, which makes it easy to pipe into shell loops or other tools:
+
+```
+uv run python -m adsbtrack.cli links --hex a66ad3 --urls-only
+```
+
+```
+https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
+https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
+https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-28
+```
+
+Useful for walking through every flight on a hex code interactively:
+
+```bash
+uv run python -m adsbtrack.cli links --hex a66ad3 --urls-only | while IFS= read -r url; do
+  printf '\n%s\n' "$url"
+  read -rp "[enter] next: " _ < /dev/tty
+  xdg-open "$url" >/dev/null 2>&1 &
+done
 ```
 
 ## Multiple data sources

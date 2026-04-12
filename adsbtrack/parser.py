@@ -340,6 +340,11 @@ def _stitch_fragments(
                         next_metrics.baro_error_points += metrics.baro_error_points
                         next_metrics.total_ground_points += metrics.total_ground_points
                         next_metrics.ground_speed_while_ground += metrics.ground_speed_while_ground
+                        # v5 F2: accumulate fragment count across stitches
+                        next_metrics.fragments_stitched += metrics.fragments_stitched
+                        # v5 F1: carry signal_gap_count through stitching.
+                        # Also add 1 for the coverage hole we just bridged.
+                        next_metrics.signal_gap_count += metrics.signal_gap_count + 1
 
                         # Recompute duration on the merged flight. extract_flights
                         # computes duration_minutes before stitching using the
@@ -728,7 +733,11 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # 90-min window.
     valid_flights, valid_metrics = _stitch_fragments(valid_flights, valid_metrics, config, type_code=type_code)
 
-    # Classify, score confidence, match airports, and save
+    # Classify, score confidence, match airports, and save.
+    # Order of operations (v5 plan):
+    #   classify_landing -> B7/B8 filter -> airport (D1) -> B1 duration
+    #   recompute -> derive_all (uses signal budget for B2) -> insert (B3 guard)
+    final_flights: list[Flight] = []
     for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
         has_landing = flight.landing_lat is not None
 
@@ -747,19 +756,58 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             dropped_max_alt_ft=config.dropped_max_alt_ft,
         )
 
-        # Match airports (skip destination for signal_lost / dropped_on_approach)
+        # v5 B7: drop non-confirmed flights that are BOTH short AND sparse.
+        # A long signal_lost flight with few points is still useful; a short
+        # flight with many points is a pattern hop. Only the combination
+        # "brief signal window with barely any data" is a sliver worth
+        # dropping. Confirmed landings are never gated out.
+        if flight.landing_type != "confirmed" and (
+            flight.duration_minutes is not None
+            and flight.duration_minutes < config.min_viable_flight_minutes
+            and metrics.data_points < config.min_viable_flight_points
+        ):
+            continue
+
+        # v5 B8: drop stationary broadcasters (transponder on the ramp).
+        if (
+            metrics.path_length_km < config.stationary_path_km
+            and metrics.max_distance_from_origin_km < config.stationary_path_km
+            and metrics.max_altitude < config.stationary_max_alt_ft
+            and metrics.max_gs_kt < config.stationary_max_gs_kt
+        ):
+            continue
+
+        # D1: match airports with on-field vs nearest split.
         origin = find_nearest_airport(db, flight.takeoff_lat, flight.takeoff_lon, config)
         if origin:
-            flight.origin_icao = origin.ident
-            flight.origin_name = origin.name
-            flight.origin_distance_km = origin.distance_km
+            if origin.distance_km <= config.airport_on_field_threshold_km:
+                flight.origin_icao = origin.ident
+                flight.origin_name = origin.name
+                flight.origin_distance_km = origin.distance_km
+            else:
+                flight.nearest_origin_icao = origin.ident
+                flight.nearest_origin_distance_km = origin.distance_km
 
         if has_landing and flight.landing_type not in ("signal_lost", "dropped_on_approach"):
             dest = find_nearest_airport(db, flight.landing_lat, flight.landing_lon, config)
             if dest:
-                flight.destination_icao = dest.ident
-                flight.destination_name = dest.name
-                flight.destination_distance_km = dest.distance_km
+                if dest.distance_km <= config.airport_on_field_threshold_km:
+                    flight.destination_icao = dest.ident
+                    flight.destination_name = dest.name
+                    flight.destination_distance_km = dest.distance_km
+                else:
+                    flight.nearest_destination_icao = dest.ident
+                    flight.nearest_destination_distance_km = dest.distance_km
+
+        # v5 B1: single source of truth for duration_minutes. Compute from
+        # wall-clock (landing_time or last_seen_time) - takeoff_time, not
+        # from the metric-span (last_point_ts - first_point_ts). The metric
+        # span misses signal-gap time on stitched flights.
+        end_time = flight.landing_time or flight.last_seen_time
+        if end_time is not None:
+            wall_secs = (end_time - flight.takeoff_time).total_seconds()
+            if wall_secs > 0:
+                flight.duration_minutes = round(wall_secs / 60.0, 1)
 
         takeoff_conf, landing_conf = score_confidence(
             metrics,
@@ -811,9 +859,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             flight.probable_destination_confidence = infer["probable_destination_confidence"]
 
         db.insert_flight(flight)
+        final_flights.append(flight)
 
     # v3: refresh materialized aircraft_stats for this ICAO
     with contextlib.suppress(Exception):
         db.refresh_aircraft_stats(hex_code)
 
-    return len(valid_flights)
+    return len(final_flights)

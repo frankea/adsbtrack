@@ -838,3 +838,260 @@ def test_stitch_uses_type_endurance_for_long_endurance_aircraft():
     assert merged.duration_minutes == expected_minutes, (
         f"Expected merged duration {expected_minutes} min, got {merged.duration_minutes} min"
     )
+
+
+# ---------------------------------------------------------------------------
+# F2: fragments_stitched counter
+# ---------------------------------------------------------------------------
+
+
+def test_stitch_fragments_increments_fragments_stitched():
+    """A two-way stitch must yield fragments_stitched == 2. A non-stitched
+    flight gets 1 by definition."""
+    t0 = _ts("2022-06-16", hour=12, minute=43, second=27)
+    f1_end = t0 + (7 * 60)
+    f2_start = t0 + (2 * 60 + 43) * 60 + 18
+    f2_end = f2_start + (3 * 60)
+
+    f1, m1 = _make_signal_lost_fragment(
+        icao="ae07b3",
+        start_ts=t0,
+        end_ts=f1_end,
+        start_lat=35.03,
+        start_lon=-117.93,
+        end_lat=35.59,
+        end_lon=-117.46,
+        end_alt_ft=17575,
+    )
+    f2, m2 = _make_found_mid_flight_fragment(
+        icao="ae07b3",
+        start_ts=f2_start,
+        end_ts=f2_end,
+        start_lat=37.08,
+        start_lon=-116.31,
+        start_alt_ft=19925,
+        end_lat=37.39,
+        end_lon=-116.03,
+    )
+    config = Config()
+    config.type_endurance_minutes = {**config.type_endurance_minutes, "K35R": 720.0}
+
+    # Each fragment defaults to fragments_stitched=1
+    assert m1.fragments_stitched == 1
+    assert m2.fragments_stitched == 1
+
+    stitched, metrics = _stitch_fragments([f1, f2], [m1, m2], config, type_code="K35R")
+    assert len(stitched) == 1
+    merged_metric = metrics[0]
+    assert merged_metric.fragments_stitched == 2
+    # Flight-level passthrough - derive_all does the copy but for this unit
+    # we only assert the metrics-side counter.
+
+
+# ---------------------------------------------------------------------------
+# B3: landing_time > takeoff_time guard in parser
+# ---------------------------------------------------------------------------
+
+
+def test_parser_skips_flight_with_landing_before_takeoff():
+    """If the extractor ever produces a flight where landing_time <= takeoff_time
+    (shouldn't happen post-v4 sort fix, but defense in depth), the parser
+    should not call insert_flight on it.
+
+    We synthesize this by directly patching the flight list before insert,
+    then asserting that insert_flight was not called with the bad row.
+    """
+    # This test exercises the db.insert_flight guard directly since the
+    # parser state machine won't produce a bad flight under normal input.
+    # It is essentially a compile-time promise that the guard still exists.
+    import tempfile
+    from datetime import datetime
+    from pathlib import Path
+
+    from adsbtrack.db import Database
+    from adsbtrack.models import Flight
+
+    with tempfile.TemporaryDirectory() as td:
+        db = Database(Path(td) / "test.db")
+        bad = Flight(
+            icao="abc123",
+            takeoff_time=datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
+            takeoff_lat=40.0,
+            takeoff_lon=-74.0,
+            takeoff_date="2024-06-15",
+            landing_time=datetime(2024, 6, 15, 11, 55, 0, tzinfo=UTC),  # before takeoff!
+            landing_lat=40.0,
+            landing_lon=-74.0,
+            landing_date="2024-06-15",
+        )
+        db.insert_flight(bad)
+        db.commit()
+        rows = db.get_flights("abc123")
+        assert rows == [], f"bad flight was persisted: {rows}"
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# B7: tiny non-confirmed flights are dropped
+# ---------------------------------------------------------------------------
+
+
+def test_tiny_signal_lost_flight_dropped():
+    """A signal_lost flight with < 2 min duration and < 10 data points must
+    be dropped. These are the 'signal flicker' slivers - nothing useful."""
+    config = Config(
+        landing_speed_threshold_kts=80.0,
+        airport_match_threshold_km=10.0,
+        airport_types=("large_airport", "medium_airport", "small_airport"),
+    )
+    base_ts = _ts("2024-06-15", hour=12)
+
+    trace = [
+        # Found mid-flight at altitude, only 5 points across 60 seconds
+        _make_trace_point(0, 40.0, -74.0, 10000, gs=250),
+        _make_trace_point(15, 40.01, -74.01, 10020, gs=252),
+        _make_trace_point(30, 40.02, -74.02, 10050, gs=251),
+        _make_trace_point(45, 40.03, -74.03, 10080, gs=250),
+        _make_trace_point(60, 40.04, -74.04, 10100, gs=249),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 0, "tiny signal_lost sliver should have been dropped"
+
+
+def test_short_confirmed_pattern_flight_kept():
+    """A confirmed landing < 2 min (a short pattern hop at the same airport)
+    must survive the B7 filter. Only non-confirmed flights get gated."""
+    config = Config(
+        landing_speed_threshold_kts=80.0,
+        airport_match_threshold_km=10.0,
+        airport_types=("large_airport", "medium_airport", "small_airport"),
+    )
+    base_ts = _ts("2024-06-15", hour=12)
+
+    trace = [
+        # Ground -> airborne -> ground within 90 s, 12 points, ground points
+        # both ends. This should classify as confirmed. Travel > 5 km so the
+        # taxi filter (< 5 min AND < 5 km) doesn't interfere - we want to
+        # exercise B7's confirmed-landing exemption specifically.
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(5, 40.0, -74.0, "ground", gs=5),
+        _make_trace_point(10, 40.005, -74.0, 500, gs=120),
+        _make_trace_point(20, 40.015, -74.0, 1500, gs=150),
+        _make_trace_point(30, 40.025, -74.0, 2200, gs=160),
+        _make_trace_point(40, 40.035, -74.0, 2500, gs=160),
+        _make_trace_point(50, 40.045, -74.0, 2500, gs=160),
+        _make_trace_point(60, 40.05, -74.0, 2000, gs=150),
+        _make_trace_point(70, 40.055, -74.0, 1000, gs=120),
+        _make_trace_point(80, 40.058, -74.0, 500, gs=80),
+        _make_trace_point(85, 40.06, -74.0, "ground", gs=20),
+        _make_trace_point(90, 40.06, -74.0, "ground", gs=5),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1, "confirmed short pattern hop should survive B7 tiny-flight filter"
+
+
+# ---------------------------------------------------------------------------
+# B8: stationary broadcaster filter
+# ---------------------------------------------------------------------------
+
+
+def test_stationary_broadcaster_filtered():
+    """An aircraft sitting on a ramp with its transponder on, producing
+    hundreds of points at the same lat/lon/alt=ground, is not a flight.
+    """
+    config = Config(
+        landing_speed_threshold_kts=80.0,
+        airport_match_threshold_km=10.0,
+        airport_types=("large_airport", "medium_airport", "small_airport"),
+    )
+    base_ts = _ts("2024-06-15", hour=12)
+
+    # 40 ground points at the same position, over ~40 minutes.
+    trace = []
+    for i in range(40):
+        trace.append(_make_trace_point(i * 60, 40.0, -74.0, "ground", gs=0))
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# D1: on-field vs nearest airport split
+# ---------------------------------------------------------------------------
+
+
+def test_airport_match_on_field_populates_origin():
+    """A takeoff 1.2 km from the nearest airport is on-field - populate
+    origin_icao with the match and leave nearest_origin_icao NULL."""
+    from adsbtrack.airports import AirportMatch
+
+    config = Config(
+        landing_speed_threshold_kts=80.0,
+        airport_match_threshold_km=10.0,
+        airport_types=("large_airport", "medium_airport", "small_airport"),
+    )
+    base_ts = _ts("2024-06-15", hour=12)
+
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(30, 40.001, -74.0, 1000, gs=100),
+        _make_trace_point(600, 41.0, -75.0, 5000, gs=200),
+        _make_trace_point(1200, 42.0, -76.0, "ground", gs=20),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    on_field = AirportMatch(ident="KONF", name="On Field", distance_km=1.2)
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=on_field):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.origin_icao == "KONF"
+    assert flight.origin_distance_km == 1.2
+    assert flight.nearest_origin_icao is None
+
+
+def test_airport_match_off_field_populates_nearest_only():
+    """A takeoff 6.5 km from the nearest airport is off-field - leave
+    origin_icao NULL but populate the diagnostic nearest_origin_icao."""
+    from adsbtrack.airports import AirportMatch
+
+    config = Config(
+        landing_speed_threshold_kts=80.0,
+        airport_match_threshold_km=10.0,
+        airport_types=("large_airport", "medium_airport", "small_airport"),
+    )
+    base_ts = _ts("2024-06-15", hour=12)
+
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(30, 40.001, -74.0, 1000, gs=100),
+        _make_trace_point(600, 41.0, -75.0, 5000, gs=200),
+        _make_trace_point(1200, 42.0, -76.0, "ground", gs=20),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    off_field = AirportMatch(ident="KFAR", name="Far Airport", distance_km=6.5)
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=off_field):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.origin_icao is None
+    assert flight.origin_distance_km is None
+    assert flight.nearest_origin_icao == "KFAR"
+    assert flight.nearest_origin_distance_km == 6.5

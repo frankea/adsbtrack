@@ -155,6 +155,27 @@ class Config:
     min_flight_minutes: float = 5.0  # minimum duration for a valid flight
     min_flight_distance_km: float = 5.0  # minimum travel for a short flight
 
+    # v5 (B7) minimum-viable-flight gate for non-confirmed flights. A
+    # signal_lost / dropped / uncertain fragment shorter than this is
+    # dropped as a sliver. Confirmed landings are never gated out.
+    min_viable_flight_minutes: float = 2.0
+    min_viable_flight_points: int = 10
+
+    # v5 (B8) stationary broadcaster detector. A "flight" where the aircraft
+    # never moved, never climbed above ramp height, and never accelerated
+    # beyond taxi speed is a parked transponder, not a mission.
+    stationary_path_km: float = 0.5
+    stationary_max_alt_ft: float = 500.0
+    stationary_max_gs_kt: float = 15.0
+
+    # v5 (D1) on-field threshold: origin_icao / destination_icao only get
+    # populated when the takeoff/landing fix is within this distance of
+    # the matched airport. Farther hits (still within the existing 10 km
+    # find_nearest_airport gate) populate the diagnostic nearest_*_icao
+    # fields so helicopter and offshore work doesn't get false-attributed
+    # to a nearby civil airfield.
+    airport_on_field_threshold_km: float = 2.0
+
     # Landing detection
     post_landing_window_secs: float = 60.0  # keep flight open to collect ground points
     post_landing_max_points: int = 5  # or this many ground points, whichever first
@@ -163,6 +184,17 @@ class Config:
     # Endurance
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown
     type_endurance_minutes: dict[str, float] = field(default_factory=lambda: dict(TYPE_ENDURANCE_MINUTES))
+
+    # v5 (B5, B6) persistence-filtered peaks. A candidate max_altitude or
+    # max_gs_kt only sets the new peak when it was held for at least
+    # `min_samples` points across a rolling wall-clock window of
+    # `window_secs`. Guards against single-sample baro or GS spikes
+    # pegging the raw max() to garbage (B5 found a B748 at 125,898 ft
+    # and a B407 at 197 kt, both from one-point glitches).
+    alt_persistence_window_secs: float = 30.0
+    alt_persistence_min_samples: int = 5
+    gs_persistence_window_secs: float = 30.0
+    gs_persistence_min_samples: int = 5
 
     # Trace merging
     dedup_time_secs: float = 1.0  # tighter than before: 2s was dropping legit helicopter hover samples

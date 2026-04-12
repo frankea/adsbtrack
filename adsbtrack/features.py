@@ -157,6 +157,29 @@ def compute_path_metrics(
 
 
 # ----------------------------------------------------------------------
+# Signal budget (v5 F1)
+# ----------------------------------------------------------------------
+
+
+def compute_signal_budget(metrics: FlightMetrics, *, duration_secs: float) -> dict:
+    """Compute active_minutes, signal_gap_secs, signal_gap_count.
+
+    ``duration_secs`` is the wall-clock flight duration (from B1's single
+    source of truth). ``active_secs`` is the sum of the phase-of-flight
+    counters from the online classifier (climb + descent + level). The gap
+    is the difference, clamped to >= 0.
+    """
+    active_secs = metrics.climb_secs + metrics.descent_secs + metrics.level_secs
+    active_secs = min(active_secs, duration_secs)  # can't exceed wall-clock
+    gap_secs = max(0, int(round(duration_secs - active_secs)))
+    return {
+        "active_minutes": round(active_secs / 60.0, 1),
+        "signal_gap_secs": gap_secs,
+        "signal_gap_count": metrics.signal_gap_count,
+    }
+
+
+# ----------------------------------------------------------------------
 # Phase of flight budget (§7)
 # ----------------------------------------------------------------------
 
@@ -216,11 +239,35 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config) -> dict:
     if cruise_gs_count > 0:
         cruise_gs_kt = int(round(cruise_gs_sum / max(1, cruise_secs_val)))
 
+    # v5 B2: proportional rescale so the four bins sum to exactly the
+    # on-signal active time. The online classifier can double-count
+    # boundary points between bins, causing the raw sum to overshoot.
+    # active_secs is clamped to duration_secs so we never claim more
+    # active time than the wall-clock allows.
+    raw_bins = [float(climb_secs), float(descent_secs), level_secs_val, cruise_secs_val]
+    raw_total = sum(raw_bins)
+    active_secs = min(raw_total, duration_secs) if duration_secs > 0 else raw_total
+    if raw_total > 0 and active_secs > 0:
+        scale = active_secs / raw_total
+        scaled = [b * scale for b in raw_bins]
+        # Round with a leftover-drip pass so the integer outputs sum exactly.
+        floored = [int(s) for s in scaled]
+        remainder = int(round(active_secs)) - sum(floored)
+        fracs = [(scaled[i] - floored[i], i) for i in range(4)]
+        fracs.sort(reverse=True)
+        for j in range(min(abs(remainder), 4)):
+            floored[fracs[j][1]] += 1 if remainder > 0 else -1
+        climb_secs, descent_secs_out, level_secs_out, cruise_secs_out = floored
+    else:
+        descent_secs_out = descent_secs
+        level_secs_out = int(round(level_secs_val))
+        cruise_secs_out = int(round(cruise_secs_val))
+
     return {
         "climb_secs": climb_secs,
-        "descent_secs": descent_secs,
-        "level_secs": int(round(level_secs_val)),
-        "cruise_secs": int(round(cruise_secs_val)),
+        "descent_secs": descent_secs_out,
+        "level_secs": level_secs_out,
+        "cruise_secs": cruise_secs_out,
         "cruise_alt_ft": cruise_alt_ft,
         "cruise_gs_kt": cruise_gs_kt,
     }
@@ -391,9 +438,14 @@ def compute_headings(metrics: FlightMetrics, *, config: Config) -> dict:
                 if landing_heading is not None:
                     break
 
+    # v5 D5: wrap to [0, 360) after rounding so a 359.95 that rounds to
+    # 360.0 becomes 0.0. _circular_mean_deg already normalizes but
+    # round() can nudge the edge case past the boundary.
+    to_hdg = round(takeoff_heading, 1) % 360.0 if takeoff_heading is not None else None
+    ldg_hdg = round(landing_heading, 1) % 360.0 if landing_heading is not None else None
     return {
-        "takeoff_heading_deg": round(takeoff_heading, 1) if takeoff_heading is not None else None,
-        "landing_heading_deg": round(landing_heading, 1) if landing_heading is not None else None,
+        "takeoff_heading_deg": to_hdg,
+        "landing_heading_deg": ldg_hdg,
     }
 
 
@@ -445,12 +497,15 @@ def compute_callsigns_summary(metrics: FlightMetrics) -> dict:
     if not metrics.callsigns_seen:
         return {"callsigns": None, "callsign_changes": None, "callsign_count": None}
     unique = sorted(set(metrics.callsigns_seen))
+    # v5 B4: cap callsign_changes at max(0, distinct - 1). The online
+    # counter in FlightMetrics tracks real transitions between the last-
+    # observed value, but legacy data or edge cases could still over-count.
+    # The capped value means "how many distinct callsigns were used beyond
+    # the first one" which is what analysts actually want.
+    capped_changes = min(metrics.callsign_changes, max(0, len(unique) - 1))
     return {
         "callsigns": json.dumps(unique, ensure_ascii=True),
-        # v4 (§1.8): callsign_changes counts transitions in the trace
-        # (TWY501 -> GS501 -> TWY501 = 2 changes), distinct from callsign_count
-        # which is the size of the deduplicated set.
-        "callsign_changes": metrics.callsign_changes,
+        "callsign_changes": capped_changes,
         "callsign_count": len(unique),
     }
 
@@ -628,6 +683,20 @@ def derive_all(
     Destination inference is NOT run here - it needs a candidates list from
     the database. Call ``infer_destination`` separately in the parser.
     """
+    # v5 F1: signal budget (active_minutes, signal_gap_secs, signal_gap_count).
+    # Must run before phase budget so B2's rescale can clamp to active_secs.
+    duration_secs = (flight.duration_minutes or 0.0) * 60.0
+    sig = compute_signal_budget(metrics, duration_secs=duration_secs)
+    flight.active_minutes = sig["active_minutes"]
+    flight.signal_gap_secs = sig["signal_gap_secs"]
+    flight.signal_gap_count = sig["signal_gap_count"]
+
+    # v5 F2: fragment count passthrough
+    flight.fragments_stitched = metrics.fragments_stitched
+
+    # v5 B6: persistence-filtered peak ground speed
+    flight.max_gs_kt = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
+
     # Path metrics
     path = compute_path_metrics(
         metrics,
@@ -652,6 +721,19 @@ def derive_all(
         flight.cruise_secs = phase["cruise_secs"]
         flight.cruise_alt_ft = phase["cruise_alt_ft"]
         flight.cruise_gs_kt = phase["cruise_gs_kt"]
+
+        # v5 B2: recompute active_minutes from the rescaled phase secs so
+        # the stored columns satisfy climb+cruise+descent+level == active*60
+        # by construction. The earlier compute_signal_budget used raw metrics
+        # which can diverge from the rescaled values.
+        rescaled_active = (
+            (flight.climb_secs or 0)
+            + (flight.cruise_secs or 0)
+            + (flight.descent_secs or 0)
+            + (flight.level_secs or 0)
+        )
+        flight.active_minutes = round(rescaled_active / 60.0, 1)
+        flight.signal_gap_secs = max(0, int(round(duration_secs - rescaled_active)))
 
         peak = compute_peak_rates(metrics)
         flight.peak_climb_fpm = peak["peak_climb_fpm"]

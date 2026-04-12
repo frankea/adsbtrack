@@ -463,6 +463,27 @@ def test_get_top_airports(db):
 # ---------------------------------------------------------------------------
 
 
+def test_insert_flight_rejects_landing_before_takeoff(db):
+    """B3: a flight whose landing_time predates takeoff_time is physically
+    impossible. db.insert_flight should refuse it rather than persisting
+    a row that will poison downstream rollups."""
+    bad = Flight(
+        icao="abc123",
+        takeoff_time=datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
+        takeoff_lat=40.0,
+        takeoff_lon=-74.0,
+        takeoff_date="2024-06-15",
+        landing_time=datetime(2024, 6, 15, 11, 55, 0, tzinfo=UTC),
+        landing_lat=40.5,
+        landing_lon=-74.5,
+        landing_date="2024-06-15",
+    )
+    db.insert_flight(bad)
+    db.commit()
+    rows = db.get_flights("abc123")
+    assert rows == [], "db.insert_flight accepted an invalid flight"
+
+
 def test_refresh_aircraft_stats_ignores_negative_duration_flights(db):
     """A flight whose duration_minutes is negative (e.g. from a previous
     parser run that hit a phantom trace point) must not drag total_hours

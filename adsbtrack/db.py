@@ -103,6 +103,15 @@ CREATE TABLE IF NOT EXISTS flights (
     probable_destination_icao TEXT,
     probable_destination_distance_km REAL,
     probable_destination_confidence REAL,
+    active_minutes REAL,
+    signal_gap_secs INTEGER,
+    signal_gap_count INTEGER,
+    fragments_stitched INTEGER,
+    nearest_origin_icao TEXT,
+    nearest_origin_distance_km REAL,
+    nearest_destination_icao TEXT,
+    nearest_destination_distance_km REAL,
+    max_gs_kt INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -306,6 +315,17 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("probable_destination_icao", "TEXT"),
         ("probable_destination_distance_km", "REAL"),
         ("probable_destination_confidence", "REAL"),
+        # v5 round 6: signal budget, fragments, on-field airport split,
+        # persistence-filtered peak ground speed
+        ("active_minutes", "REAL"),
+        ("signal_gap_secs", "INTEGER"),
+        ("signal_gap_count", "INTEGER"),
+        ("fragments_stitched", "INTEGER"),
+        ("nearest_origin_icao", "TEXT"),
+        ("nearest_origin_distance_km", "REAL"),
+        ("nearest_destination_icao", "TEXT"),
+        ("nearest_destination_distance_km", "REAL"),
+        ("max_gs_kt", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -438,6 +458,17 @@ class Database:
         self.conn.execute("DELETE FROM flights WHERE icao = ?", (icao,))
 
     def insert_flight(self, flight: Flight):
+        # B3 guard: refuse to persist a flight whose landing_time predates
+        # its takeoff_time. Cross-midnight stitch bugs and clock glitches
+        # were producing these; better to drop and log than to poison
+        # downstream rollups. The parser already guards before calling
+        # insert_flight, but this is the last-line defense at the boundary.
+        if flight.landing_time is not None and flight.landing_time <= flight.takeoff_time:
+            print(
+                f"  [dim yellow]skipping flight {flight.icao} {flight.takeoff_time.isoformat()}: "
+                f"landing_time {flight.landing_time.isoformat()} <= takeoff_time[/]"
+            )
+            return
         self.conn.execute(
             """INSERT OR REPLACE INTO flights
                (icao, takeoff_time, takeoff_lat, takeoff_lon, takeoff_date,
@@ -459,7 +490,11 @@ class Database:
                 peak_climb_fpm, peak_descent_fpm,
                 takeoff_is_night, landing_is_night, night_flight,
                 callsigns, callsign_changes, callsign_count,
-                probable_destination_icao, probable_destination_distance_km, probable_destination_confidence)
+                probable_destination_icao, probable_destination_distance_km, probable_destination_confidence,
+                active_minutes, signal_gap_secs, signal_gap_count, fragments_stitched,
+                nearest_origin_icao, nearest_origin_distance_km,
+                nearest_destination_icao, nearest_destination_distance_km,
+                max_gs_kt)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -471,7 +506,11 @@ class Database:
                        ?, ?,
                        ?, ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?)""",
+                       ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?, ?,
+                       ?, ?,
+                       ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -539,6 +578,15 @@ class Database:
                 flight.probable_destination_icao,
                 flight.probable_destination_distance_km,
                 flight.probable_destination_confidence,
+                flight.active_minutes,
+                flight.signal_gap_secs,
+                flight.signal_gap_count,
+                flight.fragments_stitched,
+                flight.nearest_origin_icao,
+                flight.nearest_origin_distance_km,
+                flight.nearest_destination_icao,
+                flight.nearest_destination_distance_km,
+                flight.max_gs_kt,
             ),
         )
 

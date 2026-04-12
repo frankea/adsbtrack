@@ -397,13 +397,15 @@ def test_squawk_summary_emergency_priority():
 
 def test_callsigns_summary_distinct_sorted():
     m = FlightMetrics()
-    m.callsigns_seen = ["TWY501", "GS501", "TWY501"]
-    m.callsign_changes = 2
+    # callsigns_seen is the order-of-first-appearance distinct list per
+    # classifier semantics; set it directly for this pure unit.
+    m.callsigns_seen = ["TWY501", "GS501"]
+    m.callsign_changes = 1
     r = compute_callsigns_summary(m)
     assert r["callsigns"] is not None
     assert "GS501" in r["callsigns"]
     assert "TWY501" in r["callsigns"]
-    assert r["callsign_changes"] == 2
+    assert r["callsign_changes"] == 1
 
 
 def test_callsigns_summary_empty():
@@ -411,3 +413,142 @@ def test_callsigns_summary_empty():
     r = compute_callsigns_summary(m)
     assert r["callsigns"] is None
     assert r["callsign_changes"] is None
+
+
+def test_callsigns_summary_caps_changes_at_distinct_minus_one():
+    """B4: if the online counter ever runs ahead of reality (e.g. ping-pong
+    flicker in a legacy DB), compute_callsigns_summary must cap the stored
+    callsign_changes at max(0, distinct - 1). Two distinct callsigns with
+    a wildly inflated changes counter should clamp to 1."""
+    m = FlightMetrics()
+    m.callsigns_seen = ["TWY501", "GS501"]
+    m.callsign_changes = 148  # inflated by ping-pong inflation
+    r = compute_callsigns_summary(m)
+    assert r["callsign_changes"] == 1, f"expected cap to 1, got {r['callsign_changes']}"
+
+
+def test_callsigns_summary_caps_changes_single_callsign_to_zero():
+    m = FlightMetrics()
+    m.callsigns_seen = ["TWY501"]
+    m.callsign_changes = 5
+    r = compute_callsigns_summary(m)
+    assert r["callsign_changes"] == 0
+
+
+# ---------------------------------------------------------------------------
+# B2: phase budget rescale invariant
+# ---------------------------------------------------------------------------
+
+
+def test_phase_budget_rescales_overrun_to_duration():
+    """B2: when the raw phase counters overshoot the metric-span duration
+    (from double-counting boundary points), the rescale must bring them
+    back down so their sum equals min(raw_total, duration_secs).
+
+    This test builds a FlightMetrics where climb+descent+level sums to
+    3780 s but the metric span is only 3600 s (5% overshoot). The
+    returned dict should rescale proportionally so sum == 3600.
+    """
+    m = FlightMetrics()
+    m.first_point_ts = 1000.0
+    m.last_point_ts = 1000.0 + 3600.0  # 1 h metric span
+    # climb + descent + cruise(level_buf) = 600 + 600 + 2580 = 3780 (5% over)
+    m.climb_secs = 600
+    m.descent_secs = 600
+    m.level_secs = 2580  # all above cruise threshold, goes to cruise_secs
+    m.max_altitude = 35_000
+    m.level_buf = [(2580.0, 31_000, 450.0)]  # one big cruise sample
+    p = compute_phase_budget(m, config=_cfg())
+    phase_sum = (p["climb_secs"] or 0) + (p["descent_secs"] or 0) + (p["level_secs"] or 0) + (p["cruise_secs"] or 0)
+    # Must land within 1 s of 3600 (the metric span, since 3780 > 3600)
+    assert abs(phase_sum - 3600) <= 1, f"phase_sum={phase_sum}, expected ~3600"
+
+
+def test_phase_budget_no_inflation_when_underrun():
+    """When the raw phase counters sum BELOW the metric-span duration
+    (signal gaps), the rescale must NOT inflate them. The difference is
+    signal gap time, accounted for separately in F1's signal_gap_secs."""
+    m = FlightMetrics()
+    m.first_point_ts = 1000.0
+    m.last_point_ts = 1000.0 + 7200.0  # 2 h metric span
+    # climb + descent + cruise = 300 + 300 + 1680 = 2280 s (< 7200)
+    m.climb_secs = 300
+    m.descent_secs = 300
+    m.level_secs = 1680
+    m.max_altitude = 35_000
+    m.level_buf = [(1680.0, 31_000, 450.0)]
+    p = compute_phase_budget(m, config=_cfg())
+    phase_sum = (p["climb_secs"] or 0) + (p["descent_secs"] or 0) + (p["level_secs"] or 0) + (p["cruise_secs"] or 0)
+    # Sum should equal the raw total (2280), NOT the duration (7200)
+    assert abs(phase_sum - 2280) <= 1, f"phase_sum={phase_sum}, expected ~2280"
+
+
+# ---------------------------------------------------------------------------
+# D5: heading modulo 360
+# ---------------------------------------------------------------------------
+
+
+def test_compute_headings_wraps_360_to_zero():
+    """A circular mean that rounds to 360.0 must wrap back to 0.0.
+
+    Picks takeoff tracks spanning 359.6 / 0.2 / 0.3 which average around
+    359.9 but round() can nudge them past 360.
+    """
+    m = FlightMetrics()
+    m.takeoff_tracks = [
+        (0.0, 359.96, 200.0),
+        (10.0, 0.02, 200.0),
+        (20.0, 0.04, 200.0),
+    ]
+    m.landing_tracks = [
+        (100.0, 359.95, 200.0),
+        (105.0, 0.01, 200.0),
+        (110.0, 0.03, 200.0),
+    ]
+    m.landing_transition_ts = 120.0
+    r = compute_headings(m, config=_cfg())
+    # Must not be 360.0 - a directed heading in [0, 360).
+    assert r["takeoff_heading_deg"] is not None
+    assert r["takeoff_heading_deg"] < 360.0
+    assert r["landing_heading_deg"] is not None
+    assert r["landing_heading_deg"] < 360.0
+
+
+# ---------------------------------------------------------------------------
+# F1: signal budget (active_minutes, signal_gap_secs, signal_gap_count)
+# ---------------------------------------------------------------------------
+
+
+def test_compute_signal_budget_no_gaps():
+    """A continuously-tracked flight has active_minutes == duration and
+    signal_gap_secs == 0."""
+    from adsbtrack.features import compute_signal_budget
+
+    m = FlightMetrics()
+    m.first_point_ts = 1000.0
+    m.last_point_ts = 1000.0 + 3600.0  # 1 h
+    m.climb_secs = 300
+    m.descent_secs = 300
+    m.level_secs = 3000
+    m.signal_gap_count = 0
+    r = compute_signal_budget(m, duration_secs=3600.0)
+    assert r["active_minutes"] == 60.0
+    assert r["signal_gap_secs"] == 0
+    assert r["signal_gap_count"] == 0
+
+
+def test_compute_signal_budget_with_gap():
+    """A 2 h flight with only 90 min of signal has signal_gap_secs == 1800."""
+    from adsbtrack.features import compute_signal_budget
+
+    m = FlightMetrics()
+    m.first_point_ts = 1000.0
+    m.last_point_ts = 1000.0 + 7200.0  # 2 h wall clock
+    m.climb_secs = 600
+    m.descent_secs = 600
+    m.level_secs = 4200  # total active = 5400 s = 90 min
+    m.signal_gap_count = 1
+    r = compute_signal_budget(m, duration_secs=7200.0)
+    assert r["active_minutes"] == 90.0
+    assert r["signal_gap_secs"] == 1800
+    assert r["signal_gap_count"] == 1

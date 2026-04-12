@@ -75,6 +75,24 @@ class FlightMetrics:
     baro_error_points: int = 0  # baro=ground but geom or gs disagreed (see record_point)
     sources: set[str] = field(default_factory=set)
     max_altitude: int = 0
+    # v5 B6: persistence-filtered peak ground speed. Only updates when a
+    # candidate is held for >= gs_persistence_min_samples across a rolling
+    # gs_persistence_window_secs window.
+    max_gs_kt: int = 0
+    # v5 B5/B6: rolling (ts, alt) / (ts, gs) windows for persistence filter.
+    # Pruned inside record_point so older samples don't linger.
+    _alt_persist_window: deque = field(default_factory=deque)
+    _gs_persist_window: deque = field(default_factory=deque)
+    # v5 F1: count of inter-point gaps longer than path_max_segment_secs
+    # observed while airborne. Used to produce signal_gap_count on the flight.
+    signal_gap_count: int = 0
+    # v5 F2: number of raw fragments this metric represents. Non-stitched
+    # flights are 1 by definition; _stitch_fragments bumps this on merge.
+    fragments_stitched: int = 1
+    # v5 B4: last observed raw callsign (distinct from callsigns_seen which
+    # is the distinct-in-order list). Needed to tell a real transition from
+    # a flicker where [-1] of the distinct list is not the most recent.
+    _last_callsign: str | None = None
     last_airborne_alt: int | None = None  # last airborne baro altitude
     last_airborne_geom: int | None = None
     last_airborne_gs: float | None = None
@@ -250,19 +268,75 @@ class FlightMetrics:
 
         # Track last airborne signals for confidence scoring
         if ground_state == "airborne":
+            # v5 B5: replace the raw max() altitude update with a
+            # persistence filter. A candidate peak only wins when held for
+            # >= alt_persistence_min_samples across a rolling
+            # alt_persistence_window_secs window. Guards against single-
+            # sample baro spikes (B748 at 125k ft, B407 at 104k ft) that
+            # previously pegged the raw max.
+            alt_win_secs = (
+                config.alt_persistence_window_secs
+                if config is not None and hasattr(config, "alt_persistence_window_secs")
+                else 30.0
+            )
+            alt_min_samples = (
+                config.alt_persistence_min_samples
+                if config is not None and hasattr(config, "alt_persistence_min_samples")
+                else 5
+            )
+            candidate_alt: int | None = None
             if isinstance(baro_alt, (int, float)):
                 self.last_airborne_alt = int(baro_alt)
-                if baro_alt > self.max_altitude:
-                    self.max_altitude = int(baro_alt)
+                candidate_alt = int(baro_alt)
             elif isinstance(geom_alt, (int, float)):
-                # Fall back to geom when baro is 'ground' but we know we're airborne
                 self.last_airborne_alt = int(geom_alt)
-                if geom_alt > self.max_altitude:
-                    self.max_altitude = int(geom_alt)
+                candidate_alt = int(geom_alt)
+            if candidate_alt is not None:
+                self._alt_persist_window.append((ts, candidate_alt))
+                alt_cutoff = ts - alt_win_secs
+                while self._alt_persist_window and self._alt_persist_window[0][0] < alt_cutoff:
+                    self._alt_persist_window.popleft()
+                if len(self._alt_persist_window) >= alt_min_samples:
+                    # Enough samples: use the minimum in the window as the
+                    # sustained candidate. This rejects single spikes.
+                    sustained = min(a for _, a in self._alt_persist_window)
+                    if sustained > self.max_altitude:
+                        self.max_altitude = sustained
+                else:
+                    # Not enough samples yet: use raw max so short flights
+                    # with only a few airborne points still get a real
+                    # max_altitude instead of staying at 0.
+                    if candidate_alt > self.max_altitude:
+                        self.max_altitude = candidate_alt
             if isinstance(geom_alt, (int, float)):
                 self.last_airborne_geom = int(geom_alt)
             if gs is not None:
                 self.last_airborne_gs = gs
+                # v5 B6: persistence-filtered peak ground speed. Same window
+                # idiom as altitude. A single 400 kt GS spike on a B407 can't
+                # set max_gs_kt unless sustained across >= min_samples points.
+                gs_win_secs = (
+                    config.gs_persistence_window_secs
+                    if config is not None and hasattr(config, "gs_persistence_window_secs")
+                    else 30.0
+                )
+                gs_min_samples = (
+                    config.gs_persistence_min_samples
+                    if config is not None and hasattr(config, "gs_persistence_min_samples")
+                    else 5
+                )
+                self._gs_persist_window.append((ts, float(gs)))
+                gs_cutoff = ts - gs_win_secs
+                while self._gs_persist_window and self._gs_persist_window[0][0] < gs_cutoff:
+                    self._gs_persist_window.popleft()
+                if len(self._gs_persist_window) >= gs_min_samples:
+                    sustained_gs = int(min(g for _, g in self._gs_persist_window))
+                    if sustained_gs > self.max_gs_kt:
+                        self.max_gs_kt = sustained_gs
+                else:
+                    raw_gs = int(gs)
+                    if raw_gs > self.max_gs_kt:
+                        self.max_gs_kt = raw_gs
             if baro_rate is not None:
                 self.last_airborne_baro_rate = baro_rate
 
@@ -319,16 +393,21 @@ class FlightMetrics:
                 self.emergency_squawks_seen.add(sq)
 
         # Callsign history
+        # v5 B4 fix: track _last_callsign as the most-recently-observed
+        # value (separate from callsigns_seen which is the dedup-in-order
+        # list). Only bump callsign_changes when the new observation is a
+        # real transition from the last-observed value. The old code used
+        # callsigns_seen[-1] which is the last-appended-unique, not the
+        # last-observed, so it missed A->B->A->B flicker and over-counted.
         cs = point.callsign
         if cs:
             cs = cs.strip()
             if cs:
-                if not self.callsigns_seen:
+                if cs not in self.callsigns_seen:
                     self.callsigns_seen.append(cs)
-                elif self.callsigns_seen[-1] != cs:
+                if self._last_callsign is not None and cs != self._last_callsign:
                     self.callsign_changes += 1
-                    if cs not in self.callsigns_seen:
-                        self.callsigns_seen.append(cs)
+                self._last_callsign = cs
 
         # DO-260B category
         if point.category:
@@ -370,6 +449,9 @@ class FlightMetrics:
                         if airborne_alt is not None:
                             self.level_buf.append((dt, airborne_alt, gs))
                 else:
+                    # v5 F1: count this inter-point gap so
+                    # signal_gap_count tracks how fragmented the coverage was.
+                    self.signal_gap_count += 1
                     # Coverage gap: attribute to cruise (level_buf with the
                     # bracketing altitude) if both endpoints are at cruise
                     # altitude, otherwise level. Cap the per-gap attribution

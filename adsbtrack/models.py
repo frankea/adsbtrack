@@ -97,6 +97,35 @@ class Flight:
     probable_destination_distance_km: float | None = None
     probable_destination_confidence: float | None = None
 
+    # --- v5: signal budget (F1) ---
+    # active_minutes is the on-signal wall-clock time (sum of phase seconds
+    # divided by 60). signal_gap_secs is duration_minutes*60 - active_secs
+    # and signal_gap_count is the number of inter-point gaps larger than
+    # path_max_segment_secs observed while airborne.
+    active_minutes: float | None = None
+    signal_gap_secs: int | None = None
+    signal_gap_count: int | None = None
+
+    # --- v5: fragment stitching (F2) ---
+    # Number of raw fragments that make up this flight after _stitch_fragments.
+    # Default 1 = not stitched.
+    fragments_stitched: int | None = None
+
+    # --- v5: on-field vs nearest airport split (D1) ---
+    # origin_icao / destination_icao only populate when the takeoff/landing
+    # point is within airport_on_field_threshold_km (2 km) of the matched
+    # airport. Otherwise the nearest_* columns carry the diagnostic hit.
+    nearest_origin_icao: str | None = None
+    nearest_origin_distance_km: float | None = None
+    nearest_destination_icao: str | None = None
+    nearest_destination_distance_km: float | None = None
+
+    # --- v5: persistence-filtered peak ground speed (B6) ---
+    # Highest ground speed held for >= gs_persistence_min_samples across a
+    # gs_persistence_window_secs window. Guards against single-sample GS
+    # spikes that previously set the raw max.
+    max_gs_kt: int | None = None
+
 
 @dataclass
 class AirportMatch:

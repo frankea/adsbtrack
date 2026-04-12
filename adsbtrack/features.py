@@ -727,10 +727,7 @@ def derive_all(
         # by construction. The earlier compute_signal_budget used raw metrics
         # which can diverge from the rescaled values.
         rescaled_active = (
-            (flight.climb_secs or 0)
-            + (flight.cruise_secs or 0)
-            + (flight.descent_secs or 0)
-            + (flight.level_secs or 0)
+            (flight.climb_secs or 0) + (flight.cruise_secs or 0) + (flight.descent_secs or 0) + (flight.level_secs or 0)
         )
         flight.active_minutes = round(rescaled_active / 60.0, 1)
         flight.signal_gap_secs = max(0, int(round(duration_secs - rescaled_active)))

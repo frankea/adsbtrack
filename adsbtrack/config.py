@@ -38,6 +38,21 @@ TYPE_ENDURANCE_MINUTES: dict[str, float] = {
     "C56X": 360.0,  # Citation Excel
     "E55P": 360.0,  # Phenom 300
     "FA7X": 720.0,  # Falcon 7X
+    # Military tankers / strategic transports. Mission legs regularly
+    # have multi-hour coverage gaps over restricted airspace, so the
+    # stitch window needs a generous endurance number to merge what is
+    # really one flight.
+    "K35R": 720.0,  # KC-135R/T Stratotanker
+    "K35E": 720.0,  # KC-135E
+    "KC10": 840.0,  # KDC-10 Extender
+    "KC30": 900.0,  # KC-30 / A330 MRTT
+    "KC46": 780.0,  # KC-46 Pegasus
+    "C17": 720.0,  # C-17 Globemaster III
+    "C5M": 900.0,  # C-5M Super Galaxy
+    "C130": 600.0,  # C-130 Hercules (broad family)
+    "P8": 600.0,  # P-8 Poseidon
+    "E3TF": 660.0,  # E-3 Sentry
+    "E6": 900.0,  # E-6 Mercury
 }
 
 
@@ -172,6 +187,13 @@ class Config:
     stitch_max_alt_delta_ft: float = 3000.0
     stitch_cruise_speed_kts: float = 300.0
     stitch_distance_slack: float = 1.2  # multiply the plausible distance by this for headwind margin
+    # Per-type stitch window: effective_gap_minutes =
+    #   max(stitch_max_gap_minutes, endurance_for(type) * stitch_endurance_ratio)
+    # Long-endurance types (tankers, heavy transports) can legitimately have
+    # coverage gaps that exceed the static 90-minute default during one
+    # operational mission; this ratio widens the window for those types
+    # without changing behavior for light GA.
+    stitch_endurance_ratio: float = 0.4
 
     # dropped_on_approach gating: require sustained descent in the last few
     # baro_rate samples before committing the classification.

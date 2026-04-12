@@ -1,12 +1,13 @@
 """Tests for adsbtrack.parser -- flight extraction state machine."""
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+from adsbtrack.classifier import FlightMetrics
 from adsbtrack.config import Config
 from adsbtrack.models import Flight
-from adsbtrack.parser import extract_flights
+from adsbtrack.parser import _stitch_fragments, extract_flights
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -625,3 +626,215 @@ def test_v3_rich_trace_populates_new_fields():
     # Headings populated
     assert flight.takeoff_heading_deg is not None
     assert abs(flight.takeoff_heading_deg - 90.0) < 5.0
+
+
+# ---------------------------------------------------------------------------
+# Bug: phantom / out-of-order trace points
+# ---------------------------------------------------------------------------
+
+
+def test_out_of_order_phantom_points_do_not_corrupt_duration():
+    """Readsb trace files occasionally contain "phantom" points with a deeply
+    negative time offset (leakage from a prior day or cache glitch). The
+    parser used to process points in stored order, which let a phantom point
+    overwrite last_point_ts with a timestamp earlier than first_point_ts,
+    producing a negative flight duration and junk last_seen_* values.
+
+    Every extracted flight must have a non-negative duration and last_seen
+    coordinates that match one of the real trace points, not the phantom.
+    """
+    config = Config(
+        landing_speed_threshold_kts=80.0,
+        airport_match_threshold_km=10.0,
+        airport_types=("large_airport", "medium_airport", "small_airport"),
+    )
+    base_ts = _ts("2024-06-15", hour=12)
+
+    # Normal flight: ground -> airborne -> ground over 30 minutes.
+    # Phantom point is inserted mid-trace with a -54000 second offset
+    # (roughly 15 hours before base_ts) at a completely different location.
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.001, -74.0, 2000, gs=130),
+        _make_trace_point(900, 40.2, -74.2, 10000, gs=250),
+        # PHANTOM: offset is ~15 hours in the past, at Edwards AFB latitude
+        _make_trace_point(-54000, 35.456, -118.107, 11850, gs=300),
+        _make_trace_point(1200, 40.3, -74.3, 10000, gs=250),
+        _make_trace_point(1500, 40.4, -74.4, 5000, gs=150),
+        _make_trace_point(1800, 40.5, -74.5, "ground", gs=10),
+    ]
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    flights = [call[0][0] for call in db.insert_flight.call_args_list]
+    assert flights, "Expected at least one flight to be extracted"
+
+    # No flight may have a negative duration.
+    for flight in flights:
+        if flight.duration_minutes is not None:
+            assert flight.duration_minutes >= 0, f"Flight has negative duration: {flight.duration_minutes} min"
+
+    # The real New Jersey flight must end at the real last point (40.5, -74.5),
+    # NOT at the phantom Edwards AFB coordinates (35.456, -118.107).
+    nj_flights = [f for f in flights if f.takeoff_lat is not None and abs(f.takeoff_lat - 40.0) < 0.5]
+    assert nj_flights, "Real NJ flight was not extracted"
+    for f in nj_flights:
+        if f.last_seen_lat is not None:
+            assert abs(f.last_seen_lat - 35.456) > 1.0, (
+                f"last_seen_lat {f.last_seen_lat} matches the phantom point; phantom data corrupted flight state"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Feature: type-endurance-aware stitch window
+# ---------------------------------------------------------------------------
+
+
+def _make_signal_lost_fragment(
+    icao: str,
+    start_ts: float,
+    end_ts: float,
+    start_lat: float,
+    start_lon: float,
+    end_lat: float,
+    end_lon: float,
+    end_alt_ft: int,
+) -> tuple[Flight, FlightMetrics]:
+    """Build a synthetic (Flight, FlightMetrics) pair for a signal_lost
+    fragment that ends airborne without a landing transition."""
+    flight = Flight(
+        icao=icao,
+        takeoff_time=datetime.fromtimestamp(start_ts, tz=UTC),
+        takeoff_lat=start_lat,
+        takeoff_lon=start_lon,
+        takeoff_date=datetime.fromtimestamp(start_ts, tz=UTC).date().isoformat(),
+    )
+    metrics = FlightMetrics()
+    metrics.first_point_ts = start_ts
+    metrics.last_point_ts = end_ts
+    metrics.last_seen_ts = end_ts
+    metrics.last_seen_lat = end_lat
+    metrics.last_seen_lon = end_lon
+    metrics.last_seen_alt_ft = end_alt_ft
+    metrics.last_airborne_alt = end_alt_ft
+    metrics.takeoff_type = "observed"
+    return flight, metrics
+
+
+def _make_found_mid_flight_fragment(
+    icao: str,
+    start_ts: float,
+    end_ts: float,
+    start_lat: float,
+    start_lon: float,
+    start_alt_ft: int,
+    end_lat: float,
+    end_lon: float,
+) -> tuple[Flight, FlightMetrics]:
+    """Build a synthetic (Flight, FlightMetrics) pair for a found_mid_flight
+    fragment whose coverage starts already airborne."""
+    flight = Flight(
+        icao=icao,
+        takeoff_time=datetime.fromtimestamp(start_ts, tz=UTC),
+        takeoff_lat=start_lat,
+        takeoff_lon=start_lon,
+        takeoff_date=datetime.fromtimestamp(start_ts, tz=UTC).date().isoformat(),
+    )
+    metrics = FlightMetrics()
+    metrics.first_point_ts = start_ts
+    metrics.last_point_ts = end_ts
+    metrics.last_seen_ts = end_ts
+    metrics.last_seen_lat = end_lat
+    metrics.last_seen_lon = end_lon
+    metrics.last_airborne_alt = start_alt_ft
+    metrics.max_altitude = start_alt_ft
+    metrics.takeoff_type = "found_mid_flight"
+    return flight, metrics
+
+
+def test_stitch_uses_type_endurance_for_long_endurance_aircraft():
+    """A KC-135-style long-endurance type should allow stitching across gaps
+    larger than the default stitch_max_gap_minutes (90 min). The stitch
+    window should scale with the type's endurance so operational missions
+    with ~2.5 hour coverage gaps over sensitive areas end up as one flight
+    rather than two signal_lost fragments.
+    """
+    # Gap setup: matches the real 2022-06-16 ae07b3 case.
+    # First fragment: 12:43:27Z -> 12:50:06Z at (35.59, -117.46, 17575 ft)
+    # Second fragment: 15:26:45Z -> 15:29:55Z starting (37.08, -116.31, 19925 ft)
+    t0 = _ts("2022-06-16", hour=12, minute=43, second=27)
+    f1_end = t0 + (7 * 60)  # ~12:50:27Z
+    f2_start = t0 + (2 * 60 + 43) * 60 + 18  # ~15:26:45Z
+    f2_end = f2_start + (3 * 60)  # ~15:29:45Z
+
+    f1, m1 = _make_signal_lost_fragment(
+        icao="ae07b3",
+        start_ts=t0,
+        end_ts=f1_end,
+        start_lat=35.03,
+        start_lon=-117.93,
+        end_lat=35.59,
+        end_lon=-117.46,
+        end_alt_ft=17575,
+    )
+    f2, m2 = _make_found_mid_flight_fragment(
+        icao="ae07b3",
+        start_ts=f2_start,
+        end_ts=f2_end,
+        start_lat=37.08,
+        start_lon=-116.31,
+        start_alt_ft=19925,
+        end_lat=37.39,
+        end_lon=-116.03,
+    )
+
+    # Without a long-endurance type, the default 90-min stitch window
+    # should refuse to merge the ~156-min gap: two fragments stay separate.
+    config_default = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config_default, type_code=None)
+    assert len(stitched) == 2, "Default stitch window should not merge fragments with a 156-min gap"
+
+    # Fresh fragments for the second call (stitching mutates in place).
+    f1b, m1b = _make_signal_lost_fragment(
+        icao="ae07b3",
+        start_ts=t0,
+        end_ts=f1_end,
+        start_lat=35.03,
+        start_lon=-117.93,
+        end_lat=35.59,
+        end_lon=-117.46,
+        end_alt_ft=17575,
+    )
+    f2b, m2b = _make_found_mid_flight_fragment(
+        icao="ae07b3",
+        start_ts=f2_start,
+        end_ts=f2_end,
+        start_lat=37.08,
+        start_lon=-116.31,
+        start_alt_ft=19925,
+        end_lat=37.39,
+        end_lon=-116.03,
+    )
+
+    # With K35R registered as a long-endurance type (720 min), the
+    # per-type stitch window should scale up and merge the fragments.
+    config_long = Config()
+    config_long.type_endurance_minutes = {**config_long.type_endurance_minutes, "K35R": 720.0}
+    stitched_long, _ = _stitch_fragments([f1b, f2b], [m1b, m2b], config_long, type_code="K35R")
+    assert len(stitched_long) == 1, (
+        "K35R long-endurance type should widen the stitch window enough to merge the 156-min gap into one flight"
+    )
+    merged = stitched_long[0]
+    assert merged.takeoff_lat == 35.03
+    assert merged.takeoff_lon == -117.93
+    # The merged duration must reflect the full stitched span from the earlier
+    # takeoff through the last observed point, not just the next fragment's
+    # pre-merge duration. Full span: t0 -> f2_end = ~166 minutes.
+    expected_minutes = round((f2_end - t0) / 60.0, 1)
+    assert merged.duration_minutes == expected_minutes, (
+        f"Expected merged duration {expected_minutes} min, got {merged.duration_minutes} min"
+    )

@@ -456,3 +456,55 @@ def test_get_top_airports(db):
     # KJFK should be the most visited (3 times: 2 as origin, 1 as dest)
     assert top[0]["airport"] == "KJFK"
     assert top[0]["visits"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Bug: aircraft_stats rollup guard against bad durations
+# ---------------------------------------------------------------------------
+
+
+def test_refresh_aircraft_stats_ignores_negative_duration_flights(db):
+    """A flight whose duration_minutes is negative (e.g. from a previous
+    parser run that hit a phantom trace point) must not drag total_hours
+    or avg_flight_minutes negative in the materialized aircraft_stats
+    rollup.
+    """
+    # One real flight plus one corrupted flight with a negative duration.
+    good = Flight(
+        icao="abc123",
+        takeoff_time=datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
+        takeoff_lat=40.0,
+        takeoff_lon=-74.0,
+        takeoff_date="2024-06-15",
+        landing_time=datetime(2024, 6, 15, 14, 0, 0, tzinfo=UTC),
+        landing_lat=42.0,
+        landing_lon=-76.0,
+        landing_date="2024-06-15",
+        duration_minutes=120.0,
+        landing_type="confirmed",
+    )
+    corrupted = Flight(
+        icao="abc123",
+        takeoff_time=datetime(2024, 6, 16, 12, 0, 0, tzinfo=UTC),
+        takeoff_lat=40.0,
+        takeoff_lon=-74.0,
+        takeoff_date="2024-06-16",
+        duration_minutes=-1122.9,
+        landing_type="signal_lost",
+    )
+    db.insert_flight(good)
+    db.insert_flight(corrupted)
+    db.commit()
+
+    db.refresh_aircraft_stats("abc123")
+    db.commit()
+
+    row = db.conn.execute(
+        "SELECT total_hours, avg_flight_minutes FROM aircraft_stats WHERE icao = ?",
+        ("abc123",),
+    ).fetchone()
+    assert row is not None
+    assert row["total_hours"] is not None
+    assert row["total_hours"] >= 0, f"total_hours went negative: {row['total_hours']}"
+    assert row["avg_flight_minutes"] is not None
+    assert row["avg_flight_minutes"] >= 0, f"avg_flight_minutes went negative: {row['avg_flight_minutes']}"

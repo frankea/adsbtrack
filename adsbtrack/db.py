@@ -758,7 +758,12 @@ class Database:
             where_clause = "WHERE icao = ?"
             params.append(icao)
 
-        # Aggregate core metrics in one sweep
+        # Aggregate core metrics in one sweep. Guard the duration-derived
+        # rollups (total_hours, avg_flight_minutes) against non-positive
+        # values so a single corrupted flight with a negative or zero
+        # duration_minutes doesn't drag the totals negative. COUNT(*) and
+        # confirmed_flights still count every row so total_flights stays
+        # truthful.
         core_rows = self.conn.execute(
             f"""
             SELECT icao,
@@ -766,8 +771,8 @@ class Database:
                    MAX(takeoff_date) AS last_seen,
                    COUNT(*) AS total_flights,
                    SUM(CASE WHEN landing_type = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_flights,
-                   SUM(COALESCE(duration_minutes, 0)) / 60.0 AS total_hours,
-                   AVG(duration_minutes) AS avg_flight_minutes
+                   SUM(CASE WHEN duration_minutes > 0 THEN duration_minutes ELSE 0 END) / 60.0 AS total_hours,
+                   AVG(CASE WHEN duration_minutes > 0 THEN duration_minutes END) AS avg_flight_minutes
             FROM flights
             {where_clause}
             GROUP BY icao

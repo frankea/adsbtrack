@@ -122,18 +122,23 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
 
 
 def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set[str]]:
-    """Merge multiple trace_day rows for the same date from different sources.
+    """Merge trace_day rows for the same date into a single sorted+deduped trace.
 
-    Converts relative offsets to absolute timestamps, concatenates, sorts,
-    deduplicates (points within dedup_time_secs and dedup_deg are duplicates),
-    then converts back to offsets from the earliest timestamp.
+    Converts relative offsets to absolute timestamps, concatenates (possibly
+    across multiple sources), sorts, deduplicates (points within
+    dedup_time_secs and dedup_deg are duplicates), then converts back to
+    offsets from the earliest base timestamp.
+
+    The single-source fast path is run through the same pipeline so that
+    readsb trace files containing "phantom" points (duplicate entries with
+    deeply negative offsets from cache glitches or prior-day leakage) get
+    both sorted into chronological order AND deduped if they collide with
+    an adjacent real point. The state machine assumes chronological order
+    and would otherwise corrupt last_point_ts on an out-of-order point.
 
     Returns (date, base_timestamp, merged_trace, source_names).
     """
     source_names = {row["source"] for row in rows}
-
-    if len(rows) == 1:
-        return rows[0]["date"], rows[0]["timestamp"], json.loads(rows[0]["trace_json"]), source_names
 
     # Convert all points to absolute timestamps
     abs_points = []
@@ -184,6 +189,7 @@ def _stitch_fragments(
     flights: list[Flight],
     metrics_list: list[FlightMetrics],
     config: Config,
+    type_code: str | None = None,
 ) -> tuple[list[Flight], list[FlightMetrics]]:
     """Merge signal_lost / dropped_on_approach fragments with the next
     found_mid_flight fragment when they are plausibly the same continuous
@@ -193,11 +199,21 @@ def _stitch_fragments(
       1. Previous flight has no landing transition (landing_lat is None) AND
          takeoff_type == "observed" OR has a last_seen position.
       2. Next flight has takeoff_type == "found_mid_flight".
-      3. Time gap between prev.last_seen_time and next.takeoff_time is < config.stitch_max_gap_minutes.
+      3. Time gap between prev.last_seen_time and next.takeoff_time is less
+         than the per-type effective stitch window (see below).
       4. Great-circle distance between prev.last_seen_* and next.takeoff_*
          is less than time_gap * cruise_speed * slack.
       5. Altitude difference between prev.last_seen_alt_ft and next's first
          airborne altitude is less than config.stitch_max_alt_delta_ft.
+
+    Effective stitch window:
+      max(config.stitch_max_gap_minutes,
+          config.type_endurance_minutes.get(type_code, max_endurance) *
+          config.stitch_endurance_ratio)
+
+    This keeps the default 90-min window for light GA while letting long-
+    endurance types (KC-135, C-17, etc.) stitch across the multi-hour
+    coverage gaps that are normal on their operational missions.
 
     Merging is destructive: the merged flight inherits prev.takeoff_* (if
     observed) and next.last_*, and its metrics are taken from the next
@@ -208,7 +224,12 @@ def _stitch_fragments(
     if len(flights) < 2:
         return flights, metrics_list
 
-    max_gap_secs = config.stitch_max_gap_minutes * 60.0
+    endurance_minutes = config.type_endurance_minutes.get(type_code or "", config.max_endurance_minutes)
+    effective_gap_minutes = max(
+        config.stitch_max_gap_minutes,
+        endurance_minutes * config.stitch_endurance_ratio,
+    )
+    max_gap_secs = effective_gap_minutes * 60.0
     max_alt_delta = config.stitch_max_alt_delta_ft
     cruise_speed_kt = config.stitch_cruise_speed_kts
     slack = config.stitch_distance_slack
@@ -319,6 +340,16 @@ def _stitch_fragments(
                         next_metrics.baro_error_points += metrics.baro_error_points
                         next_metrics.total_ground_points += metrics.total_ground_points
                         next_metrics.ground_speed_while_ground += metrics.ground_speed_while_ground
+
+                        # Recompute duration on the merged flight. extract_flights
+                        # computes duration_minutes before stitching using the
+                        # pre-merge fragment boundaries, so after widening
+                        # first_point_ts we need to refresh the Flight field to
+                        # cover the whole stitched span (including the coverage
+                        # gap between the two fragments).
+                        if next_metrics.first_point_ts is not None and next_metrics.last_point_ts is not None:
+                            span = next_metrics.last_point_ts - next_metrics.first_point_ts
+                            stitched.duration_minutes = round(span / 60.0, 1)
 
                         merged.append((stitched, next_metrics))
                         i += 2
@@ -445,8 +476,11 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             # Intra-trace gap check: any gap longer than max_point_gap_minutes
             # forces a flight close. Real operations rarely have more than a
             # few minutes between trace points; multi-hour gaps are coverage
-            # holes that the state machine should not stitch across.
-            if prev_point_ts is not None and (abs_ts - prev_point_ts) > max_point_gap_secs:
+            # holes that the state machine should not stitch across. Uses
+            # abs() so a backwards-in-time jump (phantom point with a stale
+            # timestamp that survives sorting via a duplicate offset) also
+            # triggers a close instead of silently corrupting state.
+            if prev_point_ts is not None and abs(abs_ts - prev_point_ts) > max_point_gap_secs:
                 _close_pending("intra_trace_gap")
             prev_point_ts = abs_ts
 
@@ -658,10 +692,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             span = metrics.last_point_ts - metrics.first_point_ts
             flight.duration_minutes = round(span / 60.0, 1)
 
-    # Filter: drop taxi-length flights that barely moved
+    # Filter: drop bogus single-point "flights" (e.g. leftover phantom points
+    # from readsb cache glitches that survived dedup because their nearest
+    # real neighbor was outside the dedup window) and taxi-length flights
+    # that barely moved.
     valid_flights = []
     valid_metrics = []
     for flight, metrics in zip(flights, metrics_list, strict=True):
+        # A one-point "flight" has no trajectory and no usable metrics.
+        if metrics.data_points <= 1:
+            continue
         if (
             flight.duration_minutes is not None
             and flight.duration_minutes < config.min_flight_minutes
@@ -683,8 +723,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
     # Run the stitch_fragments pass: merge signal_lost / dropped_on_approach
     # followed by a found_mid_flight fragment when they are plausibly the
-    # same continuous flight with a coverage hole in the middle.
-    valid_flights, valid_metrics = _stitch_fragments(valid_flights, valid_metrics, config)
+    # same continuous flight with a coverage hole in the middle. The type_code
+    # lets long-endurance aircraft stitch across wider gaps than the default
+    # 90-min window.
+    valid_flights, valid_metrics = _stitch_fragments(valid_flights, valid_metrics, config, type_code=type_code)
 
     # Classify, score confidence, match airports, and save
     for flight, metrics in zip(valid_flights, valid_metrics, strict=True):

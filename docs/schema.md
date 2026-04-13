@@ -54,8 +54,8 @@ Extracted flights with airport matching, quality classification, confidence scor
 | landing_confidence | REAL | [0.0, 1.0] - weighted geometric mean of seven factors |
 | data_points | INTEGER | Trace points recorded for this flight |
 | sources | TEXT | Comma-separated data sources that contributed |
-| max_altitude | INTEGER | Peak altitude in feet (persistence-filtered, 5+ samples over 30 s) |
-| max_gs_kt | INTEGER | Peak ground speed in knots (persistence-filtered) |
+| max_altitude | INTEGER | Peak baro altitude in feet (dual-track persistence-filtered, 3+ samples over 30 s, hard-capped at 60,000 ft) |
+| max_gs_kt | INTEGER | Peak ground speed in knots (dual-track persistence-filtered, hard-capped at 600 kt) |
 | ground_points_at_takeoff | INTEGER | Ground points collected before takeoff transition |
 | ground_points_at_landing | INTEGER | Ground points collected after landing transition |
 | baro_error_points | INTEGER | Points where baro encoder disagreed with geometric altitude or ground speed |

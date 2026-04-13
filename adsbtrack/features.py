@@ -73,8 +73,19 @@ def classify_mission(
             return "ems_hems"
 
     # 3. Physics rules
+    # v6 Q4: exempt large jets / VIP aircraft from survey and pattern.
+    # A B748 BBJ or GLF6 with high loiter is in ATC holding or doing a
+    # VIP security orbit, not flying a survey grid.
+    _exempt_survey_pattern = ("B748", "GLF5", "GLF6", "GLF4", "SJ30", "FA7X", "CL60")
+
     # Survey: high loiter + low cruise speed (geometric pattern)
-    if loiter_ratio is not None and loiter_ratio > 3.0 and cruise_gs_kt is not None and cruise_gs_kt < 120:
+    if (
+        loiter_ratio is not None
+        and loiter_ratio > 3.0
+        and cruise_gs_kt is not None
+        and cruise_gs_kt < 120
+        and type_code not in _exempt_survey_pattern
+    ):
         return "survey"
 
     # Training: same airport + low altitude on a known primary trainer.
@@ -95,6 +106,7 @@ def classify_mission(
         and origin_icao == destination_icao
         and max_altitude is not None
         and max_altitude < 3000
+        and type_code not in _exempt_survey_pattern
     ):
         return "pattern"
 
@@ -184,12 +196,16 @@ def compute_signal_budget(metrics: FlightMetrics, *, duration_secs: float) -> di
 # ----------------------------------------------------------------------
 
 
-def compute_phase_budget(metrics: FlightMetrics, *, config: Config) -> dict:
+def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_secs: float = 0.0) -> dict:
     """Reconcile level samples into cruise/non-cruise using final max_altitude.
 
     climb/descent/level seconds are already accumulated online; this function
     splits the level bucket into cruise (alt > ratio * max) and plain level.
     Short flights and low-ceiling flights return NULL cruise fields.
+
+    ``wall_clock_secs`` is the B1 wall-clock duration from parser. When
+    provided, the B2 rescale caps the phase sum at this value so the
+    rescaled bins match what active_minutes will be clamped to.
     """
     climb_secs = int(round(metrics.climb_secs))
     descent_secs = int(round(metrics.descent_secs))
@@ -200,8 +216,11 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config) -> dict:
     min_alt = config.phase_short_flight_min_alt
     ratio = config.phase_cruise_alt_ratio
 
-    duration_secs = 0.0
-    if metrics.first_point_ts is not None and metrics.last_point_ts is not None:
+    # v6 B2 fix: prefer the wall-clock duration from parser (B1's single
+    # source of truth) so the rescale target matches what active_minutes
+    # will be clamped to. Fall back to metric span for backward compat.
+    duration_secs = wall_clock_secs
+    if duration_secs <= 0 and metrics.first_point_ts is not None and metrics.last_point_ts is not None:
         duration_secs = metrics.last_point_ts - metrics.first_point_ts
 
     if max_alt < min_alt or duration_secs < min_secs or not metrics.level_buf:
@@ -279,9 +298,21 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config) -> dict:
 
 
 def compute_peak_rates(metrics: FlightMetrics) -> dict:
-    """Read peak climb/descent from online accumulators."""
+    """Read peak climb/descent from online accumulators.
+
+    v6 D4: hard-cap at sanity limits. Biz jets cap at ~6,000 fpm climb;
+    anything above 10,000 is a sample glitch that survived the rolling-
+    window outlier filter. Clamp rather than NULL so the direction is
+    preserved.
+    """
+    _MAX_CLIMB = 10_000
+    _MAX_DESCENT = -10_000
     peak_climb = int(round(metrics.peak_climb_fpm)) if metrics.peak_climb_fpm > 0 else None
     peak_descent = int(round(metrics.peak_descent_fpm)) if metrics.peak_descent_fpm < 0 else None
+    if peak_climb is not None and peak_climb > _MAX_CLIMB:
+        peak_climb = _MAX_CLIMB
+    if peak_descent is not None and peak_descent < _MAX_DESCENT:
+        peak_descent = _MAX_DESCENT
     return {"peak_climb_fpm": peak_climb, "peak_descent_fpm": peak_descent}
 
 
@@ -582,7 +613,13 @@ def compute_day_night(
     total = night_count + day_count
     night_flight: int | None = None
     if total > 0:
-        night_flight = 1 if (night_count / total) >= config.night_flight_ratio_threshold else 0
+        # v6 N5: redefine night_flight as "any phase of the flight occurs
+        # during night" per FAR 91.205(c). If either endpoint is night the
+        # flight is a night flight. This resolves the inconsistency where
+        # long flights could have night_flight=1 but both endpoints day (or
+        # vice versa) because the old >=50% sample threshold disagreed with
+        # the endpoint flags.
+        night_flight = 1 if (takeoff_night == 1 or landing_night == 1) else 0
 
     return {
         "takeoff_is_night": takeoff_night,
@@ -694,8 +731,14 @@ def derive_all(
     # v5 F2: fragment count passthrough
     flight.fragments_stitched = metrics.fragments_stitched
 
-    # v5 B6: persistence-filtered peak ground speed
-    flight.max_gs_kt = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
+    # v5 B6: persistence-filtered peak ground speed.
+    # v6: hard-cap at 600 kt for known subsonic types. Multi-point GS spikes
+    # (S92 at 1962 kt) can survive the 3-sample persistence filter.
+    _MAX_GS_KT = 600
+    raw_gs = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
+    if raw_gs is not None and raw_gs > _MAX_GS_KT:
+        raw_gs = _MAX_GS_KT
+    flight.max_gs_kt = raw_gs
 
     # Path metrics
     path = compute_path_metrics(
@@ -714,7 +757,7 @@ def derive_all(
 
     # Phase budget (gate altitude-derived fields for altitude_error flights)
     if flight.landing_type != "altitude_error":
-        phase = compute_phase_budget(metrics, config=config)
+        phase = compute_phase_budget(metrics, config=config, wall_clock_secs=duration_secs)
         flight.climb_secs = phase["climb_secs"]
         flight.descent_secs = phase["descent_secs"]
         flight.level_secs = phase["level_secs"]
@@ -729,8 +772,17 @@ def derive_all(
         rescaled_active = (
             (flight.climb_secs or 0) + (flight.cruise_secs or 0) + (flight.descent_secs or 0) + (flight.level_secs or 0)
         )
-        flight.active_minutes = round(rescaled_active / 60.0, 1)
-        flight.signal_gap_secs = max(0, int(round(duration_secs - rescaled_active)))
+        active_min = round(rescaled_active / 60.0, 1)
+        # v6 N2: clamp so active never exceeds wall-clock duration.
+        # v6 N3: floor at the metric span so flights with data never show 0.
+        dur_min = flight.duration_minutes or 0.0
+        if dur_min > 0:
+            active_min = min(active_min, dur_min)
+        if active_min == 0.0 and metrics.first_point_ts is not None and metrics.last_point_ts is not None:
+            metric_span = (metrics.last_point_ts - metrics.first_point_ts) / 60.0
+            active_min = round(min(metric_span, dur_min) if dur_min > 0 else metric_span, 1)
+        flight.active_minutes = active_min
+        flight.signal_gap_secs = max(0, int(round(duration_secs - active_min * 60.0)))
 
         peak = compute_peak_rates(metrics)
         flight.peak_climb_fpm = peak["peak_climb_fpm"]

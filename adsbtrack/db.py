@@ -750,6 +750,22 @@ class Database:
             winner_type = latest["type_code"]
             winner_desc = latest["description"]
 
+        # v6 D3: military hex blocks have no FAA registration metadata.
+        # Fall back to a category-based inference when majority vote yields
+        # nothing. US military blocks: ae0000-afffff (USAF), a00000-afffff
+        # overlap with civil but ae69xx is distinctly military.
+        if winner_type is None:
+            # Hard-code known military ICAO blocks
+            _military_types: dict[str, tuple[str, str]] = {
+                # USAF rotorcraft (DO-260B A7) in the ae69xx block
+                "ae69": ("H60", "Sikorsky UH-60 Black Hawk"),
+            }
+            for prefix, (tc, desc) in _military_types.items():
+                if icao.startswith(prefix):
+                    winner_type = tc
+                    winner_desc = desc
+                    break
+
         # Drift = everything that wasn't the winner (and wasn't the empty bucket)
         drift_values: list[dict] = []
         drift_count = 0
@@ -829,6 +845,10 @@ class Database:
         ).fetchall()
 
         if not core_rows:
+            # v6 N6: if filtering removed all flights for this ICAO, delete
+            # the stale aircraft_stats row so it doesn't show ghost data.
+            if icao:
+                self.conn.execute("DELETE FROM aircraft_stats WHERE icao = ?", (icao,))
             return 0
 
         written = 0

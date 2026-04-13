@@ -40,7 +40,7 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 
 **Signal budget.** `active_minutes` is the on-signal wall-clock time (sum of phase seconds / 60). `signal_gap_secs` is `duration_minutes * 60 - active_minutes * 60`. `signal_gap_count` is the number of inter-point gaps larger than 60 s observed while airborne. `fragments_stitched` counts how many raw trace fragments were merged into this flight (1 = not stitched).
 
-**Peak rates.** `peak_climb_fpm` and `peak_descent_fpm` are the best mean rate observed over a 60-second rolling window with outlier filtering (not point-to-point). `max_altitude` and `max_gs_kt` use a persistence filter requiring 5+ samples sustained across a 30-second window to guard against single-sample baro or GS spikes.
+**Peak rates.** `peak_climb_fpm` and `peak_descent_fpm` are the best mean rate observed over a 60-second rolling window with outlier filtering (not point-to-point). Hard-capped at 10,000 fpm in either direction. `max_altitude` and `max_gs_kt` use a dual-track persistence filter: a raw max tracks every sample, while a persisted max only updates when the value is held across 3+ samples in a 30-second window. The persisted value wins when available, correcting any spike recorded during the warmup phase. Hard caps apply at 60,000 ft (max_altitude) and 600 kt (max_gs_kt) as a final safety net against multi-point spikes.
 
 **Hover detection.** Helicopters only. `max_hover_secs` and `hover_episodes` count contiguous windows >= 20 s where the aircraft was airborne with `gs < 5 kt` and `|baro_rate| < 100 fpm`.
 
@@ -48,7 +48,7 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 
 **Headings.** `takeoff_heading_deg` and `landing_heading_deg` are circular means of ground-track samples in the first/last 60 s of the flight, filtered to `gs > 40 kt`. Helicopters use a widening fallback window with `gs > 10 kt`.
 
-**Day / night.** `takeoff_is_night`, `landing_is_night`, and `night_flight` (>= 50% of in-flight points after civil sunset). Computed inline using a NOAA solar-position approximation.
+**Day / night.** `takeoff_is_night`, `landing_is_night`, and `night_flight`. `night_flight = 1` when either endpoint is night (FAR 91.205(c) standard). Computed inline using a NOAA solar-position approximation.
 
 **Squawks.** `squawk_first` / `squawk_last`, `squawk_changes` (transition count), `emergency_squawk` (most severe of any 7500/7600/7700), `vfr_flight` (1 when >= 80% of squawks were 1200).
 

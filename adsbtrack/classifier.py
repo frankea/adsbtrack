@@ -75,12 +75,17 @@ class FlightMetrics:
     baro_error_points: int = 0  # baro=ground but geom or gs disagreed (see record_point)
     sources: set[str] = field(default_factory=set)
     max_altitude: int = 0
-    # v5 B6: persistence-filtered peak ground speed. Only updates when a
-    # candidate is held for >= gs_persistence_min_samples across a rolling
-    # gs_persistence_window_secs window.
     max_gs_kt: int = 0
-    # v5 B5/B6: rolling (ts, alt) / (ts, gs) windows for persistence filter.
-    # Pruned inside record_point so older samples don't linger.
+    # v6 fix: dual-track raw and persisted peaks. The raw value is updated
+    # every point (warmup fallback). The persisted value is updated only
+    # when the persistence filter has >= min_samples points in its window.
+    # max_altitude / max_gs_kt use persisted when > 0, else raw. This
+    # corrects the v5 bug where a spike during warmup (< min_samples)
+    # pegged the raw max permanently.
+    _raw_max_altitude: int = 0
+    _persisted_max_altitude: int = 0
+    _raw_max_gs_kt: int = 0
+    _persisted_max_gs_kt: int = 0
     _alt_persist_window: deque = field(default_factory=deque)
     _gs_persist_window: deque = field(default_factory=deque)
     # v5 F1: count of inter-point gaps longer than path_max_segment_secs
@@ -249,13 +254,17 @@ class FlightMetrics:
             )
         )
 
-        # Approach altitudes deque for go-around detection: prefer geom_alt,
-        # fall back to baro_alt when airborne
+        # Approach altitudes deque for go-around detection, phase budget
+        # level_buf, and cruise altitude. v6 N1 fix: prefer baro_alt to
+        # match max_altitude's source. Previously this preferred geom_alt,
+        # causing cruise_alt_ft (from level_buf) to exceed max_altitude
+        # (from baro) on 50% of flights due to the QNH correction offset
+        # between baro and GPS altitude.
         airborne_alt: int | None = None
-        if isinstance(geom_alt, (int, float)):
-            airborne_alt = int(geom_alt)
-        elif isinstance(baro_alt, (int, float)):
+        if isinstance(baro_alt, (int, float)):
             airborne_alt = int(baro_alt)
+        elif isinstance(geom_alt, (int, float)):
+            airborne_alt = int(geom_alt)
         if airborne_alt is not None:
             self.approach_alts.append((ts, airborne_alt))
 
@@ -268,12 +277,13 @@ class FlightMetrics:
 
         # Track last airborne signals for confidence scoring
         if ground_state == "airborne":
-            # v5 B5: replace the raw max() altitude update with a
-            # persistence filter. A candidate peak only wins when held for
-            # >= alt_persistence_min_samples across a rolling
-            # alt_persistence_window_secs window. Guards against single-
-            # sample baro spikes (B748 at 125k ft, B407 at 104k ft) that
-            # previously pegged the raw max.
+            # v6 B5 fix: dual-track raw and persisted max altitude.
+            # Raw is updated every point (warmup / fallback for short
+            # flights). Persisted is updated only when the rolling window
+            # has >= min_samples. The public max_altitude uses persisted
+            # when available, correcting any spike the raw path recorded
+            # during warmup. min() over the window naturally suppresses
+            # single-sample spikes because the non-spike values are lower.
             alt_win_secs = (
                 config.alt_persistence_window_secs
                 if config is not None and hasattr(config, "alt_persistence_window_secs")
@@ -282,7 +292,7 @@ class FlightMetrics:
             alt_min_samples = (
                 config.alt_persistence_min_samples
                 if config is not None and hasattr(config, "alt_persistence_min_samples")
-                else 5
+                else 3
             )
             candidate_alt: int | None = None
             if isinstance(baro_alt, (int, float)):
@@ -292,29 +302,27 @@ class FlightMetrics:
                 self.last_airborne_alt = int(geom_alt)
                 candidate_alt = int(geom_alt)
             if candidate_alt is not None:
+                # Always track raw max (fallback for very short flights)
+                if candidate_alt > self._raw_max_altitude:
+                    self._raw_max_altitude = candidate_alt
+                # Persistence filter
                 self._alt_persist_window.append((ts, candidate_alt))
                 alt_cutoff = ts - alt_win_secs
                 while self._alt_persist_window and self._alt_persist_window[0][0] < alt_cutoff:
                     self._alt_persist_window.popleft()
                 if len(self._alt_persist_window) >= alt_min_samples:
-                    # Enough samples: use the minimum in the window as the
-                    # sustained candidate. This rejects single spikes.
                     sustained = min(a for _, a in self._alt_persist_window)
-                    if sustained > self.max_altitude:
-                        self.max_altitude = sustained
-                else:
-                    # Not enough samples yet: use raw max so short flights
-                    # with only a few airborne points still get a real
-                    # max_altitude instead of staying at 0.
-                    if candidate_alt > self.max_altitude:
-                        self.max_altitude = candidate_alt
+                    if sustained > self._persisted_max_altitude:
+                        self._persisted_max_altitude = sustained
+                # Public value: persisted wins when available, else raw
+                self.max_altitude = (
+                    self._persisted_max_altitude if self._persisted_max_altitude > 0 else self._raw_max_altitude
+                )
             if isinstance(geom_alt, (int, float)):
                 self.last_airborne_geom = int(geom_alt)
             if gs is not None:
                 self.last_airborne_gs = gs
-                # v5 B6: persistence-filtered peak ground speed. Same window
-                # idiom as altitude. A single 400 kt GS spike on a B407 can't
-                # set max_gs_kt unless sustained across >= min_samples points.
+                # v6 B6 fix: same dual-track for ground speed.
                 gs_win_secs = (
                     config.gs_persistence_window_secs
                     if config is not None and hasattr(config, "gs_persistence_window_secs")
@@ -323,20 +331,20 @@ class FlightMetrics:
                 gs_min_samples = (
                     config.gs_persistence_min_samples
                     if config is not None and hasattr(config, "gs_persistence_min_samples")
-                    else 5
+                    else 3
                 )
+                gs_val = int(gs)
+                if gs_val > self._raw_max_gs_kt:
+                    self._raw_max_gs_kt = gs_val
                 self._gs_persist_window.append((ts, float(gs)))
                 gs_cutoff = ts - gs_win_secs
                 while self._gs_persist_window and self._gs_persist_window[0][0] < gs_cutoff:
                     self._gs_persist_window.popleft()
                 if len(self._gs_persist_window) >= gs_min_samples:
                     sustained_gs = int(min(g for _, g in self._gs_persist_window))
-                    if sustained_gs > self.max_gs_kt:
-                        self.max_gs_kt = sustained_gs
-                else:
-                    raw_gs = int(gs)
-                    if raw_gs > self.max_gs_kt:
-                        self.max_gs_kt = raw_gs
+                    if sustained_gs > self._persisted_max_gs_kt:
+                        self._persisted_max_gs_kt = sustained_gs
+                self.max_gs_kt = self._persisted_max_gs_kt if self._persisted_max_gs_kt > 0 else self._raw_max_gs_kt
             if baro_rate is not None:
                 self.last_airborne_baro_rate = baro_rate
 

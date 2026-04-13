@@ -822,7 +822,14 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
         flight.data_points = metrics.data_points
         flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
-        flight.max_altitude = metrics.max_altitude if metrics.max_altitude > 0 else None
+        # v6 B5: hard-cap at 60,000 ft. Multi-point baro spikes (A7-HBJ
+        # at 124,600 ft) can survive the 3-sample persistence filter.
+        # No civil aircraft in the fleet exceeds this; B748 ceiling is
+        # 43,100 ft, GLF6 is 51,000 ft.
+        raw_alt = metrics.max_altitude if metrics.max_altitude > 0 else None
+        if raw_alt is not None and raw_alt > 60_000:
+            raw_alt = 60_000
+        flight.max_altitude = raw_alt
         flight.ground_points_at_landing = metrics.ground_points_at_landing
         flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
         flight.baro_error_points = metrics.baro_error_points

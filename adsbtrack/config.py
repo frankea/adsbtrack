@@ -165,7 +165,7 @@ class Config:
     # never moved, never climbed above ramp height, and never accelerated
     # beyond taxi speed is a parked transponder, not a mission.
     stationary_path_km: float = 0.5
-    stationary_max_alt_ft: float = 500.0
+    stationary_max_alt_ft: float = 1000.0  # v6: raised from 500 to catch ramp at higher-elevation airports
     stationary_max_gs_kt: float = 15.0
 
     # v5 (D1) on-field threshold: origin_icao / destination_icao only get
@@ -192,9 +192,9 @@ class Config:
     # pegging the raw max() to garbage (B5 found a B748 at 125,898 ft
     # and a B407 at 197 kt, both from one-point glitches).
     alt_persistence_window_secs: float = 30.0
-    alt_persistence_min_samples: int = 5
+    alt_persistence_min_samples: int = 3  # v6: lowered from 5 so S92 (15s spacing) activates
     gs_persistence_window_secs: float = 30.0
-    gs_persistence_min_samples: int = 5
+    gs_persistence_min_samples: int = 3
 
     # Trace merging
     dedup_time_secs: float = 1.0  # tighter than before: 2s was dropping legit helicopter hover samples

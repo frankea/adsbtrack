@@ -132,7 +132,32 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
             console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
 
         total_stats = {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
-        for src in sources_to_fetch:
+        if len(sources_to_fetch) > 1:
+            # Parallel fetch: each source in its own thread with its own
+            # DB connection (SQLite WAL supports concurrent writers).
+            import threading
+
+            lock = threading.Lock()
+
+            def _fetch_one(src: str) -> None:
+                with Database(Path(db_path)) as thread_db:
+                    thread_config = Config(db_path=Path(db_path))
+                    thread_config.rate_limit = rate
+                    if src == "opensky":
+                        stats = fetch_traces_opensky(thread_db, thread_config, hex_code, start, end)
+                    else:
+                        stats = fetch_traces(thread_db, thread_config, hex_code, start, end, source=src)
+                    with lock:
+                        for k in total_stats:
+                            total_stats[k] += stats[k]
+
+            threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        else:
+            src = sources_to_fetch[0]
             if src == "opensky":
                 stats = fetch_traces_opensky(db, config, hex_code, start, end)
             else:

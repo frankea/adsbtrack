@@ -1,3 +1,4 @@
+import os
 from datetime import date
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -15,6 +16,8 @@ from .nnumber import nnumber_to_icao
 from .parser import extract_flights
 
 ALL_SOURCES = list(SOURCE_URLS.keys()) + ["opensky"]
+# "all" fetches from every readsb source (excludes opensky which needs creds)
+ALL_SOURCES_WITH_ALL = ["all"] + ALL_SOURCES
 
 console = Console()
 
@@ -67,7 +70,12 @@ def cli():
 @cli.command()
 @click.option("--hex", "hex_code", default=None, help="ICAO hex code (e.g. adf64f)")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number (e.g. N512WB), converted to hex automatically")
-@click.option("--source", type=click.Choice(ALL_SOURCES), default="adsbx", help="Data source (default: adsbx)")
+@click.option(
+    "--source",
+    type=click.Choice(ALL_SOURCES_WITH_ALL),
+    default="adsbx",
+    help="Data source, or 'all' to fetch from every readsb source (default: adsbx)",
+)
 @click.option("--url", "custom_url", default=None, help="Custom readsb globe_history base URL")
 @click.option("--start", "start_date", default="2025-01-01", help="Start date (YYYY-MM-DD)")
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
@@ -87,7 +95,6 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
         end = date.fromisoformat(end_date) if end_date else date.today()
 
         if custom_url:
-            # Validate URL format
             parsed = urlparse(custom_url)
             if not parsed.scheme or not parsed.netloc:
                 raise click.BadParameter(
@@ -96,21 +103,48 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
                 )
             source_name = parsed.netloc.replace(".", "_")
             SOURCE_URLS[source_name] = custom_url
-            source = source_name
+            sources_to_fetch = [source_name]
             console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{custom_url}[/]")
+        elif source == "all":
+            # Fetch from every readsb source + opensky if credentials exist
+            sources_to_fetch = list(SOURCE_URLS.keys())
+            opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
+            if not opensky_available:
+                # Check credentials.json fallback
+                creds_path = config.credentials_path
+                if creds_path.exists():
+                    import json
+
+                    try:
+                        creds = json.loads(creds_path.read_text())
+                        opensky_available = bool(creds.get("clientId") and creds.get("clientSecret"))
+                    except Exception:
+                        pass
+            if opensky_available:
+                sources_to_fetch.append("opensky")
+            console.print(
+                f"Fetching [bold]{hex_code}[/] from {start} to {end} via "
+                f"[cyan]all {len(sources_to_fetch)} sources[/]"
+                + (" (incl. OpenSky)" if opensky_available else " (OpenSky skipped: no credentials)")
+            )
         else:
+            sources_to_fetch = [source]
             console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
 
-        if source == "opensky":
-            stats = fetch_traces_opensky(db, config, hex_code, start, end)
-        else:
-            stats = fetch_traces(db, config, hex_code, start, end, source=source)
+        total_stats = {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+        for src in sources_to_fetch:
+            if src == "opensky":
+                stats = fetch_traces_opensky(db, config, hex_code, start, end)
+            else:
+                stats = fetch_traces(db, config, hex_code, start, end, source=src)
+            for k in total_stats:
+                total_stats[k] += stats[k]
 
         console.print(
-            f"\n[green]Done![/] Fetched: {stats['fetched']}, "
-            f"With data: {stats['with_data']}, "
-            f"Skipped (already fetched): {stats['skipped']}, "
-            f"Errors: {stats['errors']}"
+            f"\n[green]Done![/] Fetched: {total_stats['fetched']}, "
+            f"With data: {total_stats['with_data']}, "
+            f"Skipped (already fetched): {total_stats['skipped']}, "
+            f"Errors: {total_stats['errors']}"
         )
 
         # Auto-extract flights

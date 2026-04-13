@@ -112,6 +112,9 @@ CREATE TABLE IF NOT EXISTS flights (
     nearest_destination_icao TEXT,
     nearest_destination_distance_km REAL,
     max_gs_kt INTEGER,
+    turnaround_minutes REAL,
+    origin_helipad_id INTEGER,
+    destination_helipad_id INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -162,6 +165,16 @@ CREATE TABLE IF NOT EXISTS airports (
     iso_region TEXT,
     municipality TEXT,
     iata_code TEXT
+);
+
+CREATE TABLE IF NOT EXISTS helipads (
+    helipad_id INTEGER PRIMARY KEY,
+    centroid_lat REAL NOT NULL,
+    centroid_lon REAL NOT NULL,
+    landing_count INTEGER DEFAULT 0,
+    first_seen TEXT,
+    last_seen TEXT,
+    name_hint TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
@@ -326,6 +339,9 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("nearest_destination_icao", "TEXT"),
         ("nearest_destination_distance_km", "REAL"),
         ("max_gs_kt", "INTEGER"),
+        ("turnaround_minutes", "REAL"),
+        ("origin_helipad_id", "INTEGER"),
+        ("destination_helipad_id", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -494,7 +510,8 @@ class Database:
                 active_minutes, signal_gap_secs, signal_gap_count, fragments_stitched,
                 nearest_origin_icao, nearest_origin_distance_km,
                 nearest_destination_icao, nearest_destination_distance_km,
-                max_gs_kt)
+                max_gs_kt, turnaround_minutes,
+                origin_helipad_id, destination_helipad_id)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -510,7 +527,7 @@ class Database:
                        ?, ?, ?, ?,
                        ?, ?,
                        ?, ?,
-                       ?)""",
+                       ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -587,6 +604,9 @@ class Database:
                 flight.nearest_destination_icao,
                 flight.nearest_destination_distance_km,
                 flight.max_gs_kt,
+                flight.turnaround_minutes,
+                flight.origin_helipad_id,
+                flight.destination_helipad_id,
             ),
         )
 

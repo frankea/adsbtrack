@@ -171,11 +171,14 @@ def test_path_metrics_high_loiter():
     )
     # loiter = 300 / (2*30) = 5.0
     assert result["loiter_ratio"] == 5.0
-    # path_efficiency None (no destination)
-    assert result["path_efficiency"] is None
+    # v7 H2: path_efficiency = max_distance / path_length = 30/300 = 0.1
+    # (no longer requires airport IDs)
+    assert result["path_efficiency"] == 0.1
 
 
-def test_path_metrics_same_airport_efficiency_none():
+def test_path_metrics_same_airport_has_efficiency():
+    """v7 H2: path_efficiency is now max_distance / path_length, which works
+    for same-airport flights too (displacement ratio, not airport-to-airport)."""
     m = FlightMetrics()
     m.path_length_km = 100.0
     m.max_distance_from_origin_km = 50.0
@@ -188,7 +191,7 @@ def test_path_metrics_same_airport_efficiency_none():
         landing_lat=0.0,
         landing_lon=0.0,
     )
-    assert result["path_efficiency"] is None
+    assert result["path_efficiency"] == 0.5
 
 
 # ---------------------------------------------------------------------------

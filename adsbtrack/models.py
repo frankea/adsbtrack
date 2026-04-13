@@ -120,6 +120,15 @@ class Flight:
     nearest_destination_icao: str | None = None
     nearest_destination_distance_km: float | None = None
 
+    # --- v7 F1: helipad linkage ---
+    origin_helipad_id: int | None = None
+    destination_helipad_id: int | None = None
+
+    # --- v7 F3: turnaround time ---
+    # Minutes from the previous flight's landing (or last_seen) to this
+    # flight's takeoff, same ICAO. NULL for the first flight of each aircraft.
+    turnaround_minutes: float | None = None
+
     # --- v5: persistence-filtered peak ground speed (B6) ---
     # Highest ground speed held for >= gs_persistence_min_samples across a
     # gs_persistence_window_secs window. Guards against single-sample GS

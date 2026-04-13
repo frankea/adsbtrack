@@ -738,6 +738,8 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     #   classify_landing -> B7/B8 filter -> airport (D1) -> B1 duration
     #   recompute -> derive_all (uses signal budget for B2) -> insert (B3 guard)
     final_flights: list[Flight] = []
+    # v7 F3: track previous flight's end time for turnaround computation.
+    prev_end_time: datetime | None = None
     for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
         has_landing = flight.landing_lat is not None
 
@@ -756,12 +758,11 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             dropped_max_alt_ft=config.dropped_max_alt_ft,
         )
 
-        # v5 B7: drop non-confirmed flights that are BOTH short AND sparse.
-        # A long signal_lost flight with few points is still useful; a short
-        # flight with many points is a pattern hop. Only the combination
-        # "brief signal window with barely any data" is a sliver worth
-        # dropping. Confirmed landings are never gated out.
-        if flight.landing_type != "confirmed" and (
+        # v7 R5: tighten tiny-flight guard. Drop signal_lost and uncertain
+        # slivers that are BOTH short AND sparse. Keep confirmed (legitimate
+        # quick helicopter hops) and dropped_on_approach (useful for
+        # destination inference) regardless of size.
+        if flight.landing_type in ("signal_lost", "uncertain") and (
             flight.duration_minutes is not None
             and flight.duration_minutes < config.min_viable_flight_minutes
             and metrics.data_points < config.min_viable_flight_points
@@ -822,13 +823,45 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
         flight.data_points = metrics.data_points
         flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
-        # v6 B5: hard-cap at 60,000 ft. Multi-point baro spikes (A7-HBJ
-        # at 124,600 ft) can survive the 3-sample persistence filter.
-        # No civil aircraft in the fleet exceeds this; B748 ceiling is
-        # 43,100 ft, GLF6 is 51,000 ft.
+        # v7 R4: type-ceiling hard cap as backstop after persistence filter.
+        # If the filtered value still exceeds the type's certified ceiling
+        # by >10%, clamp it. Catches multi-point spikes (stuck transponder
+        # reporting garbage for 25 consecutive points on a short flight).
+        _type_ceiling: dict[str, int] = {
+            "B748": 43_100,
+            "B407": 22_000,
+            "S92": 15_000,
+            "S76": 15_000,
+            "H60": 19_000,
+            "UH60": 19_000,
+            "EC35": 20_000,
+            "EC45": 20_000,
+            "GLF6": 51_000,
+            "GLF5": 51_000,
+            "GLF4": 45_000,
+            "PC12": 30_000,
+            "C172": 14_000,
+            "C182": 18_100,
+            "C208": 25_000,
+            "TBM9": 31_000,
+            "CL60": 41_000,
+            "C56X": 45_000,
+            "E55P": 45_000,
+            "FA7X": 51_000,
+            "K35R": 50_000,
+            "KC46": 40_100,
+            "C17": 45_000,
+            "C5M": 34_000,
+            "C130": 28_000,
+            "E3TF": 42_000,
+            "E6": 42_000,
+        }
         raw_alt = metrics.max_altitude if metrics.max_altitude > 0 else None
-        if raw_alt is not None and raw_alt > 60_000:
-            raw_alt = 60_000
+        if raw_alt is not None:
+            ceiling = _type_ceiling.get(type_code or "", 60_000)
+            cap = int(ceiling * 1.1)  # 10% tolerance
+            if raw_alt > cap:
+                raw_alt = cap
         flight.max_altitude = raw_alt
         flight.ground_points_at_landing = metrics.ground_points_at_landing
         flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
@@ -864,6 +897,13 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             flight.probable_destination_icao = infer["probable_destination_icao"]
             flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
             flight.probable_destination_confidence = infer["probable_destination_confidence"]
+
+        # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
+        if prev_end_time is not None:
+            turn_secs = (flight.takeoff_time - prev_end_time).total_seconds()
+            if turn_secs >= 0:
+                flight.turnaround_minutes = round(turn_secs / 60.0, 1)
+        prev_end_time = flight.landing_time or flight.last_seen_time
 
         db.insert_flight(flight)
         final_flights.append(flight)

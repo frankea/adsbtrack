@@ -19,7 +19,6 @@ from collections import Counter
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .airports import haversine_km
 from .classifier import _haversine_m, descent_score
 from .solar import is_night_at
 
@@ -146,19 +145,15 @@ def compute_path_metrics(
     if path_length_km is not None and max_distance_km is not None and max_distance_km > 0:
         loiter_ratio = round(path_length_km / (2.0 * max_distance_km), 3)
 
+    # v7 H2+F2: redefine path_efficiency as max_distance / path_length.
+    # This needs only coordinates (100% coverage) instead of requiring both
+    # origin_icao and destination_icao (6.1% coverage after D1 tightening).
+    # Measures displacement efficiency: how much of the path was net
+    # progress vs backtracking/orbiting. 1.0 = straight line, <0.5 = lots
+    # of loitering or return-to-origin.
     path_efficiency: float | None = None
-    if (
-        path_length_km is not None
-        and path_length_km > 1.0
-        and origin_icao is not None
-        and destination_icao is not None
-        and origin_icao != destination_icao
-        and landing_lat is not None
-        and landing_lon is not None
-    ):
-        gc_km = haversine_km(takeoff_lat, takeoff_lon, landing_lat, landing_lon)
-        if gc_km > 0 and path_length_km > 0:
-            path_efficiency = round(min(1.0, gc_km / path_length_km), 3)
+    if path_length_km is not None and path_length_km > 1.0 and max_distance_km is not None and max_distance_km > 0:
+        path_efficiency = round(min(1.0, max_distance_km / path_length_km), 3)
 
     return {
         "path_length_km": path_length_km,
@@ -251,12 +246,28 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
         else:
             level_secs_val += dt
 
+    # v7 R1: cap cruise_alt_ft at max_altitude. Cruise can never exceed
+    # the peak. Also catches residual N1 cases where altitude source mixing
+    # (baro for max, geom fallback in level_buf) produces cruise > max.
     cruise_alt_ft: int | None = None
     if cruise_secs_val > 0 and cruise_alt_count > 0:
         cruise_alt_ft = int(round(cruise_alt_sum / max(1, cruise_secs_val)))
+        if max_alt > 0 and cruise_alt_ft > max_alt:
+            cruise_alt_ft = max_alt
+
+    # v7 R2: use median of GS samples with outlier exclusion instead of
+    # time-weighted mean. The mean lets single-spike samples (B407 at 197kt)
+    # drag the value above type limits.
     cruise_gs_kt: int | None = None
     if cruise_gs_count > 0:
-        cruise_gs_kt = int(round(cruise_gs_sum / max(1, cruise_secs_val)))
+        gs_samples = [gs for (_dt, _alt, gs) in metrics.level_buf if _alt >= cruise_threshold and gs is not None]
+        if gs_samples:
+            gs_samples.sort()
+            n = len(gs_samples)
+            median_gs = gs_samples[n // 2] if n % 2 else (gs_samples[n // 2 - 1] + gs_samples[n // 2]) / 2
+            # Exclude outliers > 2x median (single-point GS spikes)
+            filtered_gs = [g for g in gs_samples if g <= 2.0 * max(median_gs, 1.0)]
+            cruise_gs_kt = int(round(sum(filtered_gs) / len(filtered_gs))) if filtered_gs else int(round(median_gs))
 
     # v5 B2: proportional rescale so the four bins sum to exactly the
     # on-signal active time. The online classifier can double-count
@@ -731,14 +742,8 @@ def derive_all(
     # v5 F2: fragment count passthrough
     flight.fragments_stitched = metrics.fragments_stitched
 
-    # v5 B6: persistence-filtered peak ground speed.
-    # v6: hard-cap at 600 kt for known subsonic types. Multi-point GS spikes
-    # (S92 at 1962 kt) can survive the 3-sample persistence filter.
-    _MAX_GS_KT = 600
-    raw_gs = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
-    if raw_gs is not None and raw_gs > _MAX_GS_KT:
-        raw_gs = _MAX_GS_KT
-    flight.max_gs_kt = raw_gs
+    # max_gs_kt cap is deferred to after phase budget so H1 military
+    # type override can detect fixed-wing flights and use jet caps.
 
     # Path metrics
     path = compute_path_metrics(
@@ -801,6 +806,60 @@ def derive_all(
     flight.takeoff_heading_deg = headings["takeoff_heading_deg"]
     flight.landing_heading_deg = headings["landing_heading_deg"]
 
+    # v7 H1: military type override. ae69xx ICAOs were hard-coded as H60
+    # but some fly at FL350/400kt (C-17, KC-135 sharing the block). Detect
+    # fixed-wing profile from the flight's own cruise metrics and use jet
+    # caps instead of helicopter caps.
+    effective_type = type_code
+    if (
+        flight.icao.startswith("ae69")
+        and flight.cruise_alt_ft is not None
+        and flight.cruise_gs_kt is not None
+        and flight.cruise_alt_ft > 18_000
+        and flight.cruise_gs_kt > 250
+    ):
+        effective_type = "MIL_FW"
+
+    # v7 R3: type-specific max_gs_kt cap (deferred from earlier so H1
+    # override is visible). Rotorcraft 250, turboprop 400, jet 700.
+    _GS_CAP_HELICOPTER = 250
+    _GS_CAP_TURBOPROP = 400
+    _GS_CAP_JET = 700
+    _GS_CAP_DEFAULT = 600
+    _turboprop_types = ("C208", "PC12", "TBM9", "C130", "P8")
+    _jet_types = (
+        "GLF5",
+        "GLF6",
+        "GLF4",
+        "B748",
+        "CL60",
+        "C56X",
+        "FA7X",
+        "K35R",
+        "K35E",
+        "KC10",
+        "KC30",
+        "KC46",
+        "C17",
+        "C5M",
+        "E3TF",
+        "E6",
+        "SJ30",
+        "MIL_FW",
+    )
+    if effective_type in config.helicopter_types:
+        gs_cap = _GS_CAP_HELICOPTER
+    elif effective_type in _turboprop_types:
+        gs_cap = _GS_CAP_TURBOPROP
+    elif effective_type in _jet_types:
+        gs_cap = _GS_CAP_JET
+    else:
+        gs_cap = _GS_CAP_DEFAULT
+    raw_gs = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
+    if raw_gs is not None and raw_gs > gs_cap:
+        raw_gs = gs_cap
+    flight.max_gs_kt = raw_gs
+
     # Squawks
     sq = compute_squawk_summary(metrics, config=config)
     flight.squawk_first = sq["squawk_first"]
@@ -821,6 +880,21 @@ def derive_all(
     # Autopilot + detail emergency
     flight.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
     flight.emergency_flag = metrics.emergency_flag
+
+    # v7 H4: null out autopilot_target for H60 / ae69xx AFTER the
+    # assignment above (otherwise the assignment overwrites the null).
+    if effective_type == "H60" or flight.icao.startswith("ae69"):
+        flight.autopilot_target_alt_ft = None
+
+    # v7 R1 final cap: cruise_alt_ft must not exceed the type-ceiling-
+    # capped flight.max_altitude. The compute_phase_budget cap uses
+    # metrics.max_altitude which is pre-type-ceiling.
+    if (
+        flight.cruise_alt_ft is not None
+        and flight.max_altitude is not None
+        and flight.cruise_alt_ft > flight.max_altitude
+    ):
+        flight.cruise_alt_ft = flight.max_altitude
 
     # Mission (v4 §3.6: now consults owner_operator and type_code)
     flight.mission_type = classify_mission(

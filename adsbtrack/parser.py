@@ -886,10 +886,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 ap is not None
                 and abs(flight.max_altitude - ap) <= 5000
             )
-            if ap_coherent:
-                alt_cap = int(ceiling * 1.1)
-            else:
-                alt_cap = ceiling
+            alt_cap = int(ceiling * 1.1) if ap_coherent else ceiling
             if flight.max_altitude > alt_cap:
                 flight.max_altitude = alt_cap
             # Also re-cap cruise_alt_ft after ceiling adjustment

@@ -278,7 +278,7 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
             mean_gs = sum(weighted_gs) / n
             if n > 2:
                 variance = sum((g - mean_gs) ** 2 for g in weighted_gs) / (n - 1)
-                stdev = variance ** 0.5
+                stdev = variance**0.5
                 lower = mean_gs - 2.0 * max(stdev, 5.0)
                 upper = mean_gs + 2.0 * max(stdev, 5.0)
                 trimmed = [g for g in weighted_gs if lower <= g <= upper]

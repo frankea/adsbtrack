@@ -1038,9 +1038,7 @@ class Database:
 
         Returns the number of flight-helipad links written.
         """
-        helipads = self.conn.execute(
-            "SELECT helipad_id, centroid_lat, centroid_lon FROM helipads"
-        ).fetchall()
+        helipads = self.conn.execute("SELECT helipad_id, centroid_lat, centroid_lon FROM helipads").fetchall()
         if not helipads:
             return 0
 
@@ -1139,9 +1137,7 @@ class Database:
         Returns the number of registry rows deleted.
         """
         if icao:
-            count = self.conn.execute(
-                "SELECT COUNT(*) AS cnt FROM flights WHERE icao = ?", (icao,)
-            ).fetchone()["cnt"]
+            count = self.conn.execute("SELECT COUNT(*) AS cnt FROM flights WHERE icao = ?", (icao,)).fetchone()["cnt"]
             if count == 0:
                 self.conn.execute("DELETE FROM aircraft_registry WHERE icao = ?", (icao,))
                 self.conn.execute("DELETE FROM aircraft_stats WHERE icao = ?", (icao,))

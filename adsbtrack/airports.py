@@ -70,9 +70,7 @@ def enrich_helipad_names(db: Database, config: Config, *, max_distance_km: float
     Returns the number of helipads enriched.
     """
     # Fetch all helipads that still have a generic name or no name
-    helipads = db.conn.execute(
-        "SELECT helipad_id, centroid_lat, centroid_lon, name_hint FROM helipads"
-    ).fetchall()
+    helipads = db.conn.execute("SELECT helipad_id, centroid_lat, centroid_lon, name_hint FROM helipads").fetchall()
     if not helipads:
         return 0
 

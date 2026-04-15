@@ -403,15 +403,11 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 ).fetchone()
                 if drift_json and drift_json[0]:
                     import json as _json
+
                     drift_vals = _json.loads(drift_json[0])
-                    type_conflicts = [
-                        d for d in drift_vals
-                        if d.get("type_code") and d["type_code"] != type_code
-                    ]
+                    type_conflicts = [d for d in drift_vals if d.get("type_code") and d["type_code"] != type_code]
                     if type_conflicts:
-                        conflict_types = ", ".join(
-                            f"{d['type_code']}({d['count']})" for d in type_conflicts
-                        )
+                        conflict_types = ", ".join(f"{d['type_code']}({d['count']})" for d in type_conflicts)
                         print(
                             f"  WARNING: {hex_code} has {drift_count} metadata drift events "
                             f"with type_code conflicts: {type_code} vs {conflict_types}"
@@ -882,10 +878,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             # the book ceiling so corrupt spikes don't exceed physical
             # limits.
             ap = flight.autopilot_target_alt_ft
-            ap_coherent = (
-                ap is not None
-                and abs(flight.max_altitude - ap) <= 5000
-            )
+            ap_coherent = ap is not None and abs(flight.max_altitude - ap) <= 5000
             alt_cap = int(ceiling * 1.1) if ap_coherent else ceiling
             if flight.max_altitude > alt_cap:
                 flight.max_altitude = alt_cap

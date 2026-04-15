@@ -175,23 +175,23 @@ TYPE_CEILINGS: dict[str, int] = {
 # TYPE_CEILINGS for altitude. Values are Vne/Vmo + margin.
 TYPE_MAX_GS: dict[str, int] = {
     # Helicopters
-    "B407": 160,   # Vne 140 kt
+    "B407": 160,  # Vne 140 kt
     "B429": 170,
     "EC30": 155,
     "EC35": 160,
     "EC45": 160,
     "S76": 175,
-    "S92": 175,    # Vne 165 kt
-    "H60": 200,    # Vne 193 kt
+    "S92": 175,  # Vne 165 kt
+    "H60": 200,  # Vne 193 kt
     "UH60": 200,
     # Light piston / turboprop
     "C172": 160,
     "C182": 180,
-    "C208": 190,   # Vmo 175 kt
-    "PC12": 320,   # Vmo 270 kt; v12 R2a: raised from 290, a66ad3 at 319 kt confirmed legit (tailwind)
-    "TBM9": 330,   # Vmo 266 kt but TAS at altitude
+    "C208": 190,  # Vmo 175 kt
+    "PC12": 320,  # Vmo 270 kt; v12 R2a: raised from 290, a66ad3 at 319 kt confirmed legit (tailwind)
+    "TBM9": 330,  # Vmo 266 kt but TAS at altitude
     # Business jets
-    "GLF6": 590,   # Mmo 0.925, ~530 kt TAS at FL510
+    "GLF6": 590,  # Mmo 0.925, ~530 kt TAS at FL510
     "GLF5": 590,
     "GLF4": 560,
     "CL60": 530,
@@ -199,9 +199,9 @@ TYPE_MAX_GS: dict[str, int] = {
     "E55P": 460,
     "FA7X": 590,
     # Widebody
-    "B748": 590,   # Mmo 0.92
+    "B748": 590,  # Mmo 0.92
     # Military
-    "K35R": 550,   # Vmo ~490 kt, TAS at altitude ~530
+    "K35R": 550,  # Vmo ~490 kt, TAS at altitude ~530
     "KC46": 530,
     "C17": 530,
     "C5M": 500,

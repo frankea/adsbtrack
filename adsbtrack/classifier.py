@@ -323,10 +323,7 @@ class FlightMetrics:
                 # a 13,000 ft disagreement from mixed trace segments.
                 # AP only validates the altitude when the two are within
                 # 5,000 ft of each other.
-                has_ap = (
-                    point.nav_altitude_mcp is not None
-                    and abs(candidate_alt - int(point.nav_altitude_mcp)) <= 5000
-                )
+                has_ap = point.nav_altitude_mcp is not None and abs(candidate_alt - int(point.nav_altitude_mcp)) <= 5000
                 if has_ap:
                     self._alt_persist_window.append((ts, candidate_alt))
                 alt_cutoff = ts - alt_win_secs

@@ -13,7 +13,16 @@ def _cfg() -> Config:
     return Config()
 
 
-def _point(ts: float, *, lat=40.0, lon=-74.0, baro_alt=10_000, gs=300.0, callsign=None) -> PointData:
+def _point(
+    ts: float,
+    *,
+    lat=40.0,
+    lon=-74.0,
+    baro_alt=10_000,
+    gs=300.0,
+    callsign=None,
+    nav_altitude_mcp=None,
+) -> PointData:
     return PointData(
         ts=ts,
         lat=lat,
@@ -26,7 +35,7 @@ def _point(ts: float, *, lat=40.0, lon=-74.0, baro_alt=10_000, gs=300.0, callsig
         geom_rate=None,
         squawk=None,
         category=None,
-        nav_altitude_mcp=None,
+        nav_altitude_mcp=nav_altitude_mcp,
         nav_qnh=None,
         emergency_field=None,
         true_heading=None,
@@ -53,14 +62,17 @@ def test_max_altitude_persistence_rejects_single_spike():
 
     # 10 real cruise samples at 30,000 ft, 5 s apart (50 s span, 10 samples
     # - exceeds the 5-sample minimum within the 30 s window).
+    # nav_altitude_mcp is set so these enter the AP-validated persistence
+    # filter (v14 R4a requires AP for altitude cross-validation).
     for i in range(10):
         m.record_point(
-            _point(ts=1000.0 + i * 5, baro_alt=30_000, gs=450.0),
+            _point(ts=1000.0 + i * 5, baro_alt=30_000, gs=450.0, nav_altitude_mcp=30_000),
             ground_state="airborne",
             ground_reason="airborne",
             config=cfg,
         )
     # One rogue baro spike at 125,000 ft (Karman line, clearly bogus).
+    # No AP data -- the spike is uncorroborated and only hits the raw max.
     m.record_point(
         _point(ts=1055.0, baro_alt=125_000, gs=450.0),
         ground_state="airborne",
@@ -70,7 +82,7 @@ def test_max_altitude_persistence_rejects_single_spike():
     # A few more real cruise samples after the spike.
     for i in range(5):
         m.record_point(
-            _point(ts=1060.0 + i * 5, baro_alt=30_000, gs=450.0),
+            _point(ts=1060.0 + i * 5, baro_alt=30_000, gs=450.0, nav_altitude_mcp=30_000),
             ground_state="airborne",
             ground_reason="airborne",
             config=cfg,

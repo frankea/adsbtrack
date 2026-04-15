@@ -11,5 +11,25 @@ airports.csv
 dist/
 build/
 .venv/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Claude Code
+.claude/
+
+# FUSE artifacts (mounted drives)
+.fuse_hidden*
+
+# Misc
 *.har
-*.txt
+*.log

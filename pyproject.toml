@@ -1,13 +1,34 @@
 [project]
 name = "adsbtrack"
 version = "0.1.0"
-description = "Track private plane travel history using ADS-B Exchange historical data"
+description = "Pull historical ADS-B trace data and turn it into structured flight history for any aircraft"
 requires-python = ">=3.12"
+authors = [{name = "Adam Franke"}]
+readme = "README.md"
+license = {text = "MIT"}
+keywords = ["aviation", "osint", "adsb", "tracking", "aircraft", "flight-history"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Information Analysis",
+]
 dependencies = [
     "httpx[http2]>=0.28",
     "click>=8.0",
     "rich>=13.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/frankea/adsbtrack"
+Repository = "https://github.com/frankea/adsbtrack"
+Documentation = "https://github.com/frankea/adsbtrack#documentation"
+Issues = "https://github.com/frankea/adsbtrack/issues"
 
 [project.scripts]
 adsbtrack = "adsbtrack.cli:cli"

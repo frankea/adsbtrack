@@ -42,6 +42,26 @@ After extraction, a post-processing pass walks each aircraft's flights chronolog
 
 The stitched flight inherits the original takeoff position and time, which recovers the actual origin airport for flights that would otherwise be classified as mid-flight fragments. Duration is recomputed after merging so the wall-clock span covers the coverage gap.
 
+## Altitude cross-validation
+
+`max_altitude` uses a three-layer defence against corrupt altitude spikes from pressure-datum swaps and geometric-altitude errors:
+
+1. **AP-validated persistence filter.** Only samples where `nav_altitude_mcp` (autopilot target) is present AND agrees with the candidate altitude (within 5,000 ft) enter the persisted peak tracker. Squawk is not used -- it's always present on operating transponders and does not correlate with altitude validity. On B748 06a1e4, the correlation was perfect: 4/4 ceiling violations had squawk set but AP NULL; 198/198 normal flights had AP set.
+
+2. **Raw fallback.** Flights without AP data fall back to the raw max (all samples tracked unconditionally). This ensures every flight gets a max_altitude even with sparse mode-S data.
+
+3. **Per-type ceiling cap.** `TYPE_CEILINGS` maps each type code to its book service ceiling. Flights with coherent AP data (AP present and agreeing with max_altitude within 5,000 ft) get 10% tolerance; flights without coherent AP cap at exactly the book ceiling. This prevents uncorroborated spikes from exceeding physical limits while preserving legitimate high-altitude operations.
+
+The same persistence filter pattern applies to `max_gs_kt`, with per-type caps from `TYPE_MAX_GS`.
+
+## Helipad clustering and naming
+
+After flight extraction, landing coordinates that don't match any airport are clustered using DBSCAN (200 m epsilon) to identify recurring helipad sites. Each cluster becomes a row in the `helipads` table with a centroid and landing count.
+
+Helipad names are enriched in two passes: (1) an OurAirports CSV join that matches helipad centroids against `type='heliport'` entries within 500 m, and (2) a manual override dictionary for known facilities not in external databases (hospitals, HEMS bases, international helipads). The enrichment runs once per `extract` call and only updates helipads that still have generic names.
+
+Flight-helipad linkage (`origin_helipad_id`, `destination_helipad_id`) is back-filled after all flights are inserted, matching takeoff/landing coordinates against helipad centroids within 200 m.
+
 ## Airport matching
 
 Origin and destination are matched via a bounding-box query against the OurAirports database (~47k airports) followed by haversine distance calculation. Origin/destination ICAO codes are only populated when the match is within 2 km (on-field). Farther hits (up to 10 km) populate diagnostic `nearest_origin_icao` / `nearest_destination_icao` columns so the information isn't lost but helicopters and offshore ops don't get false-attributed to nearby civil airports. Matches are skipped entirely for `signal_lost` and `dropped_on_approach` flights.

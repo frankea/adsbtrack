@@ -60,6 +60,105 @@ def download_airports(db: Database, config: Config):
     return len(airports)
 
 
+def enrich_helipad_names(db: Database, config: Config, *, max_distance_km: float = 0.5) -> int:
+    """Match helipads against OurAirports heliport entries by proximity.
+
+    Downloads the same airports.csv, filters for type='heliport', and for
+    each helipad in the DB finds the nearest heliport within max_distance_km.
+    Updates the helipad's name_hint with the heliport name.
+
+    Returns the number of helipads enriched.
+    """
+    # Fetch all helipads that still have a generic name or no name
+    helipads = db.conn.execute(
+        "SELECT helipad_id, centroid_lat, centroid_lon, name_hint FROM helipads"
+    ).fetchall()
+    if not helipads:
+        return 0
+
+    # Download heliport entries from OurAirports CSV
+    resp = httpx.get(config.airports_csv_url, follow_redirects=True, timeout=60)
+    resp.raise_for_status()
+    reader = csv.DictReader(io.StringIO(resp.text))
+    heliports: list[tuple[str, str, float, float]] = []  # (ident, name, lat, lon)
+    for row in reader:
+        if row.get("type") != "heliport":
+            continue
+        try:
+            lat = float(row["latitude_deg"])
+            lon = float(row["longitude_deg"])
+        except (ValueError, KeyError):
+            continue
+        name = row.get("name", "")
+        ident = row.get("ident", "")
+        if name:
+            heliports.append((ident, name, lat, lon))
+
+    if not heliports:
+        return 0
+
+    # Manual overrides for known facilities not in OurAirports.
+    # (lat, lon, name) tuples; matched within 1 km of helipad centroid.
+    _MANUAL_OVERRIDES: list[tuple[float, float, str]] = [
+        (35.202, -101.919, "Northwest Texas Healthcare System Heliport"),
+        (34.439, -100.229, "Childress Regional Medical Center Heliport"),
+        (34.444, -100.236, "Childress Regional Medical Center Heliport"),
+        (34.438, -100.240, "Childress Regional Medical Center Heliport"),
+        (34.447, -100.225, "Childress Regional Medical Center Heliport"),
+        (45.583, -122.565, "Legacy Emanuel Medical Center Heliport"),
+        (34.231, -84.462, "Northside Hospital Cherokee Heliport"),
+        (27.409, -82.570, "Sarasota Memorial Hospital Heliport"),
+        (38.517, -92.512, "Capital Region Medical Center Heliport"),
+        (38.566, -92.490, "SSM Health St. Mary's Hospital Heliport"),
+        (38.862, -99.308, "Hays Medical Center Heliport"),
+        (38.862, -99.298, "Hays Medical Center Heliport"),
+        (25.241, 51.574, "Hamad Medical Corporation Heliport"),
+        (49.252, 0.582, "Deauville Heliport"),
+        (35.036, -85.268, "Erlanger East Hospital Heliport"),
+        (35.062, -84.718, "Starr Regional Medical Center Heliport"),
+        (38.562, -92.492, "Jefferson City MO Medical Heliport"),
+        (37.962, -92.665, "Phelps Health Hospital Heliport"),
+        (37.723, -97.263, "Ascension Via Christi St. Francis Heliport"),
+        (38.842, -99.307, "Hays KS Area Heliport"),
+    ]
+
+    enriched = 0
+    for hp in helipads:
+        hp_lat = hp["centroid_lat"]
+        hp_lon = hp["centroid_lon"]
+        hp_name = hp["name_hint"] or ""
+
+        # Skip if already named (not generic)
+        if hp_name and not hp_name.startswith("helipad_"):
+            continue
+
+        # Try OurAirports match first
+        best_name: str | None = None
+        best_dist = max_distance_km
+        for _ident, name, h_lat, h_lon in heliports:
+            d = haversine_km(hp_lat, hp_lon, h_lat, h_lon)
+            if d < best_dist:
+                best_dist = d
+                best_name = name
+
+        # Fall back to manual overrides (1 km tolerance)
+        if not best_name:
+            for m_lat, m_lon, m_name in _MANUAL_OVERRIDES:
+                d = haversine_km(hp_lat, hp_lon, m_lat, m_lon)
+                if d < 1.0:
+                    best_name = m_name
+                    break
+
+        if best_name:
+            db.conn.execute(
+                "UPDATE helipads SET name_hint = ? WHERE helipad_id = ?",
+                (best_name, hp["helipad_id"]),
+            )
+            enriched += 1
+
+    return enriched
+
+
 def find_nearest_airport(db: Database, lat: float, lon: float, config: Config) -> AirportMatch | None:
     candidates = db.find_nearby_airports(lat, lon, delta=0.15, types=config.airport_types)
     if not candidates:

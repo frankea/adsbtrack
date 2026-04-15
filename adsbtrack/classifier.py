@@ -193,6 +193,9 @@ class FlightMetrics:
     # (ts, track_deg, gs) tuples for later filtering in features.compute_headings.
     takeoff_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
     landing_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
+    # v9 N7: recent airborne positions for bearing-based heading fallback
+    # when track data is unavailable (helicopter hover approaches).
+    _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
 
     def record_point(
         self,
@@ -275,6 +278,10 @@ class FlightMetrics:
         if ground_reason in ("baro_error", "speed_override"):
             self.baro_error_points += 1
 
+        # v9 N7: buffer recent airborne positions for bearing fallback
+        if ground_state == "airborne":
+            self._recent_positions.append((ts, lat, lon))
+
         # Track last airborne signals for confidence scoring
         if ground_state == "airborne":
             # v6 B5 fix: dual-track raw and persisted max altitude.
@@ -302,11 +309,26 @@ class FlightMetrics:
                 self.last_airborne_alt = int(geom_alt)
                 candidate_alt = int(geom_alt)
             if candidate_alt is not None:
-                # Always track raw max (fallback for very short flights)
+                # Always track raw max (fallback for flights without
+                # mode-S extended data). Type ceiling catches extremes.
                 if candidate_alt > self._raw_max_altitude:
                     self._raw_max_altitude = candidate_alt
-                # Persistence filter
-                self._alt_persist_window.append((ts, candidate_alt))
+                # v14 R4a: AP-validated persistence filter. Only samples
+                # with nav_altitude_mcp (autopilot target) present enter
+                # the persistence window. Squawk is NOT sufficient --
+                # it's always present on operating transponders and does
+                # not correlate with altitude validity.
+                # v15 R4c: AP must also AGREE with the altitude sample.
+                # S92 a7a622 had AP=3,008 ft while altitude=16,500 ft --
+                # a 13,000 ft disagreement from mixed trace segments.
+                # AP only validates the altitude when the two are within
+                # 5,000 ft of each other.
+                has_ap = (
+                    point.nav_altitude_mcp is not None
+                    and abs(candidate_alt - int(point.nav_altitude_mcp)) <= 5000
+                )
+                if has_ap:
+                    self._alt_persist_window.append((ts, candidate_alt))
                 alt_cutoff = ts - alt_win_secs
                 while self._alt_persist_window and self._alt_persist_window[0][0] < alt_cutoff:
                     self._alt_persist_window.popleft()
@@ -576,19 +598,30 @@ class FlightMetrics:
         # Takeoff window is "the first N seconds after takeoff was observed"
         # which we approximate here by capturing the first N seconds of any
         # airborne point stream. Landing window is "the last N seconds"
-        # which we capture unconditionally — features.compute_headings will
+        # which we capture unconditionally - features.compute_headings will
         # filter by the landing transition timestamp.
-        if point.track is not None and ground_state == "airborne":
+        #
+        # v8 N7: takeoff tracks still require airborne state (ground tracks
+        # at takeoff are taxi noise). Landing tracks now also accept ground-
+        # state points with a valid track, because helicopters transition to
+        # baro=ground while still moving at low GS during final approach.
+        # Without this, 358 B407 confirmed landings had no landing_heading
+        # because the last airborne track was too far from touchdown.
+        if point.track is not None:
             heading_window = (
                 config.heading_window_secs if config is not None and hasattr(config, "heading_window_secs") else 60.0
             )
-            # First-60-seconds buffer (takeoff): only accept if within the
-            # heading window from the first observed airborne point.
-            if self.first_point_ts is not None and (ts - self.first_point_ts) <= heading_window:
-                self.takeoff_tracks.append((ts, float(point.track), gs))
-            # Landing buffer: always append; features.compute_headings slices
-            # by the final landing_transition_ts. Keep bounded.
-            self.landing_tracks.append((ts, float(point.track), gs))
+            if ground_state == "airborne":
+                # First-60-seconds buffer (takeoff): only accept if within the
+                # heading window from the first observed airborne point.
+                if self.first_point_ts is not None and (ts - self.first_point_ts) <= heading_window:
+                    self.takeoff_tracks.append((ts, float(point.track), gs))
+                # Landing buffer: always append airborne tracks
+                self.landing_tracks.append((ts, float(point.track), gs))
+            elif ground_state == "ground" and gs is not None and gs > 0:
+                # Ground-state points with movement: include in landing buffer
+                # so helicopter hover-approach tracks reach compute_headings.
+                self.landing_tracks.append((ts, float(point.track), gs))
             if len(self.landing_tracks) > 240:
                 # Keep the most recent 240 points only
                 self.landing_tracks = self.landing_tracks[-240:]

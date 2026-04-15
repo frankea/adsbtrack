@@ -128,6 +128,90 @@ OFFSHORE_OPERATOR_KEYWORDS: tuple[str, ...] = (
 )
 
 
+# v8 R4: type-specific service ceilings (feet). Used as a backstop after
+# persistence filtering to cap max_altitude at physically plausible values.
+# If max_altitude exceeds the ceiling by >10%, it is clamped.
+TYPE_CEILINGS: dict[str, int] = {
+    # Widebody (v14 R4a: reverted to 43,100; light-load ferry never exceeds
+    # book ceiling per AP-validated data -- 39,675 ft peak with AP set)
+    "B748": 43_100,
+    # Helicopters
+    "B407": 18_500,  # v16 R4d: lowered from 22,000; service ceiling 18,690 ft
+    "S92": 15_000,
+    "S76": 15_000,
+    "H60": 19_000,
+    "UH60": 19_000,
+    "EC35": 20_000,
+    "EC45": 20_000,
+    # Business jets
+    "GLF6": 51_000,
+    "GLF5": 51_000,
+    "GLF4": 45_000,
+    "CL60": 41_000,
+    "C56X": 45_000,
+    "E55P": 45_000,
+    "FA7X": 51_000,
+    # Turboprop / piston
+    "PC12": 30_000,
+    "C172": 14_000,
+    "C182": 18_100,
+    "C208": 25_000,
+    "TBM9": 31_000,
+    # Military
+    "K35R": 50_000,
+    "KC46": 40_100,
+    "C17": 45_000,
+    "C5M": 34_000,
+    "C130": 28_000,
+    "E3TF": 42_000,
+    "E6": 42_000,
+    "MIL_FW": 45_000,
+}
+
+
+# v9 R3: type-specific max ground speed (knots). Used as a backstop after
+# persistence filtering to cap max_gs_kt at physically plausible values.
+# If max_gs_kt exceeds the cap by >10%, it is clamped. Same pattern as
+# TYPE_CEILINGS for altitude. Values are Vne/Vmo + margin.
+TYPE_MAX_GS: dict[str, int] = {
+    # Helicopters
+    "B407": 160,   # Vne 140 kt
+    "B429": 170,
+    "EC30": 155,
+    "EC35": 160,
+    "EC45": 160,
+    "S76": 175,
+    "S92": 175,    # Vne 165 kt
+    "H60": 200,    # Vne 193 kt
+    "UH60": 200,
+    # Light piston / turboprop
+    "C172": 160,
+    "C182": 180,
+    "C208": 190,   # Vmo 175 kt
+    "PC12": 320,   # Vmo 270 kt; v12 R2a: raised from 290, a66ad3 at 319 kt confirmed legit (tailwind)
+    "TBM9": 330,   # Vmo 266 kt but TAS at altitude
+    # Business jets
+    "GLF6": 590,   # Mmo 0.925, ~530 kt TAS at FL510
+    "GLF5": 590,
+    "GLF4": 560,
+    "CL60": 530,
+    "C56X": 480,
+    "E55P": 460,
+    "FA7X": 590,
+    # Widebody
+    "B748": 590,   # Mmo 0.92
+    # Military
+    "K35R": 550,   # Vmo ~490 kt, TAS at altitude ~530
+    "KC46": 530,
+    "C17": 530,
+    "C5M": 500,
+    "C130": 360,
+    "E3TF": 500,
+    "E6": 530,
+    "MIL_FW": 600,
+}
+
+
 # Emergency squawk severity. Higher value = more severe. Used to pick the
 # most-severe code when a flight sees multiple emergency squawks.
 EMERGENCY_SQUAWK_PRIORITY: dict[str, int] = {
@@ -158,7 +242,8 @@ class Config:
     # v5 (B7) minimum-viable-flight gate for non-confirmed flights. A
     # signal_lost / dropped / uncertain fragment shorter than this is
     # dropped as a sliver. Confirmed landings are never gated out.
-    min_viable_flight_minutes: float = 2.0
+    # v8 R5: raised from 2.0 to 3.0 min to tighten the tiny-flight guard.
+    min_viable_flight_minutes: float = 3.0
     min_viable_flight_points: int = 10
 
     # v5 (B8) stationary broadcaster detector. A "flight" where the aircraft

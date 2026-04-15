@@ -12,7 +12,7 @@ from .classifier import (
     classify_landing,
     score_confidence,
 )
-from .config import Config
+from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database
 from .models import Flight
 
@@ -391,6 +391,33 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             type_code = registry_row["type_code"]
         if registry_row.get("owner_operator"):
             owner_operator = registry_row["owner_operator"]
+        # v12 N24: warn when type_code drift exceeds threshold. Pure
+        # description drift is noise; type_code conflicts indicate the
+        # registry entry may be wrong (e.g. GLF6 vs GA8C on adf64f).
+        drift_count = registry_row.get("metadata_drift_count", 0)
+        if drift_count > 20:
+            try:
+                drift_json = db.conn.execute(
+                    "SELECT metadata_drift_values FROM aircraft_registry WHERE icao = ?",
+                    (hex_code,),
+                ).fetchone()
+                if drift_json and drift_json[0]:
+                    import json as _json
+                    drift_vals = _json.loads(drift_json[0])
+                    type_conflicts = [
+                        d for d in drift_vals
+                        if d.get("type_code") and d["type_code"] != type_code
+                    ]
+                    if type_conflicts:
+                        conflict_types = ", ".join(
+                            f"{d['type_code']}({d['count']})" for d in type_conflicts
+                        )
+                        print(
+                            f"  WARNING: {hex_code} has {drift_count} metadata drift events "
+                            f"with type_code conflicts: {type_code} vs {conflict_types}"
+                        )
+            except Exception:
+                pass
     if type_code is None:
         for row in trace_days:
             if row["type_code"]:
@@ -758,11 +785,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             dropped_max_alt_ft=config.dropped_max_alt_ft,
         )
 
-        # v7 R5: tighten tiny-flight guard. Drop signal_lost and uncertain
-        # slivers that are BOTH short AND sparse. Keep confirmed (legitimate
-        # quick helicopter hops) and dropped_on_approach (useful for
-        # destination inference) regardless of size.
-        if flight.landing_type in ("signal_lost", "uncertain") and (
+        # v8 R5: tighten tiny-flight guard. Drop signal_lost, uncertain, and
+        # dropped_on_approach slivers that are BOTH short AND sparse. Keep
+        # confirmed landings (legitimate quick helicopter hops) regardless
+        # of size. Threshold raised to 3 min and dropped_on_approach added
+        # since a sub-3-min dropped fragment is noise, not a real approach.
+        if flight.landing_type in ("signal_lost", "uncertain", "dropped_on_approach") and (
             flight.duration_minutes is not None
             and flight.duration_minutes < config.min_viable_flight_minutes
             and metrics.data_points < config.min_viable_flight_points
@@ -823,46 +851,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
 
         flight.data_points = metrics.data_points
         flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
-        # v7 R4: type-ceiling hard cap as backstop after persistence filter.
-        # If the filtered value still exceeds the type's certified ceiling
-        # by >10%, clamp it. Catches multi-point spikes (stuck transponder
-        # reporting garbage for 25 consecutive points on a short flight).
-        _type_ceiling: dict[str, int] = {
-            "B748": 43_100,
-            "B407": 22_000,
-            "S92": 15_000,
-            "S76": 15_000,
-            "H60": 19_000,
-            "UH60": 19_000,
-            "EC35": 20_000,
-            "EC45": 20_000,
-            "GLF6": 51_000,
-            "GLF5": 51_000,
-            "GLF4": 45_000,
-            "PC12": 30_000,
-            "C172": 14_000,
-            "C182": 18_100,
-            "C208": 25_000,
-            "TBM9": 31_000,
-            "CL60": 41_000,
-            "C56X": 45_000,
-            "E55P": 45_000,
-            "FA7X": 51_000,
-            "K35R": 50_000,
-            "KC46": 40_100,
-            "C17": 45_000,
-            "C5M": 34_000,
-            "C130": 28_000,
-            "E3TF": 42_000,
-            "E6": 42_000,
-        }
-        raw_alt = metrics.max_altitude if metrics.max_altitude > 0 else None
-        if raw_alt is not None:
-            ceiling = _type_ceiling.get(type_code or "", 60_000)
-            cap = int(ceiling * 1.1)  # 10% tolerance
-            if raw_alt > cap:
-                raw_alt = cap
-        flight.max_altitude = raw_alt
+        # Store raw persistence-filtered altitude; ceiling cap is applied
+        # after derive_all so type_override is available for the lookup.
+        flight.max_altitude = metrics.max_altitude if metrics.max_altitude > 0 else None
         flight.ground_points_at_landing = metrics.ground_points_at_landing
         flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
         flight.baro_error_points = metrics.baro_error_points
@@ -876,6 +867,49 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             type_code=type_code,
             owner_operator=owner_operator,
         )
+
+        # v9 R4: ceiling + GS cap using effective type (type_override wins).
+        # Runs after derive_all so MIL_FW override is set. The ceiling
+        # was previously applied before derive_all using only a preliminary
+        # ae69xx altitude check, which missed flights classified by cruise_gs.
+        effective_type = flight.type_override or type_code
+        if flight.max_altitude is not None:
+            ceiling = TYPE_CEILINGS.get(effective_type or "", 60_000)
+            # v14 R4a: only give 10% tolerance when the flight has
+            # coherent AP data. Without AP, or when the AP target
+            # wildly disagrees with max_altitude (>5,000 ft delta --
+            # e.g. S92 a7a622 AP=3,008 vs alt=16,500), cap at exactly
+            # the book ceiling so corrupt spikes don't exceed physical
+            # limits.
+            ap = flight.autopilot_target_alt_ft
+            ap_coherent = (
+                ap is not None
+                and abs(flight.max_altitude - ap) <= 5000
+            )
+            if ap_coherent:
+                alt_cap = int(ceiling * 1.1)
+            else:
+                alt_cap = ceiling
+            if flight.max_altitude > alt_cap:
+                flight.max_altitude = alt_cap
+            # Also re-cap cruise_alt_ft after ceiling adjustment
+            if flight.cruise_alt_ft is not None and flight.cruise_alt_ft > flight.max_altitude:
+                flight.cruise_alt_ft = flight.max_altitude
+
+        # v9 R3: type-based GS cap for max_gs_kt. Same pattern as altitude
+        # ceiling -- if the persistence-filtered value still exceeds the
+        # type's physical max by >10%, clamp it.
+        if flight.max_gs_kt is not None:
+            gs_ceiling = TYPE_MAX_GS.get(effective_type or "", 800)
+            gs_cap = int(gs_ceiling * 1.1)
+            if flight.max_gs_kt > gs_cap:
+                flight.max_gs_kt = gs_cap
+            # v17 R5: re-add type cap on cruise_gs_kt. Both cruise_gs
+            # and max_gs must share the same caps so cruise <= max
+            # always holds. The v15 removal caused 3,134 flights to
+            # violate this invariant.
+            if flight.cruise_gs_kt is not None and flight.cruise_gs_kt > gs_cap:
+                flight.cruise_gs_kt = gs_cap
 
         # v3 destination inference for dropped / signal_lost flights
         if flight.landing_type in ("signal_lost", "dropped_on_approach") and flight.last_seen_lat is not None:
@@ -899,17 +933,96 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             flight.probable_destination_confidence = infer["probable_destination_confidence"]
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
+        # v8 N8: cap at 72 hours (4320 min). Anything longer reflects a
+        # collection gap or parked aircraft, not a real turnaround. NULL
+        # these out so they don't pollute fleet utilisation averages.
         if prev_end_time is not None:
             turn_secs = (flight.takeoff_time - prev_end_time).total_seconds()
             if turn_secs >= 0:
-                flight.turnaround_minutes = round(turn_secs / 60.0, 1)
+                turn_min = round(turn_secs / 60.0, 1)
+                flight.turnaround_minutes = turn_min if turn_min <= 4320.0 else None
+            # v10 N16: turnaround category for distribution analysis.
+            # v12 N23: every flight must get a non-null category. Flights
+            # where turnaround_minutes is NULL (>72 h cap or negative
+            # turn_secs) get 'extended_gap' so the NULL bucket is empty.
+            if flight.turnaround_minutes is not None:
+                tm = flight.turnaround_minutes
+                if tm < 30:
+                    flight.turnaround_category = "quick"
+                elif tm < 240:
+                    flight.turnaround_category = "medium"
+                elif tm < 1080:
+                    flight.turnaround_category = "overnight"
+                else:
+                    flight.turnaround_category = "multi_day"
+            else:
+                flight.turnaround_category = "extended_gap"
+            flight.is_first_observed_flight = 0
+        else:
+            # v10 F9: first observed flight for this ICAO
+            flight.is_first_observed_flight = 1
+            flight.turnaround_category = "first_observed"
+        # v11 N20: default to 0; the post-loop pass sets the last flight to 1.
+        flight.is_last_observed_flight = 0
         prev_end_time = flight.landing_time or flight.last_seen_time
 
         db.insert_flight(flight)
         final_flights.append(flight)
 
+    # v11 N20: mark the last flight for this ICAO and assign 'last_observed'
+    # turnaround category when the category is still NULL (turnaround_minutes
+    # was NULL or exceeded the 72-hour cap). This is the mirror of
+    # is_first_observed_flight. Every flight now has a non-null category.
+    if final_flights:
+        last = final_flights[-1]
+        last.is_last_observed_flight = 1
+        if last.turnaround_category is None:
+            last.turnaround_category = "last_observed"
+        db.update_last_observed_flag(last)
+
+    # v9 H1a: registry-level MIL_FW promotion. If an ae69xx ICAO has >= 3
+    # flights classified MIL_FW, the registry type is wrong -- update it
+    # and back-fill the remaining flights so ceiling/GS caps use the
+    # correct envelope for the entire fleet history.
+    if hex_code.startswith("ae69"):
+        mil_fw_count = sum(1 for f in final_flights if f.type_override == "MIL_FW")
+        if mil_fw_count >= 3:
+            with contextlib.suppress(Exception):
+                db.promote_registry_type(hex_code, "MIL_FW")
+            # Back-fill: set type_override on flights that weren't classified
+            # MIL_FW by the per-flight gate (low/slow flights on an ICAO that
+            # is demonstrably fixed-wing). Re-apply ceiling/GS caps too.
+            for f in final_flights:
+                if f.type_override is None:
+                    f.type_override = "MIL_FW"
+                    # Re-cap with MIL_FW envelope
+                    if f.max_altitude is not None:
+                        ceiling = TYPE_CEILINGS.get("MIL_FW", 60_000)
+                        alt_cap = int(ceiling * 1.1)
+                        if f.max_altitude > alt_cap:
+                            f.max_altitude = alt_cap
+                    if f.max_gs_kt is not None:
+                        gs_ceiling = TYPE_MAX_GS.get("MIL_FW", 800)
+                        gs_cap = int(gs_ceiling * 1.1)
+                        if f.max_gs_kt > gs_cap:
+                            f.max_gs_kt = gs_cap
+                    db.update_flight_type_override(f)
+
+    # v8 H5: back-fill origin_helipad_id / destination_helipad_id from the
+    # helipads table. Runs after all flights are inserted so the helipad
+    # foreign keys survive INSERT OR REPLACE. Uses the same eps as DBSCAN
+    # clustering (0.2 km).
+    with contextlib.suppress(Exception):
+        db.backfill_helipad_ids(hex_code, eps_km=0.2)
+
     # v3: refresh materialized aircraft_stats for this ICAO
     with contextlib.suppress(Exception):
         db.refresh_aircraft_stats(hex_code)
+
+    # v8 N9: purge registry entry if this ICAO ended up with zero flights
+    # after extraction (e.g. all fragments were filtered out as noise).
+    if not final_flights:
+        with contextlib.suppress(Exception):
+            db.purge_zero_flight_registry(hex_code)
 
     return len(final_flights)

@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS flights (
     level_secs INTEGER,
     cruise_alt_ft INTEGER,
     cruise_gs_kt INTEGER,
+    cruise_detected INTEGER,
+    heavy_signal_gap INTEGER,
     peak_climb_fpm INTEGER,
     peak_descent_fpm INTEGER,
     takeoff_is_night INTEGER,
@@ -115,6 +117,10 @@ CREATE TABLE IF NOT EXISTS flights (
     turnaround_minutes REAL,
     origin_helipad_id INTEGER,
     destination_helipad_id INTEGER,
+    type_override TEXT,
+    turnaround_category TEXT,
+    is_first_observed_flight INTEGER,
+    is_last_observed_flight INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -149,6 +155,7 @@ CREATE TABLE IF NOT EXISTS aircraft_stats (
     busiest_day_count INTEGER,
     home_base_icao TEXT,
     home_base_share REAL,
+    home_base_uncertain INTEGER,
     second_base_icao TEXT,
     second_base_share REAL,
     updated_at TEXT
@@ -181,6 +188,12 @@ CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
 CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
+
+DROP VIEW IF EXISTS flights_with_type;
+CREATE VIEW flights_with_type AS
+  SELECT f.*, COALESCE(f.type_override, ar.type_code) AS effective_type
+  FROM flights f
+  LEFT JOIN aircraft_registry ar ON f.icao = ar.icao;
 """
 
 # Individual CREATE statements for safe execution (no implicit commit)
@@ -342,6 +355,12 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("turnaround_minutes", "REAL"),
         ("origin_helipad_id", "INTEGER"),
         ("destination_helipad_id", "INTEGER"),
+        ("type_override", "TEXT"),
+        ("turnaround_category", "TEXT"),
+        ("is_first_observed_flight", "INTEGER"),
+        ("is_last_observed_flight", "INTEGER"),
+        ("cruise_detected", "INTEGER"),
+        ("heavy_signal_gap", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -370,6 +389,7 @@ def _migrate_add_v4_columns(conn: sqlite3.Connection):
     stats_columns = [
         ("home_base_icao", "TEXT"),
         ("home_base_share", "REAL"),
+        ("home_base_uncertain", "INTEGER"),
         ("second_base_icao", "TEXT"),
         ("second_base_share", "REAL"),
     ]
@@ -502,7 +522,7 @@ class Database:
                 max_hover_secs, hover_episodes, go_around_count,
                 takeoff_heading_deg, landing_heading_deg,
                 climb_secs, cruise_secs, descent_secs, level_secs,
-                cruise_alt_ft, cruise_gs_kt,
+                cruise_alt_ft, cruise_gs_kt, cruise_detected, heavy_signal_gap,
                 peak_climb_fpm, peak_descent_fpm,
                 takeoff_is_night, landing_is_night, night_flight,
                 callsigns, callsign_changes, callsign_count,
@@ -511,23 +531,26 @@ class Database:
                 nearest_origin_icao, nearest_origin_distance_km,
                 nearest_destination_icao, nearest_destination_distance_km,
                 max_gs_kt, turnaround_minutes,
-                origin_helipad_id, destination_helipad_id)
+                origin_helipad_id, destination_helipad_id,
+                type_override,
+                turnaround_category, is_first_observed_flight, is_last_observed_flight)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
                        ?, ?, ?, ?,
+                       ?, ?, ?, ?,
+                       ?, ?,
+                       ?, ?, ?, ?,
                        ?, ?, ?,
                        ?, ?,
+                       ?, ?, ?,
+                       ?, ?, ?,
+                       ?, ?, ?,
                        ?, ?, ?, ?,
                        ?, ?,
                        ?, ?,
-                       ?, ?, ?,
-                       ?, ?, ?,
-                       ?, ?, ?,
-                       ?, ?, ?, ?,
-                       ?, ?,
-                       ?, ?,
-                       ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?,
+                       ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -584,6 +607,8 @@ class Database:
                 flight.level_secs,
                 flight.cruise_alt_ft,
                 flight.cruise_gs_kt,
+                flight.cruise_detected,
+                flight.heavy_signal_gap,
                 flight.peak_climb_fpm,
                 flight.peak_descent_fpm,
                 flight.takeoff_is_night,
@@ -607,6 +632,10 @@ class Database:
                 flight.turnaround_minutes,
                 flight.origin_helipad_id,
                 flight.destination_helipad_id,
+                flight.type_override,
+                flight.turnaround_category,
+                flight.is_first_observed_flight,
+                flight.is_last_observed_flight,
             ),
         )
 
@@ -925,6 +954,10 @@ class Database:
             origin_total = origin_total_row["cnt"] if origin_total_row else 0
             home_base_icao = base_rows[0]["origin_icao"] if base_rows else None
             home_base_share = round(base_rows[0]["cnt"] / origin_total, 3) if base_rows and origin_total else None
+            # v11 N22: flag aircraft where home_base_share < 0.40 as uncertain.
+            # These nomadic aircraft operate from multiple bases and don't have
+            # a single "home" in the operational sense.
+            home_base_uncertain = 1 if home_base_share is not None and home_base_share < 0.40 else 0
             second_base_icao = base_rows[1]["origin_icao"] if len(base_rows) > 1 else None
             second_base_share = (
                 round(base_rows[1]["cnt"] / origin_total, 3) if len(base_rows) > 1 and origin_total else None
@@ -938,9 +971,10 @@ class Database:
                     total_flights, confirmed_flights, total_hours, total_cycles,
                     distinct_airports, distinct_callsigns, avg_flight_minutes,
                     busiest_day_date, busiest_day_count,
-                    home_base_icao, home_base_share, second_base_icao, second_base_share,
+                    home_base_icao, home_base_share, home_base_uncertain,
+                    second_base_icao, second_base_share,
                     updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     this_icao,
                     registry["registration"] if registry else None,
@@ -958,6 +992,7 @@ class Database:
                     busiest_row["cnt"] if busiest_row else 0,
                     home_base_icao,
                     home_base_share,
+                    home_base_uncertain,
                     second_base_icao,
                     second_base_share,
                     now_iso,
@@ -989,3 +1024,137 @@ class Database:
             )
             written += 1
         return written
+
+    # -- helipad back-fill (v8 H5) --
+
+    def backfill_helipad_ids(self, icao: str, *, eps_km: float = 0.2) -> int:
+        """Match flights for ``icao`` against the helipads table and populate
+        origin_helipad_id / destination_helipad_id.
+
+        For each flight, if the takeoff coordinates are within ``eps_km``
+        of a helipad centroid, set origin_helipad_id to that helipad.
+        Similarly for landing coordinates and destination_helipad_id.
+        When multiple helipads match, the closest wins.
+
+        Returns the number of flight-helipad links written.
+        """
+        helipads = self.conn.execute(
+            "SELECT helipad_id, centroid_lat, centroid_lon FROM helipads"
+        ).fetchall()
+        if not helipads:
+            return 0
+
+        flights = self.conn.execute(
+            "SELECT id, takeoff_lat, takeoff_lon, landing_lat, landing_lon FROM flights WHERE icao = ?",
+            (icao,),
+        ).fetchall()
+        if not flights:
+            return 0
+
+        # Import haversine locally to avoid circular imports at module level
+        from .airports import haversine_km
+
+        links = 0
+        for f in flights:
+            fid = f["id"]
+            to_lat, to_lon = f["takeoff_lat"], f["takeoff_lon"]
+            ld_lat, ld_lon = f["landing_lat"], f["landing_lon"]
+
+            # Origin helipad: nearest centroid within eps_km of takeoff
+            best_origin_id = None
+            best_origin_dist = eps_km
+            for h in helipads:
+                d = haversine_km(to_lat, to_lon, h["centroid_lat"], h["centroid_lon"])
+                if d <= best_origin_dist:
+                    best_origin_dist = d
+                    best_origin_id = h["helipad_id"]
+
+            # Destination helipad: nearest centroid within eps_km of landing
+            best_dest_id = None
+            if ld_lat is not None and ld_lon is not None:
+                best_dest_dist = eps_km
+                for h in helipads:
+                    d = haversine_km(ld_lat, ld_lon, h["centroid_lat"], h["centroid_lon"])
+                    if d <= best_dest_dist:
+                        best_dest_dist = d
+                        best_dest_id = h["helipad_id"]
+
+            if best_origin_id is not None or best_dest_id is not None:
+                self.conn.execute(
+                    "UPDATE flights SET origin_helipad_id = ?, destination_helipad_id = ? WHERE id = ?",
+                    (best_origin_id, best_dest_id, fid),
+                )
+                links += 1
+
+        return links
+
+    # -- registry hygiene (v8 N9) --
+
+    def promote_registry_type(self, icao: str, new_type: str) -> None:
+        """Update aircraft_registry.type_code for an ICAO."""
+        self.conn.execute(
+            "UPDATE aircraft_registry SET type_code = ? WHERE icao = ?",
+            (new_type, icao),
+        )
+
+    def update_flight_type_override(self, flight) -> None:
+        """Update type_override, max_altitude, max_gs_kt, cruise_gs_kt on an existing flight."""
+        self.conn.execute(
+            """UPDATE flights
+               SET type_override = ?, max_altitude = ?, max_gs_kt = ?, cruise_gs_kt = ?
+               WHERE icao = ? AND takeoff_time = ?""",
+            (
+                flight.type_override,
+                flight.max_altitude,
+                flight.max_gs_kt,
+                flight.cruise_gs_kt,
+                flight.icao,
+                flight.takeoff_time.isoformat() if flight.takeoff_time else None,
+            ),
+        )
+
+    def update_last_observed_flag(self, flight) -> None:
+        """Update is_last_observed_flight and turnaround_category on an existing flight."""
+        self.conn.execute(
+            """UPDATE flights
+               SET is_last_observed_flight = ?, turnaround_category = ?
+               WHERE icao = ? AND takeoff_time = ?""",
+            (
+                flight.is_last_observed_flight,
+                flight.turnaround_category,
+                flight.icao,
+                flight.takeoff_time.isoformat() if flight.takeoff_time else None,
+            ),
+        )
+
+    def purge_zero_flight_registry(self, icao: str | None = None) -> int:
+        """Delete aircraft_registry (and aircraft_stats) entries with zero flights.
+
+        If ``icao`` is given, only check that one ICAO. Otherwise purge
+        all zero-flight entries globally. After extraction, some registry
+        entries may refer to ICAOs that were retired, never flew during
+        the collection window, or had their ICAO changed. Cleaning these
+        prevents stale rows from polluting fleet summaries.
+
+        Returns the number of registry rows deleted.
+        """
+        if icao:
+            count = self.conn.execute(
+                "SELECT COUNT(*) AS cnt FROM flights WHERE icao = ?", (icao,)
+            ).fetchone()["cnt"]
+            if count == 0:
+                self.conn.execute("DELETE FROM aircraft_registry WHERE icao = ?", (icao,))
+                self.conn.execute("DELETE FROM aircraft_stats WHERE icao = ?", (icao,))
+                return 1
+            return 0
+        else:
+            result = self.conn.execute(
+                """DELETE FROM aircraft_registry
+                   WHERE icao NOT IN (SELECT DISTINCT icao FROM flights)"""
+            )
+            deleted = result.rowcount
+            self.conn.execute(
+                """DELETE FROM aircraft_stats
+                   WHERE icao NOT IN (SELECT DISTINCT icao FROM flights)"""
+            )
+            return deleted

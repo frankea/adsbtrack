@@ -54,8 +54,8 @@ Extracted flights with airport matching, quality classification, confidence scor
 | landing_confidence | REAL | [0.0, 1.0] - weighted geometric mean of seven factors |
 | data_points | INTEGER | Trace points recorded for this flight |
 | sources | TEXT | Comma-separated data sources that contributed |
-| max_altitude | INTEGER | Peak baro altitude in feet (dual-track persistence-filtered, 3+ samples over 30 s, hard-capped at 60,000 ft) |
-| max_gs_kt | INTEGER | Peak ground speed in knots (dual-track persistence-filtered, hard-capped at 600 kt) |
+| max_altitude | INTEGER | Peak baro altitude in feet (AP-validated persistence filter; type-specific ceiling cap without tolerance when AP is absent or disagrees) |
+| max_gs_kt | INTEGER | Peak ground speed in knots (persistence-filtered, type-capped at TYPE_MAX_GS * 1.1) |
 | ground_points_at_takeoff | INTEGER | Ground points collected before takeoff transition |
 | ground_points_at_landing | INTEGER | Ground points collected after landing transition |
 | baro_error_points | INTEGER | Points where baro encoder disagreed with geometric altitude or ground speed |
@@ -80,7 +80,10 @@ Extracted flights with airport matching, quality classification, confidence scor
 | takeoff_heading_deg | REAL | Circular mean of track in first 60 s of takeoff |
 | landing_heading_deg | REAL | Circular mean of track in last 60 s before landing |
 | climb_secs / descent_secs / level_secs / cruise_secs | INTEGER | Phase-of-flight time budget |
-| cruise_alt_ft / cruise_gs_kt | INTEGER | Mean altitude / gs during cruise |
+| cruise_alt_ft | INTEGER | Time-weighted mean altitude during cruise phase |
+| cruise_gs_kt | INTEGER | Time-weighted median ground speed during cruise phase (2-sigma outlier rejection, capped at max_gs_kt and TYPE_MAX_GS * 1.1) |
+| cruise_detected | INTEGER | 1 if a stable cruise segment was found by the phase budget, 0 otherwise (never NULL) |
+| heavy_signal_gap | INTEGER | 1 if active_minutes / duration_minutes < 0.5 (advisory: exclude from speed analyses) |
 | peak_climb_fpm / peak_descent_fpm | INTEGER | Best 60-s rolling-window mean climb / descent rate |
 | takeoff_is_night / landing_is_night | INTEGER | 1 if sun was below -6 degrees |
 | night_flight | INTEGER | 1 if >= 50% of in-flight points were at night |
@@ -90,6 +93,13 @@ Extracted flights with airport matching, quality classification, confidence scor
 | probable_destination_icao | TEXT | Inferred destination for dropped/signal-lost flights |
 | probable_destination_distance_km | REAL | Distance from last_seen to inferred destination |
 | probable_destination_confidence | REAL | [0.0, 1.0] confidence in the inference |
+| turnaround_minutes | REAL | Minutes from the previous flight's landing to this takeoff (same ICAO; NULL if > 72 h) |
+| turnaround_category | TEXT | `quick` (<30 min) / `medium` (30-240 min) / `overnight` (4-18 h) / `multi_day` (>18 h) / `extended_gap` (>72 h) / `first_observed` / `last_observed` (never NULL) |
+| is_first_observed_flight | INTEGER | 1 if no prior flight exists for this ICAO |
+| is_last_observed_flight | INTEGER | 1 if no following flight exists for this ICAO (symmetric with first) |
+| origin_helipad_id | INTEGER | FK to helipads table (takeoff within 200 m of a helipad centroid) |
+| destination_helipad_id | INTEGER | FK to helipads table (landing within 200 m of a helipad centroid) |
+| type_override | TEXT | Per-flight type override when cruise envelope indicates a different type (e.g. MIL_FW for ae69xx H60 ICAOs flying fixed-wing profiles) |
 
 ## aircraft_registry
 
@@ -130,6 +140,7 @@ Materialized rollup of utilization per aircraft (refreshed on every extract).
 | busiest_day_count | INTEGER | Number of flights on busiest_day_date |
 | home_base_icao | TEXT | Airport with the most takeoffs |
 | home_base_share | REAL | Fraction of takeoffs from home base |
+| home_base_uncertain | INTEGER | 1 if home_base_share < 0.40 (nomadic aircraft without a clear single base) |
 | second_base_icao | TEXT | Second most common takeoff airport |
 | second_base_share | REAL | Fraction of takeoffs from second base |
 | updated_at | TEXT | When the rollup was last refreshed |
@@ -160,3 +171,19 @@ OurAirports database (~47k airports).
 | iso_region | TEXT | ISO region code |
 | municipality | TEXT | City |
 | iata_code | TEXT | IATA code |
+
+## helipads
+
+DBSCAN-clustered landing sites that don't match any airport. Enriched with names from OurAirports heliport entries and manual overrides.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| helipad_id | INTEGER | Primary key |
+| centroid_lat / centroid_lon | REAL | Cluster centroid coordinates |
+| landing_count | INTEGER | Number of landings in this cluster |
+| first_seen / last_seen | TEXT | Earliest / latest landing date |
+| name_hint | TEXT | Facility name (from OurAirports heliport join or manual override; `helipad_N` / `offshore_platform_N` if unresolved) |
+
+## flights_with_type (view)
+
+Convenience view joining flights with their effective type code (coalesces `type_override` with `aircraft_registry.type_code`). Use this instead of manually joining and coalescing in downstream queries.

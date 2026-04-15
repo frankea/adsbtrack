@@ -36,11 +36,15 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 
 **Path metrics.** `path_length_km` is the haversine sum of all in-flight segments (skipping coverage holes > 60 s). `max_distance_km` is the max distance ever reached from the takeoff point. `loiter_ratio = path_length / (2 * max_distance)` - a value of 1.0 is a straight there-and-back, 3+ is a survey or holding pattern, 5+ is dedicated orbiting. `path_efficiency = great_circle / path_length` is populated only when origin and destination are different airports.
 
-**Phase of flight.** `climb_secs`, `cruise_secs`, `descent_secs`, `level_secs` partition the flight into climb (rate > +250 fpm), descent (rate < -250 fpm), and level. Cruise is the level subset above 70% of `max_altitude`, with `cruise_alt_ft` and `cruise_gs_kt` averaging over those samples. The four bins are rescaled proportionally so their sum equals `active_minutes * 60` exactly.
+**Phase of flight.** `climb_secs`, `cruise_secs`, `descent_secs`, `level_secs` partition the flight into climb (rate > +250 fpm), descent (rate < -250 fpm), and level. Cruise is the level subset above 70% of `max_altitude`, with `cruise_alt_ft` as a time-weighted mean and `cruise_gs_kt` as a time-weighted median with 2-sigma outlier rejection. The four bins are rescaled proportionally so their sum equals `active_minutes * 60` exactly. `cruise_detected` is 1 when a stable cruise segment was found, 0 otherwise (never NULL).
 
 **Signal budget.** `active_minutes` is the on-signal wall-clock time (sum of phase seconds / 60). `signal_gap_secs` is `duration_minutes * 60 - active_minutes * 60`. `signal_gap_count` is the number of inter-point gaps larger than 60 s observed while airborne. `fragments_stitched` counts how many raw trace fragments were merged into this flight (1 = not stitched).
 
-**Peak rates.** `peak_climb_fpm` and `peak_descent_fpm` are the best mean rate observed over a 60-second rolling window with outlier filtering (not point-to-point). Hard-capped at 10,000 fpm in either direction. `max_altitude` and `max_gs_kt` use a dual-track persistence filter: a raw max tracks every sample, while a persisted max only updates when the value is held across 3+ samples in a 30-second window. The persisted value wins when available, correcting any spike recorded during the warmup phase. Hard caps apply at 60,000 ft (max_altitude) and 600 kt (max_gs_kt) as a final safety net against multi-point spikes.
+**Peak rates.** `peak_climb_fpm` and `peak_descent_fpm` are the best mean rate observed over a 60-second rolling window with outlier filtering (not point-to-point). Hard-capped at 10,000 fpm in either direction.
+
+**Altitude cross-validation.** `max_altitude` uses a layered defence: (1) an AP-validated persistence filter -- only samples where `nav_altitude_mcp` is present AND agrees with the altitude (within 5,000 ft) enter the persisted peak tracker; (2) a raw fallback for flights without AP data; (3) per-type ceiling caps from `TYPE_CEILINGS` -- flights with coherent AP get 10% tolerance, flights without AP cap at exactly the book ceiling. This eliminates pressure-datum-swap spikes that previously pushed B748 to 49,500 ft and S92 to 16,500 ft. `max_gs_kt` uses a similar dual-track persistence filter with per-type caps from `TYPE_MAX_GS`.
+
+**Signal quality.** `heavy_signal_gap` is 1 when `active_minutes / duration_minutes < 0.5`, flagging flights where more than half the duration was unobserved. These flights should be excluded from speed analyses since GS samples reflect only the observable (often low-speed) segments.
 
 **Hover detection.** Helicopters only. `max_hover_secs` and `hover_episodes` count contiguous windows >= 20 s where the aircraft was airborne with `gs < 5 kt` and `|baro_rate| < 100 fpm`.
 
@@ -56,10 +60,16 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 
 **Probable destination.** For `signal_lost` and `dropped_on_approach` flights, `probable_destination_icao` is inferred from the last-seen position with a separate confidence score based on altitude, distance, and descent rate.
 
+**Turnaround.** `turnaround_minutes` is the gap from the previous flight's landing (or last_seen) to this flight's takeoff, same ICAO. Capped at 72 hours; longer gaps are NULL. `turnaround_category` bins this into `quick` (<30 min), `medium` (30-240 min), `overnight` (4-18 h), `multi_day` (>18 h), `extended_gap` (>72 h), `first_observed`, or `last_observed`. Every flight has a non-null category. `is_first_observed_flight` and `is_last_observed_flight` are symmetric boolean flags (exactly 1 per aircraft each).
+
+**Helipad linkage.** `origin_helipad_id` and `destination_helipad_id` link flights to DBSCAN-clustered helipad sites (within 200 m of the cluster centroid). Helipad names are enriched from OurAirports heliport entries (500 m join tolerance) plus manual overrides for known facilities not in external databases. 85 of 185 clusters carry real facility names, covering 87% of helipad-origin flights.
+
+**Type override.** `type_override` is set when a flight's cruise envelope indicates it's not the registered type. Used for ae69xx ICAOs registered as H60 (Black Hawk) that sometimes fly fixed-wing profiles (C-17, KC-135) -- these get `type_override = 'MIL_FW'` so ceiling and GS caps use the correct envelope.
+
 ## Aircraft registry and stats
 
 **`aircraft_registry`** is the authoritative metadata for each ICAO. The registry is populated at the start of every `extract` call by picking the most recently fetched `trace_days` row as the source of truth, then flagging metadata drift when other rows disagree on type_code, description, or registration.
 
-**`aircraft_stats`** is a rollup table refreshed at the end of every extract: `total_flights`, `confirmed_flights`, `total_hours`, `total_cycles`, `distinct_airports`, `distinct_callsigns`, `avg_flight_minutes`, `busiest_day_date`, `busiest_day_count`, `home_base_icao`. Populated via SQL aggregation over the `flights` table.
+**`aircraft_stats`** is a rollup table refreshed at the end of every extract: `total_flights`, `confirmed_flights`, `total_hours`, `total_cycles`, `distinct_airports`, `distinct_callsigns`, `avg_flight_minutes`, `busiest_day_date`, `busiest_day_count`, `home_base_icao`, `home_base_share`, `home_base_uncertain`, `second_base_icao`, `second_base_share`. `home_base_uncertain = 1` when `home_base_share < 0.40` (nomadic aircraft operating from multiple bases). Populated via SQL aggregation over the `flights` table.
 
 Both tables are surfaced in the `status` command and queryable directly.

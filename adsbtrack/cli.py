@@ -8,7 +8,7 @@ import click
 from rich.console import Console
 from rich.table import Table
 
-from .airports import download_airports
+from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
 from .fetcher import fetch_traces, fetch_traces_opensky
@@ -176,6 +176,12 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
         console.print("\nExtracting flights...")
         count = extract_flights(db, config, hex_code, reprocess=True)
         console.print(f"[green]Found {count} flights[/]")
+        try:
+            enriched = enrich_helipad_names(db, config)
+            if enriched:
+                console.print(f"[green]Enriched {enriched} helipad names[/]")
+        except Exception:
+            pass
 
 
 @cli.command()
@@ -190,6 +196,13 @@ def extract(hex_code, reprocess, db_path):
         ensure_airports(db, config)
         count = extract_flights(db, config, hex_code, reprocess=reprocess)
         console.print(f"[green]Extracted {count} flights[/]")
+        # v12 N13: enrich generic helipad names from OurAirports heliport data.
+        try:
+            enriched = enrich_helipad_names(db, config)
+            if enriched:
+                console.print(f"[green]Enriched {enriched} helipad names[/]")
+        except Exception:
+            pass
 
 
 @cli.command()

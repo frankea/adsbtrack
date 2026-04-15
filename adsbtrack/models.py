@@ -77,6 +77,8 @@ class Flight:
     level_secs: int | None = None
     cruise_alt_ft: int | None = None
     cruise_gs_kt: int | None = None
+    cruise_detected: int | None = None  # v12 N15: 1 if stable cruise segment found, 0 if fallback/NULL
+    heavy_signal_gap: int | None = None  # v18: 1 if active_minutes/duration_minutes < 0.5
 
     # --- v3: peak climb/descent rates (30-s rolling window) ---
     peak_climb_fpm: int | None = None
@@ -129,11 +131,22 @@ class Flight:
     # flight's takeoff, same ICAO. NULL for the first flight of each aircraft.
     turnaround_minutes: float | None = None
 
+    # --- v10 N16: turnaround category + first/last-observed flags ---
+    turnaround_category: str | None = None  # quick/medium/overnight/multi_day/first_observed/last_observed
+    is_first_observed_flight: int | None = None  # 1 if no prior flight exists for this ICAO
+    is_last_observed_flight: int | None = None  # 1 if no following flight exists for this ICAO
+
     # --- v5: persistence-filtered peak ground speed (B6) ---
     # Highest ground speed held for >= gs_persistence_min_samples across a
     # gs_persistence_window_secs window. Guards against single-sample GS
     # spikes that previously set the raw max.
     max_gs_kt: int | None = None
+
+    # --- v9: per-flight type override (H1) ---
+    # When the cruise envelope indicates the aircraft is not the registered
+    # type (e.g. ae69xx H60 actually flying as a C-17/KC-135), this column
+    # holds the overridden type code. NULL means the registry type is correct.
+    type_override: str | None = None
 
 
 @dataclass

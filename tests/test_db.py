@@ -1011,3 +1011,80 @@ def test_get_icaos_missing_crossref(db):
     missing = db.get_icaos_missing_crossref()
     assert "bbbbbb" in missing
     assert "aaaaaa" not in missing
+
+
+def test_runways_table_created(db_path):
+    """The runways table should exist on a fresh DB with the expected columns."""
+    database = Database(db_path)
+    cols = {row[1] for row in database.conn.execute("PRAGMA table_info(runways)").fetchall()}
+    expected = {
+        "airport_ident",
+        "runway_name",
+        "latitude_deg",
+        "longitude_deg",
+        "elevation_ft",
+        "heading_deg_true",
+        "length_ft",
+        "width_ft",
+        "surface",
+        "closed",
+        "displaced_threshold_ft",
+    }
+    assert expected.issubset(cols), f"missing columns: {expected - cols}"
+    # Primary key enforces one row per (ident, end).
+    pk_rows = database.conn.execute("PRAGMA index_list(runways)").fetchall()
+    assert any(r["unique"] for r in pk_rows), "expected a unique index / PK on runways"
+    database.close()
+
+
+def test_runways_index_on_airport_ident(db_path):
+    """Lookups by airport_ident must be indexed."""
+    database = Database(db_path)
+    indexes = database.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='runways'"
+    ).fetchall()
+    names = {r["name"] for r in indexes}
+    assert "idx_runways_airport_ident" in names
+    database.close()
+
+
+def test_insert_runway_ends_roundtrip(db):
+    """Insert two ends for one airport, assert we can read both back."""
+    rows = [
+        # (airport_ident, runway_name, lat, lon, elev, heading, length_ft,
+        #  width_ft, surface, closed, displaced_threshold_ft)
+        ("KSPG", "18", 27.7656, -82.6271, 7, 180.0, 2864, 75, "ASPH", 0, 0),
+        ("KSPG", "36", 27.7735, -82.6271, 7, 360.0, 2864, 75, "ASPH", 0, 0),
+    ]
+    db.insert_runway_ends(rows)
+    fetched = db.conn.execute(
+        "SELECT runway_name FROM runways WHERE airport_ident = ? ORDER BY runway_name",
+        ("KSPG",),
+    ).fetchall()
+    assert [r["runway_name"] for r in fetched] == ["18", "36"]
+
+
+def test_insert_runway_ends_is_idempotent(db):
+    """Re-inserting the same (airport_ident, runway_name) should overwrite, not duplicate."""
+    row = ("KSPG", "18", 27.7656, -82.6271, 7, 180.0, 2864, 75, "ASPH", 0, 0)
+    db.insert_runway_ends([row])
+    # Re-run with a changed surface - row count stays at 1, surface updates.
+    updated = ("KSPG", "18", 27.7656, -82.6271, 7, 180.0, 2864, 75, "CONC", 0, 0)
+    db.insert_runway_ends([updated])
+    rows = db.conn.execute("SELECT surface FROM runways WHERE airport_ident = ?", ("KSPG",)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["surface"] == "CONC"
+
+
+def test_clear_runways_for_airport(db):
+    """clear_runways_for_airport removes only that airport's rows."""
+    db.insert_runway_ends(
+        [
+            ("KSPG", "18", 27.77, -82.63, 7, 180.0, 2864, 75, "ASPH", 0, 0),
+            ("KSPG", "36", 27.77, -82.63, 7, 360.0, 2864, 75, "ASPH", 0, 0),
+            ("KATL", "09L", 33.63, -84.44, 1026, 94.0, 9000, 150, "CONC", 0, 0),
+        ]
+    )
+    db.clear_runways_for_airport("KSPG")
+    remaining = db.conn.execute("SELECT airport_ident FROM runways").fetchall()
+    assert {r["airport_ident"] for r in remaining} == {"KATL"}

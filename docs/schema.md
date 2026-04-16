@@ -173,6 +173,25 @@ OurAirports database (~47k airports).
 | municipality | TEXT | City |
 | iata_code | TEXT | IATA code |
 
+## runways
+
+Per-runway-end geometry from OurAirports `runways.csv`. One row per runway END (so runway 09/27 is two rows, not one). Loaded by `runways refresh`.
+
+Rows with missing endpoint lat/lon are skipped (heliports, some unsurveyed fields). The `airport_ident` is preserved exactly as published by OurAirports - may be an ICAO code ("KSPG") or an FAA local code ("67FL"); airport matching code already tolerates both.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| airport_ident | TEXT | OurAirports ident (ICAO or FAA local code); primary key with runway_name |
+| runway_name | TEXT | Runway end designator (e.g. "09", "27L", "18") |
+| latitude_deg / longitude_deg | REAL | Endpoint coordinates (not null; rows without coordinates are skipped at load) |
+| elevation_ft | INTEGER | Threshold elevation (MSL) |
+| heading_deg_true | REAL | Runway heading in degrees true (from `*_heading_degT`) |
+| length_ft | INTEGER | Overall runway length |
+| width_ft | INTEGER | Runway width |
+| surface | TEXT | Surface code ("ASPH", "CONC", "GRVL", ...) |
+| closed | INTEGER | 1 if the runway is marked closed in OurAirports |
+| displaced_threshold_ft | INTEGER | Displaced threshold distance at this end |
+
 ## helipads
 
 DBSCAN-clustered landing sites that don't match any airport. Enriched with names from OurAirports heliport entries and manual overrides.

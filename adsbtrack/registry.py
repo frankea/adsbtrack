@@ -211,26 +211,45 @@ def refresh_faa_registry(
     with TemporaryDirectory() as tmpdir:
         tmp_root = Path(tmpdir)
         with zipfile.ZipFile(zip_path) as zf:
-            members = {name.upper(): name for name in zf.namelist()}
+            # Index by basename so future FAA zips that nest the files
+            # under a folder (e.g. "ReleasableAircraft/MASTER.txt") still
+            # resolve. Directory entries have an empty basename and are
+            # harmlessly filtered out by the _TARGET_FILES lookup.
+            members_by_base: dict[str, str] = {}
+            for member in zf.namelist():
+                base = member.rsplit("/", 1)[-1].upper()
+                if base:
+                    members_by_base[base] = member
             for target in _TARGET_FILES:
-                if target.upper() not in members:
+                if target.upper() not in members_by_base:
                     raise FileNotFoundError(f"{target} missing from {zip_path}")
-                zf.extract(members[target.upper()], tmp_root)
+                zf.extract(members_by_base[target.upper()], tmp_root)
 
         # Clear out prior data so re-runs don't accumulate stale rows.
         db.truncate_faa_tables()
         db.commit()
 
-        stats["master"] = import_master_from_path(db, tmp_root / _resolve_case(tmp_root, "MASTER.txt"))
-        stats["dereg"] = import_dereg_from_path(db, tmp_root / _resolve_case(tmp_root, "DEREG.txt"))
-        stats["acftref"] = import_acftref_from_path(db, tmp_root / _resolve_case(tmp_root, "ACFTREF.txt"))
+        stats["master"] = import_master_from_path(db, _resolve_case(tmp_root, "MASTER.txt"))
+        stats["dereg"] = import_dereg_from_path(db, _resolve_case(tmp_root, "DEREG.txt"))
+        stats["acftref"] = import_acftref_from_path(db, _resolve_case(tmp_root, "ACFTREF.txt"))
     return stats
 
 
-def _resolve_case(root: Path, name: str) -> str:
-    """Zip members may be 'Master.txt' or 'MASTER.TXT' depending on vintage.
-    Return the actual filename that exists under ``root``."""
-    for entry in root.iterdir():
-        if entry.name.upper() == name.upper():
-            return entry.name
-    return name  # let the caller surface the FileNotFoundError
+def _resolve_case(root: Path, name: str) -> Path:
+    """Find the first file matching ``name`` (case-insensitive) anywhere
+    under ``root``. Prefers the shallowest match so ambiguous layouts
+    resolve deterministically.
+
+    The FAA zip has historically been flat, but has drifted case
+    ('Master.txt' vs 'MASTER.TXT') between vintages and may nest files
+    under a folder in future releases.
+
+    Raises FileNotFoundError when no match exists.
+    """
+    matches = sorted(
+        (p for p in root.rglob("*") if p.is_file() and p.name.upper() == name.upper()),
+        key=lambda p: len(p.parts),
+    )
+    if not matches:
+        raise FileNotFoundError(f"{name} missing from {root}")
+    return matches[0]

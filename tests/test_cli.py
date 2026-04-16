@@ -182,3 +182,29 @@ def test_registry_lookup_unknown_hex(tmp_path):
     result = runner.invoke(cli, ["registry", "lookup", "--hex", "ffffff", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "no record" in result.output.lower() or "not found" in result.output.lower()
+
+
+def test_registry_owner_search(tmp_path):
+    """Owner search returns all aircraft matching a LIKE pattern on name."""
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    result = runner.invoke(cli, ["registry", "owner", "--name", "EXAMPLE", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "N512WB" in result.output
+    assert "EXAMPLE OWNER LLC" in result.output
+
+
+def test_registry_owner_no_match(tmp_path):
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    result = runner.invoke(cli, ["registry", "owner", "--name", "NONEXISTENT", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "no" in result.output.lower() and "match" in result.output.lower()

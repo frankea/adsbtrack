@@ -33,3 +33,6 @@ htmlcov/
 # Misc
 *.har
 *.log
+
+# Worktrees for isolated feature development
+.worktrees/

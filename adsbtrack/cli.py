@@ -8,6 +8,8 @@ import click
 from rich.console import Console
 from rich.table import Table
 
+from .acars import fetch_acars
+from .airframes import AirframesClient
 from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
@@ -205,6 +207,75 @@ def extract(hex_code, reprocess, db_path):
             pass
 
 
+def _load_airframes_api_key(config: Config) -> str:
+    """Load the airframes.io API key from AIRFRAMES_API_KEY env var or the
+    credentials.json file (key: ``airframesApiKey``). Raises click.UsageError
+    with a helpful message when neither is set."""
+    key = os.environ.get("AIRFRAMES_API_KEY")
+    if key:
+        return key
+    if config.credentials_path.exists():
+        import json
+
+        try:
+            creds = json.loads(config.credentials_path.read_text())
+            if isinstance(creds, dict) and creds.get("airframesApiKey"):
+                return str(creds["airframesApiKey"])
+        except Exception:
+            pass
+    raise click.UsageError(
+        "airframes.io API key not configured. "
+        "Set the AIRFRAMES_API_KEY environment variable, "
+        f'or add {{"airframesApiKey": "..."}} to {config.credentials_path}.'
+    )
+
+
+@cli.command()
+@click.option("--hex", "hex_code", default=None, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help="Tail/registration (resolved via aircraft_registry)")
+@click.option("--start", "start_date", required=True, help="Start date (YYYY-MM-DD)")
+@click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
+@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+def acars(hex_code, tail_number, start_date, end_date, db_path):
+    """Fetch ACARS / VDL2 / HFDL messages from airframes.io for a given aircraft.
+
+    Either --hex or --tail must be given. --tail resolves through the local
+    aircraft_registry, so you must have fetched ADS-B traces for that
+    aircraft first.
+    """
+    if bool(hex_code) == bool(tail_number):
+        raise click.UsageError("Provide exactly one of --hex or --tail.")
+    start = date.fromisoformat(start_date)
+    end = date.fromisoformat(end_date) if end_date else date.today()
+
+    config = Config(db_path=Path(db_path))
+    api_key = _load_airframes_api_key(config)
+
+    with Database(Path(db_path)) as db:
+        if tail_number:
+            row = db.conn.execute(
+                "SELECT icao FROM aircraft_registry WHERE registration = ? COLLATE NOCASE",
+                (tail_number,),
+            ).fetchone()
+            if not row:
+                raise click.UsageError(
+                    f"Tail {tail_number!r} not found in aircraft_registry. Fetch ADS-B traces for this aircraft first."
+                )
+            hex_code = row["icao"]
+        hex_code = hex_code.lower()
+
+        console.print(f"Fetching ACARS for [bold]{hex_code}[/] from {start} to {end}")
+        with AirframesClient(api_key=api_key) as client:
+            stats = fetch_acars(db, client, hex_code, start_date=start, end_date=end)
+
+        console.print(
+            f"[green]Done.[/] Flights fetched: {stats['flights_fetched']}, "
+            f"messages inserted: {stats['messages_inserted']}, "
+            f"flights skipped (already fetched): {stats['flights_skipped']}, "
+            f"flights tagged with OOOI: {stats['flights_with_oooi']}"
+        )
+
+
 @cli.command()
 @click.option("--hex", "hex_code", required=True, help="ICAO hex code")
 @click.option("--from", "from_date", default=None, help="Filter from date (YYYY-MM-DD)")
@@ -221,6 +292,11 @@ def trips(hex_code, from_date, to_date, airport, db_path):
             console.print("[yellow]No flights found[/]")
             return
 
+        # Only render the ACARS column when the aircraft has any ACARS data
+        # at all, so users who haven't run `acars` don't see an empty column.
+        acars_row = db.conn.execute("SELECT COUNT(*) AS c FROM acars_messages WHERE icao = ?", (hex_code,)).fetchone()
+        has_acars = acars_row and acars_row["c"] > 0
+
         table = Table(title=f"Flights for {hex_code}")
         table.add_column("Date", style="cyan")
         table.add_column("From", style="green")
@@ -230,6 +306,8 @@ def trips(hex_code, from_date, to_date, airport, db_path):
         table.add_column("Mission", style="magenta")
         table.add_column("Conf", justify="right")
         table.add_column("Type", style="dim")
+        if has_acars:
+            table.add_column("ACARS", justify="right", style="cyan")
 
         mission_display = {
             "ems_hems": "EMS",
@@ -301,7 +379,30 @@ def trips(hex_code, from_date, to_date, airport, db_path):
                 "unknown": "[dim]--[/]",
             }.get(landing_type, "[dim]--[/]")
 
-            table.add_row(takeoff, origin, dest, duration, callsign, mission, conf_str, type_display)
+            row_cells = [takeoff, origin, dest, duration, callsign, mission, conf_str, type_display]
+            if has_acars:
+                # Count ACARS messages whose timestamp falls in this flight's
+                # window. OOOI marker appears when any of acars_out/off/on/in
+                # is populated - an OOOI-tagged flight is highlighted.
+                msg_count_row = db.conn.execute(
+                    """SELECT COUNT(*) AS c FROM acars_messages
+                       WHERE icao = ? AND timestamp BETWEEN ? AND ?""",
+                    (
+                        hex_code,
+                        f["takeoff_time"],
+                        f["landing_time"] or f["last_seen_time"] or f["takeoff_time"],
+                    ),
+                ).fetchone()
+                msg_count = msg_count_row["c"] if msg_count_row else 0
+                has_oooi = any(_col(f, k) for k in ("acars_out", "acars_off", "acars_on", "acars_in"))
+                if msg_count > 0 and has_oooi:
+                    acars_cell = f"[green]{msg_count} OOOI[/]"
+                elif msg_count > 0:
+                    acars_cell = str(msg_count)
+                else:
+                    acars_cell = "[dim]--[/]"
+                row_cells.append(acars_cell)
+            table.add_row(*row_cells)
 
         console.print(table)
         console.print(f"\nTotal: {len(flights)} flights")
@@ -407,6 +508,63 @@ def status(hex_code, db_path):
                 console.print(
                     f"  Busiest day:      {stats_row['busiest_day_date']} ({stats_row['busiest_day_count']} flights)"
                 )
+
+        # Position source breakdown (readsb type/src field). Weight each
+        # flight's percentage by its data_points so the total matches the
+        # true per-point mix rather than an unweighted average.
+        src_row = db.conn.execute(
+            """SELECT
+                   SUM(data_points) AS total_points,
+                   SUM(adsb_pct * data_points) / NULLIF(SUM(data_points), 0) AS adsb,
+                   SUM(mlat_pct * data_points) / NULLIF(SUM(data_points), 0) AS mlat,
+                   SUM(tisb_pct * data_points) / NULLIF(SUM(data_points), 0) AS tisb
+               FROM flights
+               WHERE icao = ? AND data_points > 0
+                 AND (adsb_pct IS NOT NULL OR mlat_pct IS NOT NULL OR tisb_pct IS NOT NULL)""",
+            (hex_code,),
+        ).fetchone()
+        if src_row and src_row["total_points"]:
+            adsb_pct = src_row["adsb"] or 0.0
+            mlat_pct = src_row["mlat"] or 0.0
+            tisb_pct = src_row["tisb"] or 0.0
+            other_pct = max(0.0, 100.0 - adsb_pct - mlat_pct - tisb_pct)
+            console.print("\n[bold]Position sources:[/]\n")
+            console.print(f"  ADS-B:  {adsb_pct:>5.1f}%")
+            console.print(f"  MLAT:   {mlat_pct:>5.1f}%")
+            console.print(f"  TIS-B:  {tisb_pct:>5.1f}%")
+            if other_pct > 0.05:
+                console.print(f"  Other:  {other_pct:>5.1f}%")
+
+        # ACARS summary (only shown when there are any stored messages)
+        acars_total_row = db.conn.execute(
+            "SELECT COUNT(*) AS c FROM acars_messages WHERE icao = ?", (hex_code,)
+        ).fetchone()
+        acars_total = acars_total_row["c"] if acars_total_row else 0
+        if acars_total:
+            acars_flight_row = db.conn.execute(
+                "SELECT COUNT(*) AS c FROM acars_flights WHERE icao = ?", (hex_code,)
+            ).fetchone()
+            acars_flights = acars_flight_row["c"] if acars_flight_row else 0
+            oooi_flights = db.conn.execute(
+                """SELECT COUNT(*) AS c FROM flights WHERE icao = ?
+                   AND (acars_out IS NOT NULL OR acars_off IS NOT NULL
+                        OR acars_on IS NOT NULL OR acars_in IS NOT NULL)""",
+                (hex_code,),
+            ).fetchone()["c"]
+            console.print("\n[bold]ACARS:[/]\n")
+            console.print(f"  Total messages: {acars_total}")
+            console.print(f"  Flights fetched: {acars_flights}")
+            console.print(f"  Flights with OOOI data: {oooi_flights}")
+            # Top labels for context
+            label_rows = db.conn.execute(
+                """SELECT label, COUNT(*) AS c FROM acars_messages
+                   WHERE icao = ? AND label IS NOT NULL
+                   GROUP BY label ORDER BY c DESC LIMIT 6""",
+                (hex_code,),
+            ).fetchall()
+            if label_rows:
+                top = ", ".join(f"{r['label']}({r['c']})" for r in label_rows)
+                console.print(f"  Top labels: {top}")
 
         # v3: emergency / night indicators
         night_count = db.conn.execute(

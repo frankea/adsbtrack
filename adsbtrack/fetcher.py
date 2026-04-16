@@ -65,6 +65,13 @@ def fetch_traces(
 
     current_delay = config.rate_limit
     successes_since_backoff = 0
+    # Circuit breaker: count days where every retry returned 403. Reset whenever
+    # we get any response that wasn't 403 (even a 404), since that proves the
+    # origin is reachable and we aren't CDN-blocked. Raises RuntimeError once
+    # we've eaten through enough days of pure 403s to conclude the source is
+    # genuinely blocking us rather than throwing transient bot-challenge 403s.
+    consecutive_403_days = 0
+    max_403_days = 3
 
     headers = {
         "accept": "application/json, text/javascript, */*; q=0.01",
@@ -120,6 +127,7 @@ def fetch_traces(
                         # Some 200 responses have no trace data (just {"icao": "..."})
                         if "trace" not in data or not data["trace"]:
                             db.insert_fetch_log(hex_code, day.isoformat(), 204, source=source)
+                            consecutive_403_days = 0
                             break
 
                         # Synthesize timestamp if missing (midnight UTC of that day)
@@ -130,18 +138,38 @@ def fetch_traces(
                         db.insert_trace_day(hex_code, day.isoformat(), data, source=source)
                         db.insert_fetch_log(hex_code, day.isoformat(), 200, source=source)
                         stats["with_data"] += 1
+                        consecutive_403_days = 0
                         break
 
                     elif resp.status_code == 404:
                         db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
+                        consecutive_403_days = 0
                         break
 
                     elif resp.status_code == 403:
-                        progress.stop()
-                        raise RuntimeError(
-                            f"Authentication failed (403) for {source}. "
-                            "The source may require authentication or be blocking automated requests."
+                        # Treat 403 as transient (Cloudflare/WAF bot challenge). Back off
+                        # aggressively and retry. Only give up on the source after
+                        # max_403_days consecutive days exhaust their retry budget.
+                        retries += 1
+                        if retries > max_retries:
+                            db.insert_fetch_log(hex_code, day.isoformat(), 403, source=source)
+                            stats["errors"] += 1
+                            consecutive_403_days += 1
+                            if consecutive_403_days >= max_403_days:
+                                progress.stop()
+                                raise RuntimeError(
+                                    f"HTTP 403 for {source} on {consecutive_403_days} consecutive days. "
+                                    "The source is likely blocking automated requests. "
+                                    "Try again later, increase --rate (e.g. --rate 3), "
+                                    "or check if the source requires authentication."
+                                )
+                            break
+                        wait = min(60 * (2 ** (retries - 1)), 300)
+                        progress.console.print(
+                            f"  [yellow]HTTP 403 for {day} (likely bot protection), "
+                            f"backing off {wait}s (retry {retries}/{max_retries})...[/]"
                         )
+                        time.sleep(wait)
 
                     elif resp.status_code in (429, 500, 502, 503, 504):
                         retries += 1

@@ -53,6 +53,12 @@ class PointData:
     emergency_field: str | None  # detail.emergency ("none", "general", "lifeguard", ...)
     true_heading: float | None
     callsign: str | None  # detail.flight (stripped)
+    # readsb globe_history source type, e.g. "adsb_icao", "mlat", "tisb_icao".
+    # Present at point[9] in 14-element rows and inside detail["type"] (same
+    # value) in both 9- and 14-element rows. None when the trace lacks a
+    # detail object and is under 10 elements long (e.g. OpenSky synthesized
+    # traces).
+    position_source: str | None = None
 
 
 @dataclass
@@ -74,6 +80,13 @@ class FlightMetrics:
     total_ground_points: int = 0  # any point where classify_ground_state said "ground"
     baro_error_points: int = 0  # baro=ground but geom or gs disagreed (see record_point)
     sources: set[str] = field(default_factory=set)
+    # Position source tallies (readsb type/src field). Every recorded point
+    # is bucketed by its position_source so per-flight percentages line up
+    # with data_points. Values outside ADS-B / MLAT / TIS-B (e.g. "other",
+    # "mode_s", "adsc", None) fall through and are not counted here.
+    adsb_points: int = 0
+    mlat_points: int = 0
+    tisb_points: int = 0
     max_altitude: int = 0
     max_gs_kt: int = 0
     # v6 fix: dual-track raw and persisted peaks. The raw value is updated
@@ -227,6 +240,17 @@ class FlightMetrics:
         geom_rate = point.geom_rate
 
         self.data_points += 1
+        # Position source bucket. Matches the three percentage columns on
+        # flights. Counts every point (ground or airborne) so the three
+        # percentages are comparable fractions of data_points.
+        src = point.position_source
+        if src is not None:
+            if src.startswith("adsb_"):
+                self.adsb_points += 1
+            elif src == "mlat":
+                self.mlat_points += 1
+            elif src.startswith("tisb_"):
+                self.tisb_points += 1
         prev_ts = self.last_point_ts
         if self.first_point_ts is None:
             self.first_point_ts = ts

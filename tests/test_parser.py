@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 from adsbtrack.classifier import FlightMetrics
 from adsbtrack.config import Config
 from adsbtrack.models import Flight
-from adsbtrack.parser import _stitch_fragments, extract_flights
+from adsbtrack.parser import _extract_point_fields, _stitch_fragments, extract_flights
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1095,3 +1095,126 @@ def test_airport_match_off_field_populates_nearest_only():
     assert flight.origin_distance_km is None
     assert flight.nearest_origin_icao == "KFAR"
     assert flight.nearest_origin_distance_km == 6.5
+
+
+# ---------------------------------------------------------------------------
+# Position source extraction (readsb type/src field)
+# ---------------------------------------------------------------------------
+
+
+def test_extract_point_fields_reads_position_source_from_index_9():
+    """14-element trace points carry the source tag at point[9]."""
+    # Layout: [offset, lat, lon, baro, gs, track, flags, baro_rate, detail,
+    #          source_tag, geom_alt, geom_rate, ias_or_reserved, ...]
+    point = [0.0, 40.0, -74.0, 10000, 300.0, 90.0, 0, 0, None, "mlat", 10012, 0, None, None]
+    data = _extract_point_fields(point, ts=1000.0, lat=40.0, lon=-74.0)
+    assert data.position_source == "mlat"
+
+
+def test_extract_point_fields_falls_back_to_detail_type():
+    """9-element trace points have no point[9]; type lives inside detail."""
+    point = [0.0, 40.0, -74.0, 10000, 300.0, 90.0, 0, 0, {"type": "adsb_icao", "alt_geom": 10012}]
+    data = _extract_point_fields(point, ts=1000.0, lat=40.0, lon=-74.0)
+    assert data.position_source == "adsb_icao"
+
+
+def test_extract_point_fields_position_source_none_when_absent():
+    """Legacy / OpenSky points with no detail dict have position_source=None."""
+    point = [0.0, 40.0, -74.0, 10000, 300.0, 90.0, 0, 0, None]
+    data = _extract_point_fields(point, ts=1000.0, lat=40.0, lon=-74.0)
+    assert data.position_source is None
+
+
+def test_extract_point_fields_prefers_index_9_over_detail():
+    """When both are present, index 9 wins (readsb writes them identically)."""
+    # Intentionally disagree so the test can tell which source won.
+    point = [0.0, 40.0, -74.0, 10000, 300.0, 90.0, 0, 0, {"type": "adsb_icao"}, "tisb_icao", 10012, 0, None, None]
+    data = _extract_point_fields(point, ts=1000.0, lat=40.0, lon=-74.0)
+    assert data.position_source == "tisb_icao"
+
+
+# ---------------------------------------------------------------------------
+# Position source percentages on flights
+# ---------------------------------------------------------------------------
+
+
+def _make_trace_point_with_source(time_offset, lat, lon, alt, gs, source_type):
+    """Build a 9-element trace point with a given detail.type source tag."""
+    detail = {"type": source_type}
+    return [time_offset, lat, lon, alt, gs, None, None, None, detail]
+
+
+def test_extract_flights_populates_position_source_percentages():
+    """mlat_pct / tisb_pct / adsb_pct reflect the mix of source types."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    # The pre-takeoff ground point is consumed by the state machine for the
+    # takeoff-position fix but never recorded into metrics. So the 8-point
+    # trace yields 7 recorded metric points: 5 ADS-B, 1 MLAT, 1 TIS-B.
+    trace = [
+        _make_trace_point_with_source(0, 40.0, -74.0, "ground", 0, "adsb_icao"),
+        _make_trace_point_with_source(60, 40.001, -74.0, 2000, 130, "adsb_icao"),
+        _make_trace_point_with_source(600, 40.5, -74.5, 5000, 200, "adsb_icao"),
+        _make_trace_point_with_source(1200, 40.7, -74.7, 5000, 200, "mlat"),
+        _make_trace_point_with_source(1800, 40.9, -74.9, 5000, 200, "tisb_icao"),
+        _make_trace_point_with_source(2400, 41.0, -75.0, 5000, 200, "adsb_icao"),
+        _make_trace_point_with_source(3000, 41.1, -75.1, 5000, 200, "adsb_icao"),
+        _make_trace_point_with_source(7200, 41.5, -75.5, "ground", 10, "adsb_icao"),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.data_points == 7
+    assert flight.mlat_pct == round(1 / 7 * 100, 2)
+    assert flight.tisb_pct == round(1 / 7 * 100, 2)
+    assert flight.adsb_pct == round(5 / 7 * 100, 2)
+
+
+def test_extract_flights_pct_zero_when_no_source_tag():
+    """Traces without detail.type (OpenSky-style) get 0% for all three."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.001, -74.0, 2000, gs=130),
+        _make_trace_point(3600, 41.0, -75.0, "ground", gs=10),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.mlat_pct == 0.0
+    assert flight.tisb_pct == 0.0
+    assert flight.adsb_pct == 0.0
+
+
+def test_extract_flights_pct_handles_all_mlat_flight():
+    """An entirely-MLAT flight (common for military) should be 100% mlat."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    trace = [
+        _make_trace_point_with_source(0, 40.0, -74.0, "ground", 0, "mlat"),
+        _make_trace_point_with_source(60, 40.001, -74.0, 2000, 130, "mlat"),
+        _make_trace_point_with_source(600, 40.5, -74.5, 5000, 200, "mlat"),
+        _make_trace_point_with_source(3600, 41.0, -75.0, "ground", 10, "mlat"),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.mlat_pct == 100.0
+    assert flight.tisb_pct == 0.0
+    assert flight.adsb_pct == 0.0

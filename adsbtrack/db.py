@@ -1347,7 +1347,11 @@ class Database:
         state: str | None = None,
         limit: int = 500,
     ) -> list[sqlite3.Row]:
-        """Case-insensitive address search. Combines filters with AND."""
+        """Case-insensitive address search. Combines filters with AND.
+
+        Raises ValueError if no filters are provided, to prevent an
+        accidental full-table scan.
+        """
         clauses: list[str] = []
         params: list = []
         if street:
@@ -1360,7 +1364,7 @@ class Database:
             clauses.append("UPPER(state) = ?")
             params.append(state.upper())
         if not clauses:
-            return []
+            raise ValueError("at least one of street, city, or state must be provided")
         sql = (
             "SELECT * FROM faa_registry WHERE " + " AND ".join(clauses) + " ORDER BY state, city, street, name LIMIT ?"
         )

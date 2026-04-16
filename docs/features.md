@@ -73,3 +73,28 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 **`aircraft_stats`** is a rollup table refreshed at the end of every extract: `total_flights`, `confirmed_flights`, `total_hours`, `total_cycles`, `distinct_airports`, `distinct_callsigns`, `avg_flight_minutes`, `busiest_day_date`, `busiest_day_count`, `home_base_icao`, `home_base_share`, `home_base_uncertain`, `second_base_icao`, `second_base_share`. `home_base_uncertain = 1` when `home_base_share < 0.40` (nomadic aircraft operating from multiple bases). Populated via SQL aggregation over the `flights` table.
 
 Both tables are surfaced in the `status` command and queryable directly.
+
+## Position source breakdown
+
+Every point in a readsb trace carries a source type (`adsb_icao`, `mlat`, `tisb_icao`, `other`, `adsc`, ...). `classifier.FlightMetrics` tallies three buckets per flight -- `adsb_points`, `mlat_points`, `tisb_points` -- and the parser writes `adsb_pct`, `mlat_pct`, `tisb_pct` on the flight row at close time. Points outside those three buckets (e.g. `other`, `mode_s`, `adsc`, NULL) are not counted, so the three percentages do not necessarily sum to 100.
+
+The point source is read from trace element `point[9]` in 14-element rows and from `detail["type"]` in 9-element rows (they match in every observed sample). OpenSky-synthesized traces under 10 elements with no `detail` object get NULL sources and contribute no percentage.
+
+`status` renders a "Position sources" block showing the three percentages, weighted by flight `data_points`, whenever any flight in the dataset has at least one tagged point.
+
+## ACARS OOOI on flights
+
+When `acars --hex <icao> --start <date>` runs, the fetcher pulls ACARS / VDL2 / HFDL messages for the aircraft from airframes.io and the OOOI parser scans each message against the flight timeline. Supported formats:
+
+* **Air Canada AGFSR 4T** -- trailing 4 slash-delimited fields on label `4T` are OUT / OFF / ON / IN as `HHMM` (or `----` for events that haven't happened yet)
+* **Keyword scan** -- labels `14`, `44`, `4T`, `H1` with free-form text containing `OUT 0830` / `OFF 0855` / `ON 1230` / `IN 1245` (case-insensitive, word-boundaried)
+
+Matched timestamps are anchored to the flight's calendar day (+/-1 day) via closest-time-to-reference heuristic to handle UTC day rollover. Four columns get populated on the `flights` table: `acars_out`, `acars_off`, `acars_on`, `acars_in` (ISO 8601 UTC, NULL when no OOOI match fell inside the flight window).
+
+`trips` renders an ACARS column when the aircraft has any stored messages: message count alone, or `N OOOI` in green when any of the four OOOI columns are non-null. `status` shows a per-aircraft rollup (total messages, total flights covered, count with OOOI).
+
+## Hex cross-reference
+
+`enrich all` and `enrich hex` populate `hex_crossref` by merging three external sources in preference order: FAA registry -> Mictronics DB -> hexdb.io live lookup. Conflicts between sources (differing registrations or type codes) are reported to the caller for manual review but don't prevent the row from being written.
+
+Every hex is also checked against `mil_hex_ranges` independently of the civilian identity sources: a hex can carry a Mictronics registration AND be flagged `is_military=1` with country / branch attribution, which surfaces government-operated aircraft sitting in known military allocation blocks (e.g. Bell 407s in the US DoD AE-prefix range).

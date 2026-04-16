@@ -65,3 +65,27 @@ Flight-helipad linkage (`origin_helipad_id`, `destination_helipad_id`) is back-f
 ## Airport matching
 
 Origin and destination are matched via a bounding-box query against the OurAirports database (~47k airports) followed by haversine distance calculation. Origin/destination ICAO codes are only populated when the match is within 2 km (on-field). Farther hits (up to 10 km) populate diagnostic `nearest_origin_icao` / `nearest_destination_icao` columns so the information isn't lost but helicopters and offshore ops don't get false-attributed to nearby civil airports. Matches are skipped entirely for `signal_lost` and `dropped_on_approach` flights.
+
+## FAA registry parser
+
+`registry update` downloads `ReleasableAircraft.zip` from `registry.faa.gov` (Akamai bot-managed; uses `curl_cffi` with `impersonate="chrome"` when the `faa` extra is installed, else falls back to httpx and usually 503s), extracts the three target files by basename (handling both flat and nested zips), and bulk-imports inside a single transaction.
+
+Each file has a distinct schema:
+
+* **MASTER.txt** -- 34 columns including 5 `OTHER NAMES(1..5)` slots and a precomputed `MODE S CODE HEX` column. The parser prefers the file-supplied hex and falls back to converting the octal `MODE S CODE`.
+* **DEREG.txt** -- different column set (dash-separated names, separate MAIL / PHYSICAL addresses, `CANCEL-DATE` instead of `EXPIRATION DATE`, no `TYPE AIRCRAFT` / `TYPE ENGINE`). We project it onto the `faa_deregistered` schema by preferring PHYSICAL addresses with MAIL fallback and mapping CANCEL-DATE -> expiration_date.
+* **ACFTREF.txt** -- manufacturer/model lookup keyed on `CODE`.
+
+All files ship with a UTF-8 BOM on the first byte and latin-1 / cp1252 owner names. The parser decodes as latin-1 (lossless) and strips the BOM manually.
+
+Each import validates the file's header line against a required-columns list before reading rows; a drift in column names fails fast with a clear error message rather than silently producing all-NULL rows.
+
+## Hex cross-reference merge
+
+`enrich all` walks every ICAO present in `trace_days` or `flights` that's missing from `hex_crossref` and merges three sources in preference order:
+
+1. **FAA registry** -- authoritative for N-numbered civil aircraft, read from `faa_registry` by hex.
+2. **Mictronics DB** -- community-maintained; bulk JSON files (`aircrafts.json`, `types.json`, `operators.json`) cached under `.cache/mictronics/` and kept in memory for the duration of the enrich loop.
+3. **hexdb.io REST API** -- live fallback, per-minute throttled, treats both HTTP 404 and 200-with-`{status: "404"}` bodies as misses.
+
+Conflicts (differing registrations or type codes between sources) are reported in the return value but don't block the write. An independent check against `mil_hex_ranges` runs on every hex and stamps `is_military` / `mil_country` / `mil_branch` regardless of which civilian source supplied the row, so e.g. a hex with a Mictronics registration can still be flagged as military when it sits in a DoD allocation block.

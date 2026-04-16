@@ -226,6 +226,8 @@ class Config:
     db_path: Path = Path("adsbtrack.db")
     credentials_path: Path = Path("credentials.json")
     airports_csv_url: str = "https://davidmegginson.github.io/ourairports-data/airports.csv"
+    faa_registry_url: str = "https://registry.faa.gov/database/ReleasableAircraft.zip"
+    faa_registry_cache_path: Path = Path(".cache/ReleasableAircraft.zip")
     rate_limit: float = 0.5  # seconds between requests
     rate_limit_max: float = 30.0  # max backoff after 429s
     rate_limit_recovery: int = 10  # successes before reducing delay

@@ -79,6 +79,58 @@ uv run python -m adsbtrack.cli extract --hex a66ad3 --reprocess
 
 Rebuilds the flight table from raw trace data after code changes.
 
+## FAA aircraft registry
+
+Load the FAA bulk registry (`ReleasableAircraft.zip`) so hex codes resolve to registrant name, address, certificate dates, and deregistration history. Install with the `faa` extra so the download can bypass the Akamai TLS-fingerprint block:
+
+```
+uv sync --extra faa
+uv run python -m adsbtrack.cli registry update
+```
+
+If you don't install `curl_cffi` (the `faa` extra) the live download will usually 503. Fall back to downloading the zip in your browser and pointing the command at it:
+
+```
+uv run python -m adsbtrack.cli registry update --zip /path/to/ReleasableAircraft.zip
+```
+
+Then query:
+
+```
+uv run python -m adsbtrack.cli registry lookup --hex a66ad3       # full record by hex
+uv run python -m adsbtrack.cli registry lookup --tail N512WB      # or by N-number
+uv run python -m adsbtrack.cli registry owner --name "BANK OF UTAH"  # LIKE match
+uv run python -m adsbtrack.cli registry address --state MT --city BILLINGS
+```
+
+The `status` command surfaces FAA registrant, address, and certificate info inline when the registry is loaded, and flags aircraft found only in `faa_deregistered`.
+
+## ACARS ingestion
+
+Pull ACARS / VDL2 / HFDL messages for an aircraft from [airframes.io](https://app.airframes.io) and correlate OOOI events onto its flights:
+
+```
+export AIRFRAMES_API_KEY=...     # or put "airframesApiKey" in credentials.json
+uv run python -m adsbtrack.cli acars --hex a66ad3 --start 2026-01-01
+```
+
+The fetcher resolves hex to airframes.io's numeric airframe id, walks each flight in range, and inserts the raw messages. When OOOI-bearing messages (labels 14 / 44 / 4T / H1) land inside a flight window, the parser fills `acars_out`, `acars_off`, `acars_on`, `acars_in` on the flight row.
+
+`trips` shows an ACARS column with message count and a green OOOI badge when present; `status` shows a per-aircraft ACARS summary block.
+
+## Hex cross-reference enrichment
+
+Merge FAA + [Mictronics](https://github.com/Mictronics/readsb-protobuf/tree/dev/webapp/src/db) + [hexdb.io](https://hexdb.io) into a single `hex_crossref` table so every hex in your DB has a best-effort identity, and flag aircraft in known military allocation blocks.
+
+```
+uv run python -m adsbtrack.cli enrich all --download-mictronics   # backfill everything
+uv run python -m adsbtrack.cli enrich hex --hex a66ad3            # one at a time
+uv run python -m adsbtrack.cli mil hex --hex ae1234               # check mil range
+uv run python -m adsbtrack.cli mil scan                           # flag every mil hex
+```
+
+Merge order is FAA (preferred) -> Mictronics -> hexdb.io; the enricher flags conflicts so you can see where sources disagree. 25 well-documented military allocation ranges (US DoD, UK RAF, Luftwaffe, JASDF, RAAF, RCAF, VKS, etc.) seed automatically on DB init; extend the `mil_hex_ranges` table with your own rows for better coverage.
+
 ## Finding hex codes
 
 Convert US N-numbers directly:
@@ -132,9 +184,9 @@ Traces from multiple sources are automatically merged during extraction.
 
 Detailed reference docs for contributors and analysts:
 
-- **[Database schema](docs/schema.md)** - full column reference for all 5 tables (trace_days, flights, aircraft_registry, aircraft_stats, fetch_log, airports)
-- **[Features and scoring](docs/features.md)** - landing types, confidence scoring algorithm, all derived per-flight columns, mission classification rules, signal budget, aircraft registry/stats
-- **[Internals](docs/internals.md)** - how the extractor works: trace merging, flight extraction state machine, fragment stitching, airport matching
+- **[Database schema](docs/schema.md)** - full column reference for every table (traces / flights / registry / stats / airports / helipads / FAA registry / ACARS / hex crossref / mil ranges)
+- **[Features and scoring](docs/features.md)** - landing types, confidence scoring algorithm, all derived per-flight columns, mission classification rules, signal budget, ACARS OOOI, position-source breakdown
+- **[Internals](docs/internals.md)** - how the extractor works: trace merging, flight extraction state machine, fragment stitching, airport matching, FAA registry parser, hex crossref merge
 
 ## Development
 

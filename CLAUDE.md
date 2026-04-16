@@ -13,13 +13,18 @@ uv run python -m adsbtrack.cli fetch --hex <icao> --start <date>   # Download tr
 uv run python -m adsbtrack.cli extract --hex <icao> --reprocess    # Re-extract flights
 uv run python -m adsbtrack.cli status --hex <icao>                 # View stats
 uv run python -m adsbtrack.cli trips --hex <icao>                  # View flight history
+uv run python -m adsbtrack.cli registry update                     # Load FAA registry
+uv run python -m adsbtrack.cli acars --hex <icao> --start <date>   # Fetch ACARS from airframes.io
+uv run python -m adsbtrack.cli enrich all                          # Backfill hex_crossref
+uv run python -m adsbtrack.cli mil scan                            # Flag military hexes
 ```
 
 ## Development
 
 ```bash
-uv sync --extra dev          # Install dependencies
-uv run pytest                # Run tests (164 tests)
+uv sync --extra dev          # Install core + test deps
+uv sync --extra faa          # Add curl_cffi for FAA download (bypasses Akamai)
+uv run pytest                # Run tests (285 tests)
 uv run ruff check .          # Lint
 uv run ruff format .         # Format
 uv run mypy adsbtrack        # Type check (informational)
@@ -53,6 +58,11 @@ CI runs ruff check, ruff format --check, pytest, and mypy on Python 3.12 and 3.1
 - `adsbtrack/models.py` -- Flight and AirportMatch dataclasses
 - `adsbtrack/cli.py` -- Click CLI commands
 - `adsbtrack/fetcher.py` -- HTTP trace fetching from multiple sources
+- `adsbtrack/registry.py` -- FAA bulk registry downloader + parser (MASTER/DEREG/ACFTREF)
+- `adsbtrack/airframes.py` -- airframes.io REST client (ACARS fetch backend)
+- `adsbtrack/acars.py` -- ACARS fetch pipeline + OOOI message parser
+- `adsbtrack/hex_crossref.py` -- Mictronics + hexdb.io + FAA merge logic for hex_crossref
+- `adsbtrack/mil_hex.py` -- curated military ICAO allocation ranges + lookup
 
 ## Key design decisions
 

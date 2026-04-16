@@ -118,6 +118,7 @@ Authoritative metadata per ICAO (resolves drift across daily fetches).
 | metadata_drift_values | TEXT | JSON list of conflicting (type_code, description, count) entries |
 | confirmation_rate | REAL | Fraction of flights with confirmed landings |
 | signal_quality_tier | TEXT | excellent / good / poor / very_poor |
+| airframes_id | INTEGER | Cached airframes.io numeric airframe id (filled by `acars`) |
 
 ## aircraft_stats
 
@@ -187,3 +188,122 @@ DBSCAN-clustered landing sites that don't match any airport. Enriched with names
 ## flights_with_type (view)
 
 Convenience view joining flights with their effective type code (coalesces `type_override` with `aircraft_registry.type_code`). Use this instead of manually joining and coalescing in downstream queries.
+
+## faa_registry / faa_deregistered
+
+Loaded from `ReleasableAircraft.zip` by `registry update`. Both tables share the same 29-column schema; `faa_registry` holds active registrations (MASTER.txt), `faa_deregistered` holds historical records (DEREG.txt projected onto the same shape with MAIL / PHYSICAL addresses preferring PHYSICAL and CANCEL-DATE mapped to `expiration_date`).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| mode_s_code_hex | TEXT | 6-char ICAO hex (primary key; derived from octal MODE S CODE or read from MASTER's MODE S CODE HEX column) |
+| n_number | TEXT | N-number without the leading 'N' |
+| serial_number | TEXT | Manufacturer serial |
+| mfr_mdl_code | TEXT | FK to `faa_aircraft_ref.code` |
+| eng_mfr_mdl | TEXT | Engine manufacturer / model code |
+| year_mfr | TEXT | Year of manufacture |
+| type_registrant | TEXT | 1=Individual, 2=Partnership, 3=Corp, ... (faa_registry only, NULL in faa_deregistered) |
+| name | TEXT | Registrant name |
+| street / street2 / city / state / zip_code / region / county / country | TEXT | Address (DEREG prefers PHYSICAL with MAIL fallback) |
+| last_action_date | TEXT | Date of last FAA action (YYYYMMDD) |
+| cert_issue_date | TEXT | Date certificate was issued |
+| certification | TEXT | Certification class (e.g. 1N) |
+| type_aircraft | TEXT | Aircraft type code (faa_registry only) |
+| type_engine | TEXT | Engine type (faa_registry only) |
+| status_code | TEXT | Registration status |
+| mode_s_code | TEXT | Original octal MODE S code |
+| fract_owner | TEXT | Fractional ownership indicator |
+| air_worth_date | TEXT | Airworthiness cert date |
+| expiration_date | TEXT | Registration expiration; in DEREG this holds CANCEL-DATE |
+| unique_id | TEXT | FAA unique id (faa_registry only) |
+| kit_mfr / kit_model | TEXT | Experimental kit info |
+
+## faa_aircraft_ref
+
+Manufacturer / model lookup table loaded from ACFTREF.txt.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| code | TEXT | MFR MDL CODE (primary key, join key for `*.mfr_mdl_code`) |
+| mfr | TEXT | Manufacturer name |
+| model | TEXT | Model name |
+| type_acft | TEXT | Aircraft type code |
+| type_eng | TEXT | Engine type code |
+
+## acars_flights
+
+One row per airframes.io flight we've fetched messages for. Used as a skip-list so repeated `acars` runs don't refetch the same flights.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| flight_id | INTEGER | airframes.io flight id (primary key) |
+| airframe_id | INTEGER | airframes.io numeric airframe id |
+| icao | TEXT | ICAO hex |
+| registration | TEXT | Tail number at fetch time |
+| flight_number / flight_iata / flight_icao | TEXT | Flight designators when known |
+| status | TEXT | airframes.io flight status |
+| departing_airport / destination_airport | TEXT | ICAO codes from airframes.io |
+| departure_time_scheduled / departure_time_actual | TEXT | ISO timestamps |
+| arrival_time_scheduled / arrival_time_actual | TEXT | ISO timestamps |
+| first_seen / last_seen | TEXT | Earliest / latest message timestamp |
+| message_count | INTEGER | Number of messages in this flight |
+| fetched_at | TEXT | When we pulled it |
+
+## acars_messages
+
+Raw ACARS / VDL2 / HFDL messages. `UNIQUE(airframes_id)` makes re-fetches idempotent.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER | Local row id |
+| airframes_id | INTEGER | airframes.io message id (UNIQUE) |
+| uuid | TEXT | airframes.io UUID |
+| flight_id | INTEGER | FK to `acars_flights.flight_id` |
+| icao | TEXT | ICAO hex |
+| registration | TEXT | Tail |
+| timestamp | TEXT | Message timestamp (ISO) |
+| source_type | TEXT | ACARS / VDL2 / HFDL / SATCOM |
+| link_direction | TEXT | uplink / downlink |
+| from_hex / to_hex | TEXT | Hex addresses in the ACARS header |
+| frequency | REAL | Receiver frequency (MHz) |
+| level | REAL | Signal level |
+| channel | TEXT | Channel identifier |
+| mode | TEXT | Transmission mode |
+| label | TEXT | ACARS label (14, 44, 4T, H1, SA, ...) |
+| block_id / message_number / ack | TEXT | ACARS header fields |
+| flight_number | TEXT | Flight identifier from the message |
+| text | TEXT | Human-readable body |
+| data | TEXT | Raw binary / encoded payload |
+| latitude / longitude / altitude | REAL | Position report values when present |
+| departing_airport / destination_airport | TEXT | Route hints parsed from the message |
+| fetched_at | TEXT | When we pulled it |
+
+The `flights` table also gains four ACARS-derived columns populated by the OOOI parser: `acars_out`, `acars_off`, `acars_on`, `acars_in` (ISO 8601 UTC, NULL when the event was not observed or the message format wasn't parseable).
+
+## hex_crossref
+
+Merged hex -> identity lookup from FAA + Mictronics + hexdb.io. `enrich all` / `enrich hex` populates.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| icao | TEXT | ICAO hex (primary key) |
+| registration | TEXT | Registration / tail |
+| type_code | TEXT | ICAO type designator |
+| type_description | TEXT | Type description |
+| operator | TEXT | Registered owner / operator |
+| source | TEXT | Which provider supplied the row (faa / mictronics / hexdb / mil_range) |
+| is_military | INTEGER | 1 when the hex falls in a `mil_hex_ranges` block |
+| mil_country | TEXT | Country attribution from `mil_hex_ranges` |
+| mil_branch | TEXT | Branch attribution from `mil_hex_ranges` |
+| last_updated | TEXT | When the row was last enriched |
+
+## mil_hex_ranges
+
+Static military ICAO allocation ranges. Seeded with 25 well-documented blocks (US DoD, UK RAF, Luftwaffe, French AF, JASDF, RAAF, RCAF, VKS, ...) on DB init; users can extend by inserting their own rows (`INSERT OR REPLACE` composes cleanly with the seeder).
+
+| Column | Type | Description |
+|--------|------|-------------|
+| range_start | TEXT | First hex in the allocation (lowercase, 6 chars) |
+| range_end | TEXT | Last hex in the allocation (primary key is the pair) |
+| country | TEXT | Attributing country |
+| branch | TEXT | Service branch (Military (DoD), RAF, Luftwaffe, ...) |
+| notes | TEXT | Source / caveats |

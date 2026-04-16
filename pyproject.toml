@@ -39,6 +39,12 @@ dev = [
     "ruff>=0.4",
     "mypy>=1.10",
 ]
+# curl_cffi provides a Chrome TLS fingerprint so `registry update` can
+# bypass Akamai Bot Manager on registry.faa.gov. Without it, the download
+# usually 503s and users must fetch the zip manually through a browser.
+faa = [
+    "curl_cffi>=0.7",
+]
 
 [tool.ruff]
 target-version = "py312"

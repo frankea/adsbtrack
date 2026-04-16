@@ -107,10 +107,24 @@ def test_parse_master_row_strips_and_nullifies_empty():
 
 
 def test_parse_master_row_raises_on_bad_mode_s():
+    """Blank BOTH the MODE S CODE (octal) and MODE S CODE HEX columns.
+    The parser falls back to MODE S CODE HEX when octal is blank, so we
+    have to clear both to force the ValueError."""
     row = _make_master_row()
     row["MODE S CODE"] = ""
+    row["MODE S CODE HEX"] = ""
     with pytest.raises(ValueError):
         parse_master_row(row)
+
+
+def test_parse_master_row_uses_hex_column_when_octal_blank():
+    """Real FAA MASTER.txt ships a derived MODE S CODE HEX column.
+    When octal is blank, prefer the hex column over raising."""
+    row = _make_master_row()
+    row["MODE S CODE"] = "        "  # 8 spaces = empty
+    row["MODE S CODE HEX"] = "A66AD3"
+    parsed = parse_master_row(row)
+    assert parsed[-1] == "a66ad3"
 
 
 def test_parse_acftref_row():
@@ -131,29 +145,60 @@ def test_parse_acftref_row():
     assert parsed == ("1152015", "CESSNA", "172", "4", "1")
 
 
-# Minimum MASTER header (keeps the fixture short but valid).
+# Real FAA file format uses commas, has a UTF-8 BOM on the first byte,
+# splits MASTER / DEREG into different schemas, and has 5 OTHER NAMES
+# columns between AIR WORTH DATE and EXPIRATION DATE on MASTER.
 _MASTER_HEADER = (
-    "N-NUMBER|SERIAL NUMBER|MFR MDL CODE|ENG MFR MDL|YEAR MFR|TYPE REGISTRANT|"
-    "NAME|STREET|STREET2|CITY|STATE|ZIP CODE|REGION|COUNTY|COUNTRY|"
-    "LAST ACTION DATE|CERT ISSUE DATE|CERTIFICATION|TYPE AIRCRAFT|TYPE ENGINE|"
-    "STATUS CODE|MODE S CODE|FRACT OWNER|AIR WORTH DATE|EXPIRATION DATE|"
-    "UNIQUE ID|KIT MFR|KIT MODEL|MODE S CODE HEX"
+    "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR,TYPE REGISTRANT,"
+    "NAME,STREET,STREET2,CITY,STATE,ZIP CODE,REGION,COUNTY,COUNTRY,"
+    "LAST ACTION DATE,CERT ISSUE DATE,CERTIFICATION,TYPE AIRCRAFT,TYPE ENGINE,"
+    "STATUS CODE,MODE S CODE,FRACT OWNER,AIR WORTH DATE,"
+    "OTHER NAMES(1),OTHER NAMES(2),OTHER NAMES(3),OTHER NAMES(4),OTHER NAMES(5),"
+    "EXPIRATION DATE,UNIQUE ID,KIT MFR, KIT MODEL,MODE S CODE HEX"
 )
 
-# Two rows: N512WB and a minimal second aircraft. Fields padded with spaces
-# the way the real FAA file does.
+# Two rows: N512WB and a minimal second aircraft.
 _MASTER_ROWS = [
-    "512WB   |66-1099  |1152015|41514|1966|1|EXAMPLE OWNER LLC|100 MAIN ST|   "
-    "|AUSTIN|TX|78701|2|453|US|20231201|20201115|1N|4|1|V|51465323|N|19660601|"
-    "20260101|00123456|   |   |A66AD3",
-    "99SK    |12345    |1234567|54321|2001|1|GHOST HELI LLC|200 OAK AVE|   "
-    "|DALLAS|TX|75201|2|113|US|20240101|20210101|1N|6|1|V|00000001|N|20010101|"
-    "20270101|00789012|   |   |000001",
+    "512WB,66-1099,1152015,41514,1966,1,EXAMPLE OWNER LLC,100 MAIN ST,,"
+    "AUSTIN,TX,78701,2,453,US,20231201,20201115,1N,4,1,V,51465323,N,19660601,"
+    ",,,,,20260101,00123456,,,A66AD3",
+    "99SK,12345,1234567,54321,2001,1,GHOST HELI LLC,200 OAK AVE,,"
+    "DALLAS,TX,75201,2,113,US,20240101,20210101,1N,6,1,V,00000001,N,20010101,"
+    ",,,,,20270101,00789012,,,000001",
+]
+
+# DEREG has a different schema. We keep a parallel fixture for it.
+_DEREG_HEADER = (
+    "N-NUMBER,SERIAL-NUMBER,MFR-MDL-CODE,STATUS-CODE,NAME,STREET-MAIL,STREET2-MAIL,"
+    "CITY-MAIL,STATE-ABBREV-MAIL,ZIP-CODE-MAIL,ENG-MFR-MDL,YEAR-MFR,CERTIFICATION,"
+    "REGION,COUNTY-MAIL,COUNTRY-MAIL,AIR-WORTH-DATE,CANCEL-DATE,MODE-S-CODE,"
+    "INDICATOR-GROUP,EXP-COUNTRY,LAST-ACT-DATE,CERT-ISSUE-DATE,STREET-PHYSICAL,"
+    "STREET2-PHYSICAL,CITY-PHYSICAL,STATE-ABBREV-PHYSICAL,ZIP-CODE-PHYSICAL,"
+    "COUNTY-PHYSICAL,COUNTRY-PHYSICAL,OTHER-NAMES(1),OTHER-NAMES(2),"
+    "OTHER-NAMES(3),OTHER-NAMES(4),OTHER-NAMES(5),KIT MFR, KIT MODEL"
+)
+
+_DEREG_ROWS = [
+    # GHOST HELI -> hex 000001 via MODE-S-CODE octal "00000001"
+    "99SK,12345,1234567,A,GHOST HELI LLC,200 OAK AVE,,DALLAS,TX,75201,54321,2001,1N,"
+    "2,113,US,20010101,20240101,00000001,,,20240101,20210101,,,,,,,,,,,,,,",
 ]
 
 
-def _write_pipe_file(path: Path, header: str, rows: list[str]) -> None:
-    path.write_text(header + "\n" + "\n".join(rows) + "\n", encoding="latin-1")
+def _write_csv_file(path: Path, header: str, rows: list[str]) -> None:
+    """Write a UTF-8-BOM + comma-delimited FAA-style file.
+
+    Latin-1 encoding is the actual FAA wire format (preserves cp1252
+    punctuation in owner names); combined with the BOM prefix this
+    matches what `registry update` reads from a real ReleasableAircraft.zip.
+    """
+    body = "\ufeff".encode() + (header + "\n" + "\n".join(rows) + "\n").encode("latin-1")
+    path.write_bytes(body)
+
+
+# Retain the old name as a deprecated alias so existing tests that imported
+# `_write_pipe_file` still work during the delimiter migration.
+_write_pipe_file = _write_csv_file
 
 
 def test_import_master_from_path(tmp_path):
@@ -175,23 +220,27 @@ def test_import_master_from_path(tmp_path):
 
 def test_import_dereg_from_path(tmp_path):
     dereg = tmp_path / "DEREG.txt"
-    _write_pipe_file(dereg, _MASTER_HEADER, _MASTER_ROWS[:1])
+    _write_csv_file(dereg, _DEREG_HEADER, _DEREG_ROWS)
 
     db_path = tmp_path / "t.db"
     with Database(db_path) as db:
         count = import_dereg_from_path(db, dereg)
         assert count == 1
-        assert db.get_faa_deregistered_by_hex("a66ad3") is not None
+        row = db.get_faa_deregistered_by_hex("000001")
+        assert row is not None
+        assert row["name"] == "GHOST HELI LLC"
+        # DEREG "CANCEL-DATE" is projected onto our expiration_date column.
+        assert row["expiration_date"] == "20240101"
 
 
 def test_import_acftref_from_path(tmp_path):
-    header = "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED"
+    header = "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED"
     rows = [
-        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140",
-        "1234567|BELL|407|6|4|2||1|5|CLASS 1|140",
+        "1152015,CESSNA,172,4,1,1,,1,4,CLASS 1,140",
+        "1234567,BELL,407,6,4,2,,1,5,CLASS 1,140",
     ]
     path = tmp_path / "ACFTREF.txt"
-    _write_pipe_file(path, header, rows)
+    _write_csv_file(path, header, rows)
 
     db_path = tmp_path / "t.db"
     with Database(db_path) as db:
@@ -203,10 +252,13 @@ def test_import_acftref_from_path(tmp_path):
 
 
 def test_import_master_skips_malformed_mode_s(tmp_path):
-    """A row with an empty MODE S CODE should be skipped, not crash the import."""
-    bad_row = _MASTER_ROWS[0].replace("51465323", "        ")  # 8 spaces = empty
+    """A row with an empty MODE S CODE + empty MODE S CODE HEX should be
+    skipped, not crash the import."""
+    # Blank out BOTH the octal MODE S CODE and the MODE S CODE HEX column,
+    # otherwise parse_master_row falls back to the hex column and succeeds.
+    bad_row = _MASTER_ROWS[0].replace("51465323", "        ").replace("A66AD3", "      ")
     master = tmp_path / "MASTER.txt"
-    _write_pipe_file(master, _MASTER_HEADER, [bad_row, _MASTER_ROWS[1]])
+    _write_csv_file(master, _MASTER_HEADER, [bad_row, _MASTER_ROWS[1]])
 
     db_path = tmp_path / "t.db"
     with Database(db_path) as db:
@@ -217,24 +269,28 @@ def test_import_master_skips_malformed_mode_s(tmp_path):
         assert db.get_faa_registry_by_hex("000001") is not None
 
 
-def _build_releasable_zip(master_body: str, dereg_body: str, acftref_body: str) -> bytes:
+def _build_releasable_zip(master_body: bytes | str, dereg_body: bytes | str, acftref_body: bytes | str) -> bytes:
     """Build an in-memory ReleasableAircraft.zip holding the three files."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("MASTER.txt", master_body)
-        zf.writestr("DEREG.txt", dereg_body)
-        zf.writestr("ACFTREF.txt", acftref_body)
+        for name, body in (("MASTER.txt", master_body), ("DEREG.txt", dereg_body), ("ACFTREF.txt", acftref_body)):
+            zf.writestr(name, body)
     return buf.getvalue()
+
+
+def _faa_file_bytes(header: str, rows: list[str]) -> bytes:
+    """Helper mirroring _write_csv_file but returning bytes for zipping."""
+    return "\ufeff".encode() + (header + "\n" + "\n".join(rows) + "\n").encode("latin-1")
 
 
 def test_refresh_faa_registry_from_local_zip(tmp_path):
     """refresh_faa_registry should accept a pre-downloaded zip path and
     import all three files inside it."""
-    master_body = _MASTER_HEADER + "\n" + "\n".join(_MASTER_ROWS) + "\n"
-    dereg_body = _MASTER_HEADER + "\n" + _MASTER_ROWS[0] + "\n"
-    acftref_body = (
-        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
-        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    master_body = _faa_file_bytes(_MASTER_HEADER, _MASTER_ROWS)
+    dereg_body = _faa_file_bytes(_DEREG_HEADER, _DEREG_ROWS)
+    acftref_body = _faa_file_bytes(
+        "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED",
+        ["1152015,CESSNA,172,4,1,1,,1,4,CLASS 1,140"],
     )
 
     zip_path = tmp_path / "ReleasableAircraft.zip"
@@ -266,11 +322,11 @@ def test_refresh_faa_registry_from_nested_zip(tmp_path):
     from adsbtrack.config import Config
     from adsbtrack.registry import refresh_faa_registry
 
-    master_body = _MASTER_HEADER + "\n" + _MASTER_ROWS[0] + "\n"
-    dereg_body = _MASTER_HEADER + "\n" + _MASTER_ROWS[1] + "\n"
-    acftref_body = (
-        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
-        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    master_body = _faa_file_bytes(_MASTER_HEADER, [_MASTER_ROWS[0]])
+    dereg_body = _faa_file_bytes(_DEREG_HEADER, _DEREG_ROWS)
+    acftref_body = _faa_file_bytes(
+        "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED",
+        ["1152015,CESSNA,172,4,1,1,,1,4,CLASS 1,140"],
     )
     zip_path = tmp_path / "ReleasableAircraft.zip"
     buf = io.BytesIO()
@@ -298,14 +354,13 @@ def test_end_to_end_update_lookup_owner(tmp_path):
     from adsbtrack.cli import cli
 
     zip_path = tmp_path / "ReleasableAircraft.zip"
-    header = _MASTER_HEADER + "\n"
     # Only EXAMPLE OWNER into MASTER; GHOST HELI goes into DEREG so the owner
     # search below has no match in faa_registry.
-    master_body = header + _MASTER_ROWS[0] + "\n"
-    dereg_body = header + _MASTER_ROWS[1] + "\n"
-    acftref_body = (
-        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
-        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    master_body = _faa_file_bytes(_MASTER_HEADER, [_MASTER_ROWS[0]])
+    dereg_body = _faa_file_bytes(_DEREG_HEADER, _DEREG_ROWS)
+    acftref_body = _faa_file_bytes(
+        "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED",
+        ["1152015,CESSNA,172,4,1,1,,1,4,CLASS 1,140"],
     )
     zip_path.write_bytes(_build_releasable_zip(master_body, dereg_body, acftref_body))
 

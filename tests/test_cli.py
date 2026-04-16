@@ -82,32 +82,52 @@ def test_links_urls_only_emits_one_url_per_line(tmp_path):
 
 
 def _build_fake_releasable_zip(path):
+    """Build a releasable zip using the real FAA format:
+
+    - comma-delimited CSV (not pipe)
+    - UTF-8 BOM on each file
+    - MASTER has OTHER NAMES(1..5) cols between AIR WORTH DATE and EXPIRATION DATE
+    - DEREG has a separate dash-separated schema with MAIL / PHYSICAL addresses
+    """
     master_header = (
-        "N-NUMBER|SERIAL NUMBER|MFR MDL CODE|ENG MFR MDL|YEAR MFR|TYPE REGISTRANT|"
-        "NAME|STREET|STREET2|CITY|STATE|ZIP CODE|REGION|COUNTY|COUNTRY|"
-        "LAST ACTION DATE|CERT ISSUE DATE|CERTIFICATION|TYPE AIRCRAFT|TYPE ENGINE|"
-        "STATUS CODE|MODE S CODE|FRACT OWNER|AIR WORTH DATE|EXPIRATION DATE|"
-        "UNIQUE ID|KIT MFR|KIT MODEL|MODE S CODE HEX\n"
+        "N-NUMBER,SERIAL NUMBER,MFR MDL CODE,ENG MFR MDL,YEAR MFR,TYPE REGISTRANT,"
+        "NAME,STREET,STREET2,CITY,STATE,ZIP CODE,REGION,COUNTY,COUNTRY,"
+        "LAST ACTION DATE,CERT ISSUE DATE,CERTIFICATION,TYPE AIRCRAFT,TYPE ENGINE,"
+        "STATUS CODE,MODE S CODE,FRACT OWNER,AIR WORTH DATE,"
+        "OTHER NAMES(1),OTHER NAMES(2),OTHER NAMES(3),OTHER NAMES(4),OTHER NAMES(5),"
+        "EXPIRATION DATE,UNIQUE ID,KIT MFR, KIT MODEL,MODE S CODE HEX\n"
     )
-    master_body = master_header + (
-        "512WB|66-1099|1152015|41514|1966|1|EXAMPLE OWNER LLC|100 MAIN ST||"
-        "AUSTIN|TX|78701|2|453|US|20231201|20201115|1N|4|1|V|51465323|N|19660601|"
-        "20260101|00123456|||A66AD3\n"
+    master_row = (
+        "512WB,66-1099,1152015,41514,1966,1,EXAMPLE OWNER LLC,100 MAIN ST,,"
+        "AUSTIN,TX,78701,2,453,US,20231201,20201115,1N,4,1,V,51465323,N,19660601,"
+        ",,,,,20260101,00123456,,,A66AD3\n"
     )
-    dereg_body = master_header + (
-        "99SK|12345|1234567|54321|2001|1|GHOST HELI LLC|200 OAK AVE||"
-        "DALLAS|TX|75201|2|113|US|20240101|20210101|1N|6|1|V|00000001|N|20010101|"
-        "20270101|00789012|||000001\n"
+    dereg_header = (
+        "N-NUMBER,SERIAL-NUMBER,MFR-MDL-CODE,STATUS-CODE,NAME,STREET-MAIL,STREET2-MAIL,"
+        "CITY-MAIL,STATE-ABBREV-MAIL,ZIP-CODE-MAIL,ENG-MFR-MDL,YEAR-MFR,CERTIFICATION,"
+        "REGION,COUNTY-MAIL,COUNTRY-MAIL,AIR-WORTH-DATE,CANCEL-DATE,MODE-S-CODE,"
+        "INDICATOR-GROUP,EXP-COUNTRY,LAST-ACT-DATE,CERT-ISSUE-DATE,STREET-PHYSICAL,"
+        "STREET2-PHYSICAL,CITY-PHYSICAL,STATE-ABBREV-PHYSICAL,ZIP-CODE-PHYSICAL,"
+        "COUNTY-PHYSICAL,COUNTRY-PHYSICAL,OTHER-NAMES(1),OTHER-NAMES(2),"
+        "OTHER-NAMES(3),OTHER-NAMES(4),OTHER-NAMES(5),KIT MFR, KIT MODEL\n"
+    )
+    dereg_row = (
+        "99SK,12345,1234567,A,GHOST HELI LLC,200 OAK AVE,,DALLAS,TX,75201,54321,2001,1N,"
+        "2,113,US,20010101,20240101,00000001,,,20240101,20210101,,,,,,,,,,,,,,\n"
     )
     acftref_body = (
-        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
-        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+        "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED\n"
+        "1152015,CESSNA,172,4,1,1,,1,4,CLASS 1,140\n"
     )
+    bom = "\ufeff".encode()
+    master_bytes = bom + (master_header + master_row).encode("latin-1")
+    dereg_bytes = bom + (dereg_header + dereg_row).encode("latin-1")
+    acftref_bytes = bom + acftref_body.encode("latin-1")
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as zf:
-        zf.writestr("MASTER.txt", master_body)
-        zf.writestr("DEREG.txt", dereg_body)
-        zf.writestr("ACFTREF.txt", acftref_body)
+        zf.writestr("MASTER.txt", master_bytes)
+        zf.writestr("DEREG.txt", dereg_bytes)
+        zf.writestr("ACFTREF.txt", acftref_bytes)
     path.write_bytes(buf.getvalue())
 
 

@@ -248,3 +248,55 @@ def test_registry_address_requires_filter(tmp_path):
     result = runner.invoke(cli, ["registry", "address", "--db", str(db_path)])
     # Missing filters -> UsageError -> non-zero exit.
     assert result.exit_code != 0
+
+
+def test_status_shows_faa_registry_block(tmp_path):
+    """When faa_registry has the hex, status prints registrant/address/cert info."""
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+
+    # Also seed a trace_day for this hex so status has something to report.
+    from datetime import UTC, datetime
+
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "a66ad3",
+            "2024-01-01",
+            {
+                "r": "N512WB",
+                "t": "C172",
+                "desc": "Cessna 172",
+                "ownOp": "unknown",
+                "year": "1966",
+                "timestamp": datetime(2024, 1, 1, tzinfo=UTC).timestamp(),
+                "trace": [],
+            },
+        )
+
+    result = runner.invoke(cli, ["status", "--hex", "a66ad3", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    # New FAA block prints registrant and address cues.
+    assert "EXAMPLE OWNER LLC" in result.output
+    assert "AUSTIN" in result.output
+    # Cert issue date surfaces somewhere.
+    assert "20201115" in result.output
+
+
+def test_status_flags_deregistered(tmp_path):
+    """Status output notes when the hex appears in faa_deregistered."""
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+
+    # 000001 is the hex in faa_deregistered only.
+    result = runner.invoke(cli, ["status", "--hex", "000001", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "GHOST HELI LLC" in result.output
+    assert "deregistered" in result.output.lower()

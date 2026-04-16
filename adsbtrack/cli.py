@@ -345,11 +345,8 @@ def status(hex_code, db_path):
             tail = f"N{source['n_number']}" if source["n_number"] else "-"
             console.print(f"  Tail:          {tail}")
             console.print(f"  Registrant:    {source['name'] or '-'}")
-            street_line = source["street"] or ""
-            if source["street2"]:
-                street_line = (street_line + " " + source["street2"]).strip()
-            city_state_zip = " ".join(p for p in (source["city"], source["state"], source["zip_code"]) if p)
-            console.print(f"  Address:       {street_line or '-'}")
+            street_line, city_state_zip = _format_faa_address(source)
+            console.print(f"  Address:       {street_line}")
             if city_state_zip:
                 console.print(f"                 {city_state_zip}")
             console.print(f"  Cert issued:   {source['cert_issue_date'] or '-'}")
@@ -509,6 +506,23 @@ def registry_update(zip_path, db_path):
     )
 
 
+def _format_faa_address(row) -> tuple[str, str]:
+    """Return (street_line, city_state_zip_line) formatted for display.
+
+    street_line is '-' when street/street2 are both empty.
+    city_state_zip_line is '' when all three components are missing; callers
+    should skip printing the second line in that case.
+    """
+    street_line = row["street"] or ""
+    if row["street2"]:
+        street_line = (street_line + " " + row["street2"]).strip()
+    street_line = street_line or "-"
+    city_state = ", ".join(p for p in (row["city"], row["state"]) if p)
+    zip_part = row["zip_code"] or ""
+    city_state_zip = f"{city_state} {zip_part}".strip()
+    return street_line, city_state_zip
+
+
 def _print_faa_registry_row(row, *, deregistered: bool) -> None:
     """Pretty-print a faa_registry / faa_deregistered sqlite3.Row."""
     heading = "Deregistered aircraft" if deregistered else "Registered aircraft"
@@ -519,14 +533,10 @@ def _print_faa_registry_row(row, *, deregistered: bool) -> None:
     console.print(f"  ICAO hex:        {row['mode_s_code_hex']}")
     console.print(f"  Serial:          {row['serial_number'] or '-'}")
     console.print(f"  Registrant:      {row['name'] or '-'}")
-    # Address block
-    street_line = row["street"] or ""
-    if row["street2"]:
-        street_line = (street_line + " " + row["street2"]).strip()
-    city_state = ", ".join(p for p in (row["city"], row["state"]) if p)
-    console.print(f"  Address:         {street_line or '-'}")
-    if city_state or row["zip_code"]:
-        console.print(f"                   {city_state} {row['zip_code'] or ''}".rstrip())
+    street_line, city_state_zip = _format_faa_address(row)
+    console.print(f"  Address:         {street_line}")
+    if city_state_zip:
+        console.print(f"                   {city_state_zip}")
     console.print(f"  Country:         {row['country'] or '-'}")
     console.print(f"  Cert issued:     {row['cert_issue_date'] or '-'}")
     console.print(f"  Last action:     {row['last_action_date'] or '-'}")

@@ -187,6 +187,21 @@ CREATE TABLE IF NOT EXISTS helipads (
     name_hint TEXT
 );
 
+CREATE TABLE IF NOT EXISTS runways (
+    airport_ident TEXT NOT NULL,
+    runway_name TEXT NOT NULL,
+    latitude_deg REAL NOT NULL,
+    longitude_deg REAL NOT NULL,
+    elevation_ft INTEGER,
+    heading_deg_true REAL,
+    length_ft INTEGER,
+    width_ft INTEGER,
+    surface TEXT,
+    closed INTEGER DEFAULT 0,
+    displaced_threshold_ft INTEGER,
+    PRIMARY KEY (airport_ident, runway_name)
+);
+
 CREATE TABLE IF NOT EXISTS faa_registry (
     mode_s_code_hex TEXT PRIMARY KEY,
     n_number TEXT,
@@ -313,6 +328,8 @@ CREATE TABLE IF NOT EXISTS acars_messages (
 
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
+CREATE INDEX IF NOT EXISTS idx_runways_airport_ident ON runways(airport_ident);
+CREATE INDEX IF NOT EXISTS idx_runways_latlon ON runways(latitude_deg, longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
 CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_n_number ON faa_registry(n_number);

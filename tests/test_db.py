@@ -1011,3 +1011,38 @@ def test_get_icaos_missing_crossref(db):
     missing = db.get_icaos_missing_crossref()
     assert "bbbbbb" in missing
     assert "aaaaaa" not in missing
+
+
+def test_runways_table_created(db_path):
+    """The runways table should exist on a fresh DB with the expected columns."""
+    database = Database(db_path)
+    cols = {row[1] for row in database.conn.execute("PRAGMA table_info(runways)").fetchall()}
+    expected = {
+        "airport_ident",
+        "runway_name",
+        "latitude_deg",
+        "longitude_deg",
+        "elevation_ft",
+        "heading_deg_true",
+        "length_ft",
+        "width_ft",
+        "surface",
+        "closed",
+        "displaced_threshold_ft",
+    }
+    assert expected.issubset(cols), f"missing columns: {expected - cols}"
+    # Primary key enforces one row per (ident, end).
+    pk_rows = database.conn.execute("PRAGMA index_list(runways)").fetchall()
+    assert any(r["unique"] for r in pk_rows), "expected a unique index / PK on runways"
+    database.close()
+
+
+def test_runways_index_on_airport_ident(db_path):
+    """Lookups by airport_ident must be indexed."""
+    database = Database(db_path)
+    indexes = database.conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='runways'"
+    ).fetchall()
+    names = {r["name"] for r in indexes}
+    assert "idx_runways_airport_ident" in names
+    database.close()

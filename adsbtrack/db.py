@@ -324,6 +324,39 @@ CREATE INDEX IF NOT EXISTS idx_acars_messages_icao_ts ON acars_messages(icao, ti
 CREATE INDEX IF NOT EXISTS idx_acars_messages_flight ON acars_messages(flight_id);
 CREATE INDEX IF NOT EXISTS idx_acars_flights_icao ON acars_flights(icao);
 
+-- Hex cross-reference: unified icao -> identity lookup merged from FAA
+-- registry, Mictronics, and hexdb.io. The source column records which
+-- provider supplied the row (so users can see where data came from and
+-- re-enrich preferentially from richer sources later).
+CREATE TABLE IF NOT EXISTS hex_crossref (
+    icao TEXT PRIMARY KEY,
+    registration TEXT,
+    type_code TEXT,
+    type_description TEXT,
+    operator TEXT,
+    source TEXT,
+    is_military INTEGER DEFAULT 0,
+    mil_country TEXT,
+    mil_branch TEXT,
+    last_updated TEXT
+);
+
+-- Static military hex allocation ranges. Seed rows are inserted on init
+-- from adsbtrack.mil_hex._SEED_RANGES. Users can extend the table with
+-- their own rows (INSERT OR REPLACE composes cleanly with the seeder).
+CREATE TABLE IF NOT EXISTS mil_hex_ranges (
+    range_start TEXT NOT NULL,
+    range_end TEXT NOT NULL,
+    country TEXT,
+    branch TEXT,
+    notes TEXT,
+    PRIMARY KEY (range_start, range_end)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hex_crossref_registration ON hex_crossref(registration);
+CREATE INDEX IF NOT EXISTS idx_hex_crossref_military ON hex_crossref(is_military);
+CREATE INDEX IF NOT EXISTS idx_mil_hex_ranges_start ON mil_hex_ranges(range_start);
+
 CREATE VIEW IF NOT EXISTS flights_with_type AS
   SELECT f.*, COALESCE(f.type_override, ar.type_code) AS effective_type
   FROM flights f
@@ -574,6 +607,12 @@ class Database:
         _migrate_add_flight_columns(self.conn)
         # v4: aircraft_registry / aircraft_stats column additions
         _migrate_add_v4_columns(self.conn)
+        # Seed the curated military-hex allocations. Idempotent -- repeated
+        # init calls just upsert the same rows. Lazy import avoids a
+        # module-level cycle (mil_hex needs Database for TYPE_CHECKING).
+        from .mil_hex import seed_mil_hex_ranges
+
+        seed_mil_hex_ranges(self)
 
     def __enter__(self):
         return self
@@ -1581,3 +1620,93 @@ class Database:
                WHERE icao = ? AND takeoff_time = ?""",
             (out, off, on, in_, icao, takeoff_time_iso),
         )
+
+    # -- Hex cross-reference (hex_crossref / mil_hex_ranges) --
+
+    def upsert_hex_crossref(self, row: dict) -> None:
+        """Insert or replace a hex_crossref row. Expected keys:
+        icao, registration, type_code, type_description, operator, source,
+        is_military, mil_country, mil_branch, last_updated. Missing keys
+        default to NULL / 0."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO hex_crossref
+               (icao, registration, type_code, type_description, operator,
+                source, is_military, mil_country, mil_branch, last_updated)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row["icao"].lower(),
+                row.get("registration"),
+                row.get("type_code"),
+                row.get("type_description"),
+                row.get("operator"),
+                row.get("source"),
+                1 if row.get("is_military") else 0,
+                row.get("mil_country"),
+                row.get("mil_branch"),
+                row.get("last_updated"),
+            ),
+        )
+
+    def get_hex_crossref(self, hex_code: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM hex_crossref WHERE icao = ?",
+            (hex_code.lower(),),
+        ).fetchone()
+
+    def get_icaos_missing_crossref(self) -> list[str]:
+        """Return icao codes present in trace_days or flights but absent
+        from hex_crossref. Used by `enrich --all` to drive the backfill."""
+        rows = self.conn.execute(
+            """SELECT DISTINCT icao FROM (
+                   SELECT icao FROM trace_days
+                   UNION
+                   SELECT icao FROM flights
+               ) WHERE icao NOT IN (SELECT icao FROM hex_crossref)
+               ORDER BY icao"""
+        ).fetchall()
+        return [r["icao"] for r in rows]
+
+    def insert_mil_hex_range(self, row: dict) -> None:
+        """Upsert a single military hex allocation range."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO mil_hex_ranges
+               (range_start, range_end, country, branch, notes)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                row["range_start"].lower(),
+                row["range_end"].lower(),
+                row.get("country"),
+                row.get("branch"),
+                row.get("notes"),
+            ),
+        )
+
+    def lookup_mil_hex_range(self, hex_code: str) -> sqlite3.Row | None:
+        """Return the mil_hex_ranges row that contains hex_code, or None.
+
+        Ranges are compared lexicographically on the 6-char lowercase hex.
+        Since all hex codes are 6 characters, lexicographic and numeric
+        comparison agree, which lets us use a plain WHERE BETWEEN.
+        """
+        key = hex_code.lower().zfill(6)
+        return self.conn.execute(
+            """SELECT * FROM mil_hex_ranges
+               WHERE ? BETWEEN range_start AND range_end
+               ORDER BY (range_end < range_start), LENGTH(range_end) - LENGTH(range_start)
+               LIMIT 1""",
+            (key,),
+        ).fetchone()
+
+    def all_mil_hex_ranges(self) -> list[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM mil_hex_ranges ORDER BY range_start").fetchall()
+
+    def get_all_icaos(self) -> list[str]:
+        """Return every icao present in trace_days or flights."""
+        rows = self.conn.execute(
+            """SELECT DISTINCT icao FROM (
+                   SELECT icao FROM trace_days
+                   UNION
+                   SELECT icao FROM flights
+               ) ORDER BY icao"""
+        ).fetchall()
+        return [r["icao"] for r in rows]

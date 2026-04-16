@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from adsbtrack.runways import parse_runway_row
+from adsbtrack.db import Database
+from adsbtrack.runways import import_runways_from_path, parse_runway_row
 
 FIXTURE = Path(__file__).parent / "fixtures" / "runways_sample.csv"
 
@@ -124,3 +125,80 @@ def test_parse_runway_row_closed_flag():
     row = _row(closed="1")
     ends = parse_runway_row(row)
     assert ends[0][9] == 1
+
+
+def test_import_runways_from_path_counts_ends(tmp_path):
+    """The fixture should produce 13 valid runway ends total:
+    * KATL:     5 runway pairs * 2 ends    = 10
+    * KSPG:     1 runway pair  * 2 ends    =  2
+    * SINGLE:   1 valid end (other blank)  =  1
+    * BOTHBAD:  0 (no coordinates)         =  0
+    * 00A, HELIPORT2: 0 each (heliports)   =  0
+    """
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        inserted = import_runways_from_path(db, FIXTURE)
+        assert inserted == 13
+        assert db.runway_count() == 13
+
+
+def test_import_runways_from_path_katl_has_ten_ends(tmp_path):
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        import_runways_from_path(db, FIXTURE)
+        rows = db.conn.execute(
+            "SELECT runway_name FROM runways WHERE airport_ident = ? ORDER BY runway_name",
+            ("KATL",),
+        ).fetchall()
+        names = [r["runway_name"] for r in rows]
+        assert names == sorted(["08L", "26R", "09R", "27L", "08R", "26L", "09L", "27R", "10", "28"])
+
+
+def test_import_runways_from_path_kspg_has_two_ends(tmp_path):
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        import_runways_from_path(db, FIXTURE)
+        rows = db.conn.execute(
+            "SELECT runway_name, heading_deg_true FROM runways WHERE airport_ident = ? ORDER BY runway_name",
+            ("KSPG",),
+        ).fetchall()
+        assert [r["runway_name"] for r in rows] == ["18", "36"]
+        assert rows[0]["heading_deg_true"] == pytest.approx(180.0)
+
+
+def test_import_runways_from_path_skips_heliport(tmp_path):
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        import_runways_from_path(db, FIXTURE)
+        count_00a = db.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM runways WHERE airport_ident = ?",
+            ("00A",),
+        ).fetchone()["cnt"]
+        count_h2 = db.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM runways WHERE airport_ident = ?",
+            ("HELIPORT2",),
+        ).fetchone()["cnt"]
+        assert count_00a == 0
+        assert count_h2 == 0
+
+
+def test_import_runways_from_path_single_end(tmp_path):
+    """SINGLE has one well-formed end and one blank end -> 1 row."""
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        import_runways_from_path(db, FIXTURE)
+        rows = db.conn.execute(
+            "SELECT runway_name FROM runways WHERE airport_ident = ?",
+            ("SINGLE",),
+        ).fetchall()
+        assert [r["runway_name"] for r in rows] == ["09"]
+
+
+def test_import_runways_from_path_is_idempotent(tmp_path):
+    """Running twice should leave row count unchanged."""
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        import_runways_from_path(db, FIXTURE)
+        first = db.runway_count()
+        import_runways_from_path(db, FIXTURE)
+        assert db.runway_count() == first

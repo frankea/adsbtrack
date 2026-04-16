@@ -18,6 +18,11 @@ both.
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
+
+from .db import Database
+
 # Pinned in the plan on 2026-04-16; lives in Config so tests can override.
 OURAIRPORTS_RUNWAYS_URL = "https://davidmegginson.github.io/ourairports-data/runways.csv"
 
@@ -140,3 +145,20 @@ def parse_runway_row(row: dict[str, str]) -> list[RunwayEnd]:
             )
         )
     return ends
+
+
+def import_runways_from_path(db: Database, path: Path) -> int:
+    """Parse a local runways.csv at `path`, upsert every valid end, return
+    the count of ends inserted.
+
+    Idempotent: repeated calls upsert via (airport_ident, runway_name) so
+    the total row count is bounded by the unique-key space, not the call
+    count.
+    """
+    ends: list[RunwayEnd] = []
+    with path.open("r", encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        for row in reader:
+            ends.extend(parse_runway_row(row))
+    db.insert_runway_ends(ends)
+    return len(ends)

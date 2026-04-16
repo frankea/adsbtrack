@@ -11,8 +11,14 @@ registrant identity, address, and deregistration history.
 from __future__ import annotations
 
 import csv
+import zipfile
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+import httpx
+from rich.progress import Progress
+
+from .config import Config
 from .db import Database
 
 # FAA files ship with latin-1 / cp1252 bytes in a small fraction of rows
@@ -167,3 +173,64 @@ def import_acftref_from_path(db: Database, path: Path) -> int:
     if skipped:
         print(f"  skipped {skipped} malformed rows from {path.name}")
     return len(parsed)
+
+
+_TARGET_FILES = ("MASTER.txt", "DEREG.txt", "ACFTREF.txt")
+
+
+def download_faa_zip(cfg: Config, destination: Path | None = None) -> Path:
+    """Download the FAA ReleasableAircraft.zip to ``destination`` (or the
+    configured cache path). Creates parent directories as needed."""
+    dest = destination or cfg.faa_registry_cache_path
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with Progress() as progress:
+        task = progress.add_task("Downloading FAA ReleasableAircraft.zip...", total=None)
+        with httpx.stream("GET", cfg.faa_registry_url, follow_redirects=True, timeout=300) as resp:
+            resp.raise_for_status()
+            with dest.open("wb") as fh:
+                for chunk in resp.iter_bytes(chunk_size=1 << 16):
+                    fh.write(chunk)
+        progress.update(task, completed=100)
+    return dest
+
+
+def refresh_faa_registry(
+    db: Database,
+    cfg: Config,
+    *,
+    local_zip: Path | None = None,
+) -> dict[str, int]:
+    """Download (or use local_zip) the FAA bundle, extract the three files,
+    truncate the local tables, and bulk-import the fresh data.
+
+    Returns a stats dict {master, dereg, acftref} with the row counts inserted.
+    """
+    zip_path = local_zip or download_faa_zip(cfg)
+
+    stats = {"master": 0, "dereg": 0, "acftref": 0}
+    with TemporaryDirectory() as tmpdir:
+        tmp_root = Path(tmpdir)
+        with zipfile.ZipFile(zip_path) as zf:
+            members = {name.upper(): name for name in zf.namelist()}
+            for target in _TARGET_FILES:
+                if target.upper() not in members:
+                    raise FileNotFoundError(f"{target} missing from {zip_path}")
+                zf.extract(members[target.upper()], tmp_root)
+
+        # Clear out prior data so re-runs don't accumulate stale rows.
+        db.truncate_faa_tables()
+        db.commit()
+
+        stats["master"] = import_master_from_path(db, tmp_root / _resolve_case(tmp_root, "MASTER.txt"))
+        stats["dereg"] = import_dereg_from_path(db, tmp_root / _resolve_case(tmp_root, "DEREG.txt"))
+        stats["acftref"] = import_acftref_from_path(db, tmp_root / _resolve_case(tmp_root, "ACFTREF.txt"))
+    return stats
+
+
+def _resolve_case(root: Path, name: str) -> str:
+    """Zip members may be 'Master.txt' or 'MASTER.TXT' depending on vintage.
+    Return the actual filename that exists under ``root``."""
+    for entry in root.iterdir():
+        if entry.name.upper() == name.upper():
+            return entry.name
+    return name  # let the caller surface the FileNotFoundError

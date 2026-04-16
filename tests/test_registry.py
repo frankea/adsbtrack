@@ -1,5 +1,7 @@
 """Tests for adsbtrack.registry - FAA aircraft registry import and lookup."""
 
+import io
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -13,6 +15,7 @@ from adsbtrack.registry import (
     octal_mode_s_to_icao_hex,
     parse_acftref_row,
     parse_master_row,
+    refresh_faa_registry,
 )
 
 
@@ -212,3 +215,46 @@ def test_import_master_skips_malformed_mode_s(tmp_path):
         assert count == 1
         assert db.get_faa_registry_by_hex("a66ad3") is None
         assert db.get_faa_registry_by_hex("000001") is not None
+
+
+def _build_releasable_zip(master_body: str, dereg_body: str, acftref_body: str) -> bytes:
+    """Build an in-memory ReleasableAircraft.zip holding the three files."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("MASTER.txt", master_body)
+        zf.writestr("DEREG.txt", dereg_body)
+        zf.writestr("ACFTREF.txt", acftref_body)
+    return buf.getvalue()
+
+
+def test_refresh_faa_registry_from_local_zip(tmp_path):
+    """refresh_faa_registry should accept a pre-downloaded zip path and
+    import all three files inside it."""
+    master_body = _MASTER_HEADER + "\n" + "\n".join(_MASTER_ROWS) + "\n"
+    dereg_body = _MASTER_HEADER + "\n" + _MASTER_ROWS[0] + "\n"
+    acftref_body = (
+        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
+        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    )
+
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    zip_path.write_bytes(_build_releasable_zip(master_body, dereg_body, acftref_body))
+
+    cfg = Config(db_path=tmp_path / "t.db", faa_registry_cache_path=zip_path)
+    with Database(cfg.db_path) as db:
+        # Pre-seed a stale registry row to prove truncate runs.
+        stale = ["X"] * 29
+        stale[0] = "OLD"
+        stale[6] = "STALE"
+        stale[-1] = "deadbe"
+        db.insert_faa_registry([tuple(stale)])
+
+        stats = refresh_faa_registry(db, cfg, local_zip=zip_path)
+
+        assert stats["master"] == 2
+        assert stats["dereg"] == 1
+        assert stats["acftref"] == 1
+        # Fresh row must be present.
+        assert db.get_faa_registry_by_hex("a66ad3") is not None
+        # Stale row must be gone (truncate ran before the fresh load).
+        assert db.get_faa_registry_by_hex("deadbe") is None

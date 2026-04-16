@@ -15,6 +15,7 @@ in-window sample has altitude data.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from .classifier import FlightMetrics, _PointSample
 
@@ -27,7 +28,7 @@ class LandingAnchor:
 
     lat: float
     lon: float
-    method: str  # "alt_min" | "last_point"
+    method: Literal["alt_min", "last_point"]
 
 
 def _sample_altitude(sample: _PointSample) -> int | None:
@@ -82,10 +83,12 @@ def compute_landing_anchor(
             best_alt = _sample_altitude(best)
             # best_alt is non-None because we only set best when alt was non-None.
             assert best_alt is not None
-            if alt < best_alt or (alt == best_alt and sample.ts > best.ts):
+            # Newest-first iteration means ties are naturally won by the first
+            # (= latest-ts) encounter, so a plain strict "<" is enough.
+            if alt < best_alt:
                 best = sample
 
-    if best is not None:
+    if best is not None and best.lat is not None and best.lon is not None:
         return LandingAnchor(lat=best.lat, lon=best.lon, method="alt_min")
 
     # Fallback: last_seen_*

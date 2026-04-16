@@ -159,3 +159,22 @@ def test_uses_geom_alt_when_baro_alt_missing():
     metrics = _metrics_with_samples([sample_a, sample_b])
     anchor = compute_landing_anchor(metrics, window_minutes=10.0)
     assert anchor == LandingAnchor(lat=33.64, lon=-84.44, method="alt_min")
+
+
+def test_ref_ts_falls_back_to_latest_sample_ts():
+    """When last_point_ts and last_seen_ts are both missing but
+    recent_points has samples, the newest sample's ts is used as the
+    window reference."""
+    base_ts = 1_700_000_000.0
+    samples = [
+        _make_sample(base_ts + 0, 3000, 50.00, 0.00),
+        _make_sample(base_ts + 60, 500, 50.05, 0.05),
+    ]
+    m = FlightMetrics()
+    for s in samples:
+        m.recent_points.append(s)
+    # Deliberately leave last_point_ts and last_seen_ts as None.
+    assert m.last_point_ts is None
+    assert m.last_seen_ts is None
+    anchor = compute_landing_anchor(m, window_minutes=10.0)
+    assert anchor == LandingAnchor(lat=50.05, lon=0.05, method="alt_min")

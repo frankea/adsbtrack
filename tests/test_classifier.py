@@ -210,3 +210,103 @@ def test_callsign_changes_ping_pong_counted_as_distinct_not_flicker():
     # track real transitions (which ping-pong 6 times) but the
     # feature-level cap brings it to 1.
     assert len(m.callsigns_seen) == 2, f"callsigns_seen must be deduped, got {m.callsigns_seen}"
+
+
+# ---------------------------------------------------------------------------
+# Position source counters (readsb type/src)
+# ---------------------------------------------------------------------------
+
+
+def _point_with_source(ts: float, position_source: str | None) -> PointData:
+    return PointData(
+        ts=ts,
+        lat=40.0,
+        lon=-74.0,
+        baro_alt=10_000,
+        gs=300.0,
+        track=90.0,
+        geom_alt=None,
+        baro_rate=0.0,
+        geom_rate=None,
+        squawk=None,
+        category=None,
+        nav_altitude_mcp=None,
+        nav_qnh=None,
+        emergency_field=None,
+        true_heading=None,
+        callsign=None,
+        position_source=position_source,
+    )
+
+
+def test_metrics_count_adsb_points():
+    """adsb_icao and adsb_other both count as ADS-B."""
+    cfg = _cfg()
+    m = FlightMetrics()
+    for i, src in enumerate(["adsb_icao", "adsb_other", "adsb_icao"]):
+        m.record_point(
+            _point_with_source(1000.0 + i * 5, src),
+            ground_state="airborne",
+            ground_reason="airborne",
+            config=cfg,
+        )
+    assert m.adsb_points == 3
+    assert m.mlat_points == 0
+    assert m.tisb_points == 0
+
+
+def test_metrics_count_mlat_and_tisb():
+    """mlat and tisb_icao bump their respective counters."""
+    cfg = _cfg()
+    m = FlightMetrics()
+    sources = ["mlat", "mlat", "tisb_icao", "adsb_icao"]
+    for i, src in enumerate(sources):
+        m.record_point(
+            _point_with_source(1000.0 + i * 5, src),
+            ground_state="airborne",
+            ground_reason="airborne",
+            config=cfg,
+        )
+    assert m.mlat_points == 2
+    assert m.tisb_points == 1
+    assert m.adsb_points == 1
+
+
+def test_metrics_count_other_source_types_unclassified():
+    """Values like 'other', 'mode_s', 'adsc', None do not bump adsb/mlat/tisb."""
+    cfg = _cfg()
+    m = FlightMetrics()
+    for i, src in enumerate(["other", "mode_s", "adsc", None]):
+        m.record_point(
+            _point_with_source(1000.0 + i * 5, src),
+            ground_state="airborne",
+            ground_reason="airborne",
+            config=cfg,
+        )
+    assert m.adsb_points == 0
+    assert m.mlat_points == 0
+    assert m.tisb_points == 0
+
+
+def test_metrics_counts_apply_for_ground_points_too():
+    """Source counters track every recorded point, not just airborne ones.
+
+    Percentages are computed against data_points (total), so ground points
+    must be included or adsb_pct + mlat_pct + tisb_pct could exceed 100%.
+    """
+    cfg = _cfg()
+    m = FlightMetrics()
+    m.record_point(
+        _point_with_source(1000.0, "adsb_icao"),
+        ground_state="ground",
+        ground_reason="ok",
+        config=cfg,
+    )
+    m.record_point(
+        _point_with_source(1005.0, "adsb_icao"),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    assert m.data_points == 2
+    assert m.adsb_points == 2

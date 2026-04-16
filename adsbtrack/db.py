@@ -121,6 +121,9 @@ CREATE TABLE IF NOT EXISTS flights (
     turnaround_category TEXT,
     is_first_observed_flight INTEGER,
     is_last_observed_flight INTEGER,
+    mlat_pct REAL,
+    tisb_pct REAL,
+    adsb_pct REAL,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -256,6 +259,58 @@ CREATE TABLE IF NOT EXISTS faa_aircraft_ref (
     type_eng TEXT
 );
 
+CREATE TABLE IF NOT EXISTS acars_flights (
+    flight_id INTEGER PRIMARY KEY,
+    airframe_id INTEGER NOT NULL,
+    icao TEXT NOT NULL,
+    registration TEXT,
+    flight_number TEXT,
+    flight_iata TEXT,
+    flight_icao TEXT,
+    status TEXT,
+    departing_airport TEXT,
+    destination_airport TEXT,
+    departure_time_scheduled TEXT,
+    departure_time_actual TEXT,
+    arrival_time_scheduled TEXT,
+    arrival_time_actual TEXT,
+    first_seen TEXT,
+    last_seen TEXT,
+    message_count INTEGER,
+    fetched_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS acars_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    airframes_id INTEGER NOT NULL UNIQUE,
+    uuid TEXT,
+    flight_id INTEGER,
+    icao TEXT NOT NULL,
+    registration TEXT,
+    timestamp TEXT NOT NULL,
+    source_type TEXT,
+    link_direction TEXT,
+    from_hex TEXT,
+    to_hex TEXT,
+    frequency REAL,
+    level REAL,
+    channel TEXT,
+    mode TEXT,
+    label TEXT,
+    block_id TEXT,
+    message_number TEXT,
+    ack TEXT,
+    flight_number TEXT,
+    text TEXT,
+    data TEXT,
+    latitude REAL,
+    longitude REAL,
+    altitude REAL,
+    departing_airport TEXT,
+    destination_airport TEXT,
+    fetched_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
@@ -265,9 +320,11 @@ CREATE INDEX IF NOT EXISTS idx_faa_registry_name ON faa_registry(name);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_city_state ON faa_registry(city, state);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_street ON faa_registry(street);
 CREATE INDEX IF NOT EXISTS idx_faa_deregistered_n_number ON faa_deregistered(n_number);
+CREATE INDEX IF NOT EXISTS idx_acars_messages_icao_ts ON acars_messages(icao, timestamp);
+CREATE INDEX IF NOT EXISTS idx_acars_messages_flight ON acars_messages(flight_id);
+CREATE INDEX IF NOT EXISTS idx_acars_flights_icao ON acars_flights(icao);
 
-DROP VIEW IF EXISTS flights_with_type;
-CREATE VIEW flights_with_type AS
+CREATE VIEW IF NOT EXISTS flights_with_type AS
   SELECT f.*, COALESCE(f.type_override, ar.type_code) AS effective_type
   FROM flights f
   LEFT JOIN aircraft_registry ar ON f.icao = ar.icao;
@@ -438,6 +495,16 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("is_last_observed_flight", "INTEGER"),
         ("cruise_detected", "INTEGER"),
         ("heavy_signal_gap", "INTEGER"),
+        # Position source mix (readsb type/src field)
+        ("mlat_pct", "REAL"),
+        ("tisb_pct", "REAL"),
+        ("adsb_pct", "REAL"),
+        # ACARS OOOI timestamps (ISO 8601, UTC) populated from airframes.io
+        # messages with labels 14 / 44 / 4T that fall in the flight window.
+        ("acars_out", "TEXT"),
+        ("acars_off", "TEXT"),
+        ("acars_on", "TEXT"),
+        ("acars_in", "TEXT"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -458,6 +525,9 @@ def _migrate_add_v4_columns(conn: sqlite3.Connection):
     registry_columns = [
         ("confirmation_rate", "REAL"),
         ("signal_quality_tier", "TEXT"),
+        # airframes.io numeric airframe id, cached so we skip the icao lookup
+        # call on subsequent ACARS fetches for the same aircraft.
+        ("airframes_id", "INTEGER"),
     ]
     for col_name, col_type in registry_columns:
         with contextlib.suppress(sqlite3.OperationalError):
@@ -610,7 +680,9 @@ class Database:
                 max_gs_kt, turnaround_minutes,
                 origin_helipad_id, destination_helipad_id,
                 type_override,
-                turnaround_category, is_first_observed_flight, is_last_observed_flight)
+                turnaround_category, is_first_observed_flight, is_last_observed_flight,
+                mlat_pct, tisb_pct, adsb_pct,
+                acars_out, acars_off, acars_on, acars_in)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -627,7 +699,9 @@ class Database:
                        ?, ?,
                        ?, ?,
                        ?, ?, ?, ?, ?,
-                       ?, ?, ?)""",
+                       ?, ?, ?,
+                       ?, ?, ?,
+                       ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -713,6 +787,13 @@ class Database:
                 flight.turnaround_category,
                 flight.is_first_observed_flight,
                 flight.is_last_observed_flight,
+                flight.mlat_pct,
+                flight.tisb_pct,
+                flight.adsb_pct,
+                flight.acars_out,
+                flight.acars_off,
+                flight.acars_on,
+                flight.acars_in,
             ),
         )
 
@@ -1370,3 +1451,133 @@ class Database:
         )
         params.append(limit)
         return self.conn.execute(sql, params).fetchall()
+
+    # -- ACARS / airframes.io --
+
+    def update_registry_airframes_id(self, icao: str, airframes_id: int) -> None:
+        """Cache the airframes.io numeric airframe id for an ICAO so the
+        ACARS fetcher can skip the /airframes/icao/{hex} lookup next time."""
+        self.conn.execute(
+            "UPDATE aircraft_registry SET airframes_id = ? WHERE icao = ?",
+            (airframes_id, icao),
+        )
+
+    def get_registry_airframes_id(self, icao: str) -> int | None:
+        row = self.conn.execute(
+            "SELECT airframes_id FROM aircraft_registry WHERE icao = ?",
+            (icao,),
+        ).fetchone()
+        return row["airframes_id"] if row and row["airframes_id"] is not None else None
+
+    def upsert_acars_flight(self, f: dict) -> None:
+        """INSERT OR REPLACE on flight_id PK so re-fetches refresh metadata
+        (status, message_count, etc.) without losing the row."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO acars_flights
+               (flight_id, airframe_id, icao, registration, flight_number,
+                flight_iata, flight_icao, status,
+                departing_airport, destination_airport,
+                departure_time_scheduled, departure_time_actual,
+                arrival_time_scheduled, arrival_time_actual,
+                first_seen, last_seen, message_count, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                f["flight_id"],
+                f["airframe_id"],
+                f["icao"],
+                f.get("registration"),
+                f.get("flight_number"),
+                f.get("flight_iata"),
+                f.get("flight_icao"),
+                f.get("status"),
+                f.get("departing_airport"),
+                f.get("destination_airport"),
+                f.get("departure_time_scheduled"),
+                f.get("departure_time_actual"),
+                f.get("arrival_time_scheduled"),
+                f.get("arrival_time_actual"),
+                f.get("first_seen"),
+                f.get("last_seen"),
+                f.get("message_count"),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+
+    def get_acars_flight_ids_fetched(self, icao: str) -> set[int]:
+        """Return the set of airframes.io flight_ids we have already fetched
+        messages for. Used as a skip-list to avoid re-fetching the same
+        flight when the user runs `acars` repeatedly for the same range."""
+        rows = self.conn.execute("SELECT flight_id FROM acars_flights WHERE icao = ?", (icao,)).fetchall()
+        return {row["flight_id"] for row in rows}
+
+    def insert_acars_message(self, m: dict) -> None:
+        """INSERT OR IGNORE keyed on UNIQUE(airframes_id) so re-fetches stay
+        idempotent. Caller is responsible for stamping fetched_at via this
+        method (filled with now() if absent)."""
+        self.conn.execute(
+            """INSERT OR IGNORE INTO acars_messages
+               (airframes_id, uuid, flight_id, icao, registration, timestamp,
+                source_type, link_direction, from_hex, to_hex,
+                frequency, level, channel, mode,
+                label, block_id, message_number, ack, flight_number,
+                text, data, latitude, longitude, altitude,
+                departing_airport, destination_airport, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                m["airframes_id"],
+                m.get("uuid"),
+                m.get("flight_id"),
+                m["icao"],
+                m.get("registration"),
+                m["timestamp"],
+                m.get("source_type"),
+                m.get("link_direction"),
+                m.get("from_hex"),
+                m.get("to_hex"),
+                m.get("frequency"),
+                m.get("level"),
+                m.get("channel"),
+                m.get("mode"),
+                m.get("label"),
+                m.get("block_id"),
+                m.get("message_number"),
+                m.get("ack"),
+                m.get("flight_number"),
+                m.get("text"),
+                m.get("data"),
+                m.get("latitude"),
+                m.get("longitude"),
+                m.get("altitude"),
+                m.get("departing_airport"),
+                m.get("destination_airport"),
+                m.get("fetched_at") or datetime.now(UTC).isoformat(),
+            ),
+        )
+
+    def update_flight_oooi(
+        self,
+        icao: str,
+        takeoff_time_iso: str,
+        *,
+        out: str | None = None,
+        off: str | None = None,
+        on: str | None = None,
+        in_: str | None = None,
+    ) -> None:
+        """Set acars_out/off/on/in on a single flight by (icao, takeoff_time).
+
+        Each kwarg only updates its column when the new value is non-NULL,
+        so a partial OOOI message (e.g. just OUT seen) does not overwrite
+        previously-stored values. The trailing underscore on `in_` avoids
+        the Python keyword.
+        """
+        self.conn.execute(
+            """UPDATE flights
+               SET acars_out = COALESCE(?, acars_out),
+                   acars_off = COALESCE(?, acars_off),
+                   acars_on  = COALESCE(?, acars_on),
+                   acars_in  = COALESCE(?, acars_in)
+               WHERE icao = ? AND takeoff_time = ?""",
+            (out, off, on, in_, icao, takeoff_time_iso),
+        )

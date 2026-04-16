@@ -59,6 +59,14 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
     if len(point) > 11 and isinstance(point[11], (int, float)):
         geom_rate = float(point[11])
 
+    # Source type tag: readsb writes this at point[9] in the 14-element
+    # layout. In 9-element rows (most real data in this DB), the same
+    # value lives inside detail["type"]. Prefer point[9] when both are
+    # present (they always match in observed data).
+    position_source: str | None = None
+    if len(point) > 9 and isinstance(point[9], str):
+        position_source = point[9]
+
     # Rich detail fields (only ~22% of points have the full payload, so guard)
     squawk: str | None = None
     category: str | None = None
@@ -100,6 +108,12 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
             gr = detail.get("geom_rate")
             if isinstance(gr, (int, float)):
                 geom_rate = float(gr)
+        # detail["type"] is the same source tag as point[9]; use it as the
+        # fallback for 9-element rows where point[9] is not present.
+        if position_source is None:
+            det_type = detail.get("type")
+            if isinstance(det_type, str):
+                position_source = det_type
 
     return PointData(
         ts=ts,
@@ -118,6 +132,7 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
         emergency_field=emergency_field,
         true_heading=true_heading,
         callsign=callsign,
+        position_source=position_source,
     )
 
 
@@ -302,6 +317,9 @@ def _stitch_fragments(
                         # phase counters sum, peak rates take the extremum,
                         # squawk/callsign histories union.
                         next_metrics.data_points += metrics.data_points
+                        next_metrics.adsb_points += metrics.adsb_points
+                        next_metrics.mlat_points += metrics.mlat_points
+                        next_metrics.tisb_points += metrics.tisb_points
                         next_metrics.path_length_km += metrics.path_length_km
                         next_metrics.max_distance_from_origin_km = max(
                             next_metrics.max_distance_from_origin_km,
@@ -853,6 +871,19 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flight.ground_points_at_landing = metrics.ground_points_at_landing
         flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
         flight.baro_error_points = metrics.baro_error_points
+
+        # Position source mix. When data_points is zero or the trace carried
+        # no source tags, leave all three at 0.0 so downstream queries can
+        # rely on non-null values.
+        total = metrics.data_points
+        if total > 0:
+            flight.mlat_pct = round(metrics.mlat_points * 100.0 / total, 2)
+            flight.tisb_pct = round(metrics.tisb_points * 100.0 / total, 2)
+            flight.adsb_pct = round(metrics.adsb_points * 100.0 / total, 2)
+        else:
+            flight.mlat_pct = 0.0
+            flight.tisb_pct = 0.0
+            flight.adsb_pct = 0.0
 
         # v3 derived features - must run AFTER classify_landing + airport
         # matching so mission/loiter/cruise/day-night all see final values.

@@ -691,3 +691,239 @@ def test_truncate_faa_tables(tmp_path):
         db.insert_faa_registry([tuple(row)])
         db.truncate_faa_tables()
         assert db.get_faa_registry_by_hex("a00001") is None
+
+
+# ---------------------------------------------------------------------------
+# ACARS schema: tables, columns, indexes
+# ---------------------------------------------------------------------------
+
+
+def _columns(db, table):
+    return {r["name"] for r in db.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _indexes(db, table):
+    return {r["name"] for r in db.conn.execute(f"PRAGMA index_list({table})").fetchall()}
+
+
+def test_acars_flights_table_created(db):
+    cols = _columns(db, "acars_flights")
+    # Core identity + metadata
+    assert cols >= {
+        "flight_id",
+        "airframe_id",
+        "icao",
+        "registration",
+        "flight_number",
+        "flight_iata",
+        "flight_icao",
+        "status",
+        "departing_airport",
+        "destination_airport",
+        "departure_time_scheduled",
+        "departure_time_actual",
+        "arrival_time_scheduled",
+        "arrival_time_actual",
+        "first_seen",
+        "last_seen",
+        "message_count",
+        "fetched_at",
+    }
+
+
+def test_acars_messages_table_created(db):
+    cols = _columns(db, "acars_messages")
+    assert cols >= {
+        "id",
+        "airframes_id",
+        "uuid",
+        "flight_id",
+        "icao",
+        "registration",
+        "timestamp",
+        "source_type",
+        "link_direction",
+        "from_hex",
+        "to_hex",
+        "frequency",
+        "level",
+        "channel",
+        "mode",
+        "label",
+        "block_id",
+        "message_number",
+        "ack",
+        "flight_number",
+        "text",
+        "data",
+        "latitude",
+        "longitude",
+        "altitude",
+        "departing_airport",
+        "destination_airport",
+        "fetched_at",
+    }
+    # UNIQUE(airframes_id) for dedup
+    unique_idxs = [r["name"] for r in db.conn.execute("PRAGMA index_list(acars_messages)").fetchall() if r["unique"]]
+    # The unique constraint creates an auto index; verify it covers airframes_id
+    found = False
+    for ix in unique_idxs:
+        info = db.conn.execute(f"PRAGMA index_info({ix})").fetchall()
+        if len(info) == 1 and info[0]["name"] == "airframes_id":
+            found = True
+            break
+    assert found, f"Expected UNIQUE index on acars_messages(airframes_id), got {unique_idxs}"
+
+
+def test_acars_messages_icao_timestamp_index(db):
+    idx_names = _indexes(db, "acars_messages")
+    assert "idx_acars_messages_icao_ts" in idx_names
+
+
+def test_aircraft_registry_has_airframes_id_column(db):
+    assert "airframes_id" in _columns(db, "aircraft_registry")
+
+
+def test_flights_table_has_acars_oooi_columns(db):
+    cols = _columns(db, "flights")
+    assert {"acars_out", "acars_off", "acars_on", "acars_in"} <= cols
+
+
+def test_acars_migration_is_idempotent(db_path):
+    """Opening the same DB twice must not error or duplicate columns."""
+    Database(db_path).close()
+    # Second open should find existing tables and columns, suppress duplicate errors
+    d = Database(db_path)
+    cols = {r["name"] for r in d.conn.execute("PRAGMA table_info(acars_messages)").fetchall()}
+    assert "airframes_id" in cols
+    d.close()
+
+
+def test_insert_acars_message_dedup_by_airframes_id(db):
+    """Inserting the same airframes_id twice should be a no-op (UNIQUE)."""
+    m = {
+        "airframes_id": 6503832431,
+        "uuid": "abc-123",
+        "flight_id": 5538326232,
+        "icao": "06A0A5",
+        "registration": "A7-BCA",
+        "timestamp": "2026-03-29T13:45:35.138Z",
+        "source_type": "aero-acars",
+        "link_direction": "uplink",
+        "from_hex": "90",
+        "to_hex": "06A0A5",
+        "frequency": None,
+        "level": None,
+        "channel": None,
+        "mode": "2",
+        "label": "H1",
+        "block_id": "P",
+        "message_number": None,
+        "ack": "!",
+        "flight_number": None,
+        "text": "- #EIEM13R0",
+        "data": None,
+        "latitude": None,
+        "longitude": None,
+        "altitude": None,
+        "departing_airport": None,
+        "destination_airport": None,
+    }
+    db.insert_acars_message(m)
+    db.insert_acars_message(m)  # second insert must dedup silently
+    db.commit()
+    count = db.conn.execute(
+        "SELECT COUNT(*) AS c FROM acars_messages WHERE airframes_id = ?", (m["airframes_id"],)
+    ).fetchone()["c"]
+    assert count == 1
+
+
+def test_upsert_acars_flight_updates_message_count(db):
+    f = {
+        "flight_id": 5538326232,
+        "airframe_id": 14166,
+        "icao": "06A0A5",
+        "registration": "A7-BCA",
+        "flight_number": "QR3255",
+        "flight_iata": None,
+        "flight_icao": None,
+        "status": "radio-silence",
+        "departing_airport": None,
+        "destination_airport": None,
+        "departure_time_scheduled": None,
+        "departure_time_actual": None,
+        "arrival_time_scheduled": None,
+        "arrival_time_actual": None,
+        "first_seen": "2026-03-29T08:50:24Z",
+        "last_seen": "2026-03-29T13:45:35Z",
+        "message_count": 200,
+    }
+    db.upsert_acars_flight(f)
+    db.upsert_acars_flight({**f, "message_count": 250, "status": "arrived"})
+    db.commit()
+    row = db.conn.execute(
+        "SELECT message_count, status FROM acars_flights WHERE flight_id = ?",
+        (f["flight_id"],),
+    ).fetchone()
+    assert row["message_count"] == 250
+    assert row["status"] == "arrived"
+
+
+def test_get_acars_flight_ids_fetched_returns_set(db):
+    db.upsert_acars_flight(
+        {
+            "flight_id": 1,
+            "airframe_id": 14166,
+            "icao": "06A0A5",
+            "registration": "A7-BCA",
+            "flight_number": None,
+            "flight_iata": None,
+            "flight_icao": None,
+            "status": None,
+            "departing_airport": None,
+            "destination_airport": None,
+            "departure_time_scheduled": None,
+            "departure_time_actual": None,
+            "arrival_time_scheduled": None,
+            "arrival_time_actual": None,
+            "first_seen": None,
+            "last_seen": None,
+            "message_count": 0,
+        }
+    )
+    db.upsert_acars_flight(
+        {
+            "flight_id": 2,
+            "airframe_id": 14166,
+            "icao": "06A0A5",
+            "registration": "A7-BCA",
+            "flight_number": None,
+            "flight_iata": None,
+            "flight_icao": None,
+            "status": None,
+            "departing_airport": None,
+            "destination_airport": None,
+            "departure_time_scheduled": None,
+            "departure_time_actual": None,
+            "arrival_time_scheduled": None,
+            "arrival_time_actual": None,
+            "first_seen": None,
+            "last_seen": None,
+            "message_count": 0,
+        }
+    )
+    db.commit()
+    fetched = db.get_acars_flight_ids_fetched("06A0A5")
+    assert fetched == {1, 2}
+
+
+def test_update_registry_airframes_id(db):
+    # Seed a registry row via upsert_aircraft_registry (takes sqlite3.Row list)
+    db.conn.execute(
+        "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+        ("06A0A5", "A7-BCA", "2026-04-16T00:00:00Z"),
+    )
+    db.update_registry_airframes_id("06A0A5", 14166)
+    db.commit()
+    row = db.conn.execute("SELECT airframes_id FROM aircraft_registry WHERE icao = ?", ("06A0A5",)).fetchone()
+    assert row["airframes_id"] == 14166

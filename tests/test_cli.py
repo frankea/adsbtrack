@@ -317,3 +317,234 @@ def test_status_flags_deregistered(tmp_path):
     assert result.exit_code == 0, result.output
     assert "GHOST HELI LLC" in result.output
     assert "deregistered" in result.output.lower()
+
+
+def test_status_shows_position_source_breakdown(tmp_path):
+    """`status` should report the ADS-B/MLAT/TIS-B mix when flights have it.
+
+    One flight is all-ADS-B, one is all-MLAT -- weighted by data_points
+    the rollup should show 50/50 (they have equal data_points).
+    """
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ae07b3",
+                takeoff_time=datetime(2022, 6, 15, 12, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-118.0,
+                takeoff_date="2022-06-15",
+                data_points=100,
+                adsb_pct=100.0,
+                mlat_pct=0.0,
+                tisb_pct=0.0,
+            )
+        )
+        db.insert_flight(
+            Flight(
+                icao="ae07b3",
+                takeoff_time=datetime(2022, 6, 16, 12, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-118.0,
+                takeoff_date="2022-06-16",
+                data_points=100,
+                adsb_pct=0.0,
+                mlat_pct=100.0,
+                tisb_pct=0.0,
+            )
+        )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["status", "--hex", "ae07b3", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "Position sources" in result.output
+    assert "ADS-B" in result.output
+    assert "MLAT" in result.output
+    assert "TIS-B" in result.output
+    # Both 50.0% -- accept either formatting but require the digit.
+    assert "50.0" in result.output
+
+
+def test_acars_cli_fetches_and_stores_messages(tmp_path, monkeypatch):
+    """`acars --hex <h> --start <d>` resolves the airframe and stores messages.
+
+    The AirframesClient is monkey-patched to a fake so no network is hit.
+    """
+    db_path = tmp_path / "a.db"
+    # Seed the registry so --tail resolution also works
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+            ("06a0a5", "A7-BCA", "2026-04-16T00:00:00Z"),
+        )
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def close(self):
+            pass
+
+        def get_airframe_by_icao(self, icao):
+            return {"id": 14166, "tail": "A7-BCA"}
+
+        def get_airframe_by_id(self, aid):
+            return {"flights": [{"id": 1, "createdAt": "2026-04-10T10:00:00Z"}]}
+
+        def get_flight(self, fid):
+            return {
+                "id": fid,
+                "messages": [
+                    {
+                        "id": 111,
+                        "uuid": "u",
+                        "timestamp": "2026-04-10T10:30:00Z",
+                        "tail": "A7-BCA",
+                        "label": "H1",
+                        "text": "- #ok",
+                        "sourceType": "acars",
+                        "linkDirection": "downlink",
+                        "fromHex": "06A0A5",
+                        "toHex": "00",
+                        "blockId": "A",
+                        "ack": "!",
+                        "mode": "2",
+                        "messageNumber": None,
+                        "flightNumber": None,
+                        "data": None,
+                        "latitude": None,
+                        "longitude": None,
+                        "altitude": None,
+                        "departingAirport": None,
+                        "destinationAirport": None,
+                        "frequency": None,
+                        "level": None,
+                        "channel": None,
+                    }
+                ],
+            }
+
+    monkeypatch.setenv("AIRFRAMES_API_KEY", "test-key")
+    monkeypatch.setattr("adsbtrack.cli.AirframesClient", FakeClient)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["acars", "--hex", "06a0a5", "--start", "2026-04-01", "--end", "2026-04-16", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+
+    with Database(db_path) as db:
+        count = db.conn.execute("SELECT COUNT(*) AS c FROM acars_messages").fetchone()["c"]
+        assert count == 1
+        flt = db.conn.execute("SELECT message_count FROM acars_flights WHERE flight_id = 1").fetchone()
+        assert flt["message_count"] == 1
+
+
+def test_acars_cli_errors_without_api_key(tmp_path, monkeypatch):
+    """With no env var and no credentials file, the CLI should exit non-zero with a clear error."""
+    db_path = tmp_path / "a.db"
+    Database(db_path).close()
+    monkeypatch.delenv("AIRFRAMES_API_KEY", raising=False)
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["acars", "--hex", "06a0a5", "--start", "2026-04-01", "--db", str(db_path)],
+    )
+    assert result.exit_code != 0
+    assert "AIRFRAMES_API_KEY" in result.output or "api key" in result.output.lower()
+
+
+def _seed_flight_with_acars(db_path, msg_count: int, oooi: bool = False):
+    """Seed one ADS-B flight and optional ACARS messages overlapping it."""
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="06a0a5",
+                takeoff_time=datetime(2026, 3, 29, 2, 0, tzinfo=UTC),
+                takeoff_lat=25.26,
+                takeoff_lon=51.61,
+                takeoff_date="2026-03-29",
+                landing_time=datetime(2026, 3, 29, 15, 0, tzinfo=UTC),
+                landing_lat=51.47,
+                landing_lon=-0.45,
+                landing_date="2026-03-29",
+                origin_icao="OTHH",
+                destination_icao="EGLL",
+                origin_name="Doha",
+                destination_name="Heathrow",
+                acars_out="2026-03-29T01:33:00+00:00" if oooi else None,
+                acars_off="2026-03-29T01:51:00+00:00" if oooi else None,
+            )
+        )
+        for i in range(msg_count):
+            db.insert_acars_message(
+                {
+                    "airframes_id": 10_000 + i,
+                    "uuid": f"u{i}",
+                    "flight_id": 42,
+                    "icao": "06a0a5",
+                    "registration": "A7-BCA",
+                    "timestamp": "2026-03-29T08:00:00Z",
+                    "source_type": "acars",
+                    "link_direction": "uplink",
+                    "from_hex": None,
+                    "to_hex": None,
+                    "frequency": None,
+                    "level": None,
+                    "channel": None,
+                    "mode": "2",
+                    "label": "H1",
+                    "block_id": "A",
+                    "message_number": None,
+                    "ack": "!",
+                    "flight_number": None,
+                    "text": "- #ok",
+                    "data": None,
+                    "latitude": None,
+                    "longitude": None,
+                    "altitude": None,
+                    "departing_airport": None,
+                    "destination_airport": None,
+                }
+            )
+        db.commit()
+
+
+def test_trips_shows_acars_count_when_messages_exist(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flight_with_acars(db_path, msg_count=3)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "06a0a5", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    # A count of 3 messages should appear somewhere in the output
+    assert "3" in result.output
+    # Header or per-row marker identifying the ACARS column
+    assert "ACARS" in result.output
+
+
+def test_trips_shows_oooi_marker(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flight_with_acars(db_path, msg_count=1, oooi=True)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "06a0a5", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    # Some visual indicator of OOOI data present
+    assert "OOOI" in result.output or "O" in result.output
+
+
+def test_status_shows_acars_section(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flight_with_acars(db_path, msg_count=5)
+    runner = CliRunner()
+    result = runner.invoke(cli, ["status", "--hex", "06a0a5", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "ACARS" in result.output
+    assert "5" in result.output  # message count

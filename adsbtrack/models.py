@@ -148,6 +148,23 @@ class Flight:
     # holds the overridden type code. NULL means the registry type is correct.
     type_override: str | None = None
 
+    # --- Position source mix (readsb type/src field) ---
+    # Per-flight percentage of trace points whose position_source matched
+    # each bucket. Remaining points (e.g. "other", "mode_s", "adsc",
+    # unknown) are not represented here, so these three need not sum to 100.
+    mlat_pct: float | None = None
+    tisb_pct: float | None = None
+    adsb_pct: float | None = None
+
+    # --- ACARS OOOI timestamps (ISO 8601 UTC) ---
+    # Populated by acars.fetch_acars when an OOOI-bearing ACARS message
+    # falls within the flight window. NULL when we don't have coverage,
+    # couldn't parse the format, or the event hasn't happened yet.
+    acars_out: str | None = None
+    acars_off: str | None = None
+    acars_on: str | None = None
+    acars_in: str | None = None
+
 
 @dataclass
 class AirportMatch:

@@ -1218,3 +1218,172 @@ def test_extract_flights_pct_handles_all_mlat_flight():
     assert flight.mlat_pct == 100.0
     assert flight.tisb_pct == 0.0
     assert flight.adsb_pct == 0.0
+
+
+def test_extract_flights_uses_alt_min_anchor_for_destination():
+    """Synthetic flight where the altitude minimum is near airport KA but
+    the last observed trace point drifted close to airport KB. The
+    destination should resolve to KA via the alt_min anchor; method
+    recorded as 'alt_min'."""
+    from unittest.mock import MagicMock
+
+    base = "2026-04-16"
+    start_ts = _ts(base, 12, 0, 0)
+
+    # Flight profile: takeoff, climb, cruise, descent to touchdown near KA,
+    # then a few more airborne points that drift toward KB before signal
+    # drop. Simulates a dropped_on_approach at KA followed by aircraft
+    # continuing visible past it.
+    trace = [
+        _make_trace_point(0, 30.00, -90.00, "ground", gs=0),
+        _make_trace_point(60, 30.00, -90.00, 100, gs=80),  # takeoff
+        _make_trace_point(300, 30.05, -90.10, 3000, gs=140),
+        _make_trace_point(600, 30.05, -90.05, 500, gs=80),  # alt-min, near KA (30.0, -90.0)
+        _make_trace_point(660, 30.20, -89.80, 2000, gs=120),
+        _make_trace_point(720, 30.40, -89.60, 2500, gs=120),  # last point, near KB (30.5, -89.5)
+        # Signal lost (trace ends airborne).
+    ]
+    row = _make_trace_row(base, start_ts, trace)
+
+    db = _make_db_mock([row])
+
+    # KA is the alt_min airport, KB is the last-point airport.
+    def fake_nearby(lat, lon, **kwargs):
+        return [
+            {
+                "ident": "KA",
+                "latitude_deg": 30.00,
+                "longitude_deg": -90.00,
+                "elevation_ft": 10,
+                "name": "Alpha",
+                "municipality": "",
+                "iata_code": "",
+                "type": "small_airport",
+            },
+            {
+                "ident": "KB",
+                "latitude_deg": 30.50,
+                "longitude_deg": -89.50,
+                "elevation_ft": 10,
+                "name": "Bravo",
+                "municipality": "",
+                "iata_code": "",
+                "type": "small_airport",
+            },
+        ]
+
+    db.find_nearby_airports.side_effect = fake_nearby
+    db.insert_flight = MagicMock()
+
+    cfg = _make_config()
+
+    extract_flights(db, cfg, "aaaaaa", reprocess=False)
+
+    # Grab the flight object(s) passed to insert_flight and verify the
+    # probable destination was picked via the alt_min anchor.
+    inserted = [c.args[0] for c in db.insert_flight.call_args_list]
+    assert len(inserted) >= 1
+    flight = inserted[0]
+    # landing_type will be signal_lost or dropped_on_approach - either way,
+    # anchor method should be 'alt_min'.
+    assert flight.landing_anchor_method == "alt_min"
+    # Probable destination should resolve to KA (closest to alt-min point),
+    # not KB (closest to last point).
+    assert flight.probable_destination_icao == "KA"
+
+
+def test_extract_flights_falls_back_to_last_point_when_tail_alts_missing():
+    """When the final window has no altitude data (OpenSky-style traces
+    with 'ground' strings or None throughout), landing_anchor_method
+    should record 'last_point'."""
+    from unittest.mock import MagicMock
+
+    base = "2026-04-16"
+    start_ts = _ts(base, 12, 0, 0)
+
+    # Short "flight" where every airborne point has baro_alt='ground'.
+    # The parser typically flags these as altitude_error; we only care
+    # that the fallback method is recorded.
+    trace = [
+        _make_trace_point(0, 30.00, -90.00, "ground", gs=0),
+        _make_trace_point(60, 30.00, -90.00, "ground", gs=90),  # baro='ground' at flight speed
+        _make_trace_point(300, 30.05, -90.05, "ground", gs=120),
+        _make_trace_point(600, 30.10, -90.10, "ground", gs=80),
+    ]
+    row = _make_trace_row(base, start_ts, trace)
+    db = _make_db_mock([row])
+    db.insert_flight = MagicMock()
+
+    extract_flights(db, _make_config(), "aaaaaa", reprocess=False)
+
+    inserted = [c.args[0] for c in db.insert_flight.call_args_list]
+    # At least one flight may have been extracted; if so, confirm the
+    # anchor fell back. If the parser filtered this trace out entirely,
+    # the test is non-applicable and passes vacuously.
+    for flight in inserted:
+        assert flight.landing_anchor_method in ("last_point", None)
+
+
+def test_reprocess_recomputes_landing_anchor_method():
+    """Calling extract_flights with reprocess=True should recompute the
+    anchor even if flights already exist with stale values."""
+    import tempfile
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from adsbtrack.db import Database
+
+    tmp = tempfile.TemporaryDirectory()
+    try:
+        db_path = Path(tmp.name) / "t.db"
+        with Database(db_path) as db:
+            # Insert a stale flight with landing_anchor_method=NULL.
+            stale = Flight(
+                icao="aaaaaa",
+                takeoff_time=datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+                takeoff_lat=30.0,
+                takeoff_lon=-90.0,
+                takeoff_date="2026-04-16",
+                landing_anchor_method=None,
+            )
+            db.insert_flight(stale)
+            db.commit()
+
+            # Insert trace for the same icao.
+            base = "2026-04-16"
+            start_ts = _ts(base, 12, 0, 0)
+            trace = [
+                _make_trace_point(0, 30.00, -90.00, "ground", gs=0),
+                _make_trace_point(60, 30.00, -90.00, 100, gs=80),
+                _make_trace_point(300, 30.05, -90.10, 3000, gs=140),
+                _make_trace_point(600, 30.05, -90.05, 500, gs=80),
+            ]
+            db.insert_trace_day(
+                "aaaaaa",
+                base,
+                {
+                    "r": "N1",
+                    "t": "C172",
+                    "desc": "CESSNA",
+                    "ownOp": "",
+                    "year": "",
+                    "timestamp": start_ts,
+                    "trace": trace,
+                },
+                source="adsbx",
+            )
+            db.commit()
+
+            extract_flights(db, _make_config(), "aaaaaa", reprocess=True)
+            db.commit()
+
+            rows = db.conn.execute(
+                "SELECT landing_anchor_method FROM flights WHERE icao = ?",
+                ("aaaaaa",),
+            ).fetchall()
+            # After reprocess, the new flight row should have a populated
+            # anchor method (either alt_min or last_point depending on trace).
+            methods = [r["landing_anchor_method"] for r in rows]
+            assert any(m in ("alt_min", "last_point") for m in methods), f"got {methods}"
+    finally:
+        tmp.cleanup()

@@ -14,6 +14,7 @@ from .classifier import (
 )
 from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database
+from .landing_anchor import compute_landing_anchor
 from .models import Flight
 
 
@@ -799,6 +800,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             dropped_max_alt_ft=config.dropped_max_alt_ft,
         )
 
+        # Landing airport-matching anchor. Altitude-minimum point within the
+        # final N minutes is a stronger estimator than the last observed
+        # point for flights that drifted laterally or lost signal at
+        # altitude. Falls back to last_point when tail altitudes are missing.
+        anchor = compute_landing_anchor(
+            metrics,
+            window_minutes=config.landing_anchor_window_minutes,
+        )
+        flight.landing_anchor_method = anchor.method if anchor is not None else None
+
         # v8 R5: tighten tiny-flight guard. Drop signal_lost, uncertain, and
         # dropped_on_approach slivers that are BOTH short AND sparse. Keep
         # confirmed landings (legitimate quick helicopter hops) regardless
@@ -832,7 +843,13 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 flight.nearest_origin_distance_km = origin.distance_km
 
         if has_landing and flight.landing_type not in ("signal_lost", "dropped_on_approach"):
-            dest = find_nearest_airport(db, flight.landing_lat, flight.landing_lon, config)
+            # Use anchor (alt-min in final window) when available; fall back
+            # to landing_lat/lon only if compute_landing_anchor returned None
+            # (shouldn't happen on a has_landing flight but guards against
+            # empty recent_points).
+            dest_lat = anchor.lat if anchor is not None else flight.landing_lat
+            dest_lon = anchor.lon if anchor is not None else flight.landing_lon
+            dest = find_nearest_airport(db, dest_lat, dest_lon, config)
             if dest:
                 if dest.distance_km <= config.airport_on_field_threshold_km:
                     flight.destination_icao = dest.ident
@@ -932,26 +949,34 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             if flight.cruise_gs_kt is not None and flight.cruise_gs_kt > gs_cap:
                 flight.cruise_gs_kt = gs_cap
 
-        # v3 destination inference for dropped / signal_lost flights
-        if flight.landing_type in ("signal_lost", "dropped_on_approach") and flight.last_seen_lat is not None:
-            try:
-                candidates = db.find_nearby_airports(
-                    flight.last_seen_lat,
-                    flight.last_seen_lon,
-                    delta=config.prob_dest_search_delta,
-                    types=config.airport_types,
+        # v3 destination inference for dropped / signal_lost flights.
+        # Uses the alt-min anchor (falling back to last_seen) so candidates
+        # are queried around "where the aircraft was trying to land" rather
+        # than where it was last observed (which may be at altitude).
+        if flight.landing_type in ("signal_lost", "dropped_on_approach"):
+            ref_lat = anchor.lat if anchor is not None else flight.last_seen_lat
+            ref_lon = anchor.lon if anchor is not None else flight.last_seen_lon
+            if ref_lat is not None and ref_lon is not None:
+                try:
+                    candidates = db.find_nearby_airports(
+                        ref_lat,
+                        ref_lon,
+                        delta=config.prob_dest_search_delta,
+                        types=config.airport_types,
+                    )
+                except Exception:
+                    candidates = []
+                infer = features.infer_destination(
+                    flight=flight,
+                    metrics=metrics,
+                    candidates=list(candidates),
+                    config=config,
+                    anchor_lat=ref_lat,
+                    anchor_lon=ref_lon,
                 )
-            except Exception:
-                candidates = []
-            infer = features.infer_destination(
-                flight=flight,
-                metrics=metrics,
-                candidates=list(candidates),
-                config=config,
-            )
-            flight.probable_destination_icao = infer["probable_destination_icao"]
-            flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
-            flight.probable_destination_confidence = infer["probable_destination_confidence"]
+                flight.probable_destination_icao = infer["probable_destination_icao"]
+                flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
+                flight.probable_destination_confidence = infer["probable_destination_confidence"]
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
         # v8 N8: cap at 72 hours (4320 min). Anything longer reflects a

@@ -184,10 +184,87 @@ CREATE TABLE IF NOT EXISTS helipads (
     name_hint TEXT
 );
 
+CREATE TABLE IF NOT EXISTS faa_registry (
+    mode_s_code_hex TEXT PRIMARY KEY,
+    n_number TEXT,
+    serial_number TEXT,
+    mfr_mdl_code TEXT,
+    eng_mfr_mdl TEXT,
+    year_mfr TEXT,
+    type_registrant TEXT,
+    name TEXT,
+    street TEXT,
+    street2 TEXT,
+    city TEXT,
+    state TEXT,
+    zip_code TEXT,
+    region TEXT,
+    county TEXT,
+    country TEXT,
+    last_action_date TEXT,
+    cert_issue_date TEXT,
+    certification TEXT,
+    type_aircraft TEXT,
+    type_engine TEXT,
+    status_code TEXT,
+    mode_s_code TEXT,
+    fract_owner TEXT,
+    air_worth_date TEXT,
+    expiration_date TEXT,
+    unique_id TEXT,
+    kit_mfr TEXT,
+    kit_model TEXT
+);
+
+CREATE TABLE IF NOT EXISTS faa_deregistered (
+    mode_s_code_hex TEXT PRIMARY KEY,
+    n_number TEXT,
+    serial_number TEXT,
+    mfr_mdl_code TEXT,
+    eng_mfr_mdl TEXT,
+    year_mfr TEXT,
+    type_registrant TEXT,
+    name TEXT,
+    street TEXT,
+    street2 TEXT,
+    city TEXT,
+    state TEXT,
+    zip_code TEXT,
+    region TEXT,
+    county TEXT,
+    country TEXT,
+    last_action_date TEXT,
+    cert_issue_date TEXT,
+    certification TEXT,
+    type_aircraft TEXT,
+    type_engine TEXT,
+    status_code TEXT,
+    mode_s_code TEXT,
+    fract_owner TEXT,
+    air_worth_date TEXT,
+    expiration_date TEXT,
+    unique_id TEXT,
+    kit_mfr TEXT,
+    kit_model TEXT
+);
+
+CREATE TABLE IF NOT EXISTS faa_aircraft_ref (
+    code TEXT PRIMARY KEY,
+    mfr TEXT,
+    model TEXT,
+    type_acft TEXT,
+    type_eng TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
 CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
+CREATE INDEX IF NOT EXISTS idx_faa_registry_n_number ON faa_registry(n_number);
+CREATE INDEX IF NOT EXISTS idx_faa_registry_name ON faa_registry(name);
+CREATE INDEX IF NOT EXISTS idx_faa_registry_city_state ON faa_registry(city, state);
+CREATE INDEX IF NOT EXISTS idx_faa_registry_street ON faa_registry(street);
+CREATE INDEX IF NOT EXISTS idx_faa_deregistered_n_number ON faa_deregistered(n_number);
 
 DROP VIEW IF EXISTS flights_with_type;
 CREATE VIEW flights_with_type AS
@@ -1154,3 +1231,138 @@ class Database:
                    WHERE icao NOT IN (SELECT DISTINCT icao FROM flights)"""
             )
             return deleted
+
+    # -- FAA registry (faa_registry / faa_deregistered / faa_aircraft_ref) --
+
+    # Column order must match adsbtrack.registry.MASTER_COLUMNS: the tuples
+    # passed to executemany are built in that order, and the PRIMARY KEY
+    # (mode_s_code_hex) sits at the end.
+    _FAA_REGISTRY_COLUMNS = (
+        "n_number",
+        "serial_number",
+        "mfr_mdl_code",
+        "eng_mfr_mdl",
+        "year_mfr",
+        "type_registrant",
+        "name",
+        "street",
+        "street2",
+        "city",
+        "state",
+        "zip_code",
+        "region",
+        "county",
+        "country",
+        "last_action_date",
+        "cert_issue_date",
+        "certification",
+        "type_aircraft",
+        "type_engine",
+        "status_code",
+        "mode_s_code",
+        "fract_owner",
+        "air_worth_date",
+        "expiration_date",
+        "unique_id",
+        "kit_mfr",
+        "kit_model",
+        "mode_s_code_hex",
+    )
+
+    def _faa_insert_sql(self, table: str) -> str:
+        cols = ", ".join(self._FAA_REGISTRY_COLUMNS)
+        placeholders = ", ".join("?" for _ in self._FAA_REGISTRY_COLUMNS)
+        return f"INSERT OR REPLACE INTO {table} ({cols}) VALUES ({placeholders})"
+
+    def insert_faa_registry(self, rows: list[tuple]) -> None:
+        """Bulk insert/replace rows into faa_registry.
+
+        rows is a list of tuples in MASTER_COLUMNS order (mode_s_code_hex
+        last). Safe to call with thousands of rows; the caller controls
+        transaction boundaries for best performance.
+        """
+        self.conn.executemany(self._faa_insert_sql("faa_registry"), rows)
+
+    def insert_faa_deregistered(self, rows: list[tuple]) -> None:
+        self.conn.executemany(self._faa_insert_sql("faa_deregistered"), rows)
+
+    def insert_faa_aircraft_ref(self, rows: list[tuple]) -> None:
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO faa_aircraft_ref (code, mfr, model, type_acft, type_eng) VALUES (?, ?, ?, ?, ?)",
+            rows,
+        )
+
+    def truncate_faa_tables(self) -> None:
+        """Clear all three FAA tables. Used by the update flow before re-import."""
+        self.conn.execute("DELETE FROM faa_registry")
+        self.conn.execute("DELETE FROM faa_deregistered")
+        self.conn.execute("DELETE FROM faa_aircraft_ref")
+
+    def get_faa_registry_by_hex(self, hex_code: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM faa_registry WHERE mode_s_code_hex = ?",
+            (hex_code.lower(),),
+        ).fetchone()
+
+    def get_faa_registry_by_n_number(self, n_number: str) -> sqlite3.Row | None:
+        # N-numbers are stored without the leading 'N'. Accept either form.
+        normalized = n_number.upper().lstrip("N").strip()
+        return self.conn.execute(
+            "SELECT * FROM faa_registry WHERE n_number = ?",
+            (normalized,),
+        ).fetchone()
+
+    def get_faa_deregistered_by_hex(self, hex_code: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM faa_deregistered WHERE mode_s_code_hex = ?",
+            (hex_code.lower(),),
+        ).fetchone()
+
+    def get_faa_deregistered_by_n_number(self, n_number: str) -> sqlite3.Row | None:
+        normalized = n_number.upper().lstrip("N").strip()
+        return self.conn.execute(
+            "SELECT * FROM faa_deregistered WHERE n_number = ?",
+            (normalized,),
+        ).fetchone()
+
+    def get_faa_aircraft_ref(self, code: str) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM faa_aircraft_ref WHERE code = ?",
+            (code,),
+        ).fetchone()
+
+    def search_faa_registry_by_name(self, query: str, limit: int = 500) -> list[sqlite3.Row]:
+        """Case-insensitive LIKE match over the name column."""
+        pattern = f"%{query.upper()}%"
+        return self.conn.execute(
+            "SELECT * FROM faa_registry WHERE UPPER(name) LIKE ? ORDER BY name, n_number LIMIT ?",
+            (pattern, limit),
+        ).fetchall()
+
+    def search_faa_registry_by_address(
+        self,
+        *,
+        street: str | None = None,
+        city: str | None = None,
+        state: str | None = None,
+        limit: int = 500,
+    ) -> list[sqlite3.Row]:
+        """Case-insensitive address search. Combines filters with AND."""
+        clauses: list[str] = []
+        params: list = []
+        if street:
+            clauses.append("UPPER(street) LIKE ?")
+            params.append(f"%{street.upper()}%")
+        if city:
+            clauses.append("UPPER(city) = ?")
+            params.append(city.upper())
+        if state:
+            clauses.append("UPPER(state) = ?")
+            params.append(state.upper())
+        if not clauses:
+            return []
+        sql = (
+            "SELECT * FROM faa_registry WHERE " + " AND ".join(clauses) + " ORDER BY state, city, street, name LIMIT ?"
+        )
+        params.append(limit)
+        return self.conn.execute(sql, params).fetchall()

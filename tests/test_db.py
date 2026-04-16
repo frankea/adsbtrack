@@ -529,3 +529,155 @@ def test_refresh_aircraft_stats_ignores_negative_duration_flights(db):
     assert row["total_hours"] >= 0, f"total_hours went negative: {row['total_hours']}"
     assert row["avg_flight_minutes"] is not None
     assert row["avg_flight_minutes"] >= 0, f"avg_flight_minutes went negative: {row['avg_flight_minutes']}"
+
+
+def test_faa_registry_tables_exist(tmp_path):
+    """After Database construction, the three FAA tables must exist."""
+    from adsbtrack.db import Database
+
+    with Database(tmp_path / "t.db") as db:
+        tables = {
+            row["name"] for row in db.conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        assert "faa_registry" in tables
+        assert "faa_deregistered" in tables
+        assert "faa_aircraft_ref" in tables
+
+
+def test_insert_and_get_faa_registry(tmp_path):
+    """Round-trip a registry row by hex."""
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        # Build a row tuple matching MASTER_COLUMNS length (29 columns).
+        # Fill with placeholder values but set n_number, name, hex.
+        row = ["X"] * len(MASTER_COLUMNS)
+        row[0] = "512WB"  # n_number
+        row[6] = "EXAMPLE LLC"  # name
+        row[-1] = "a66ad3"  # mode_s_code_hex
+        db.insert_faa_registry([tuple(row)])
+        fetched = db.get_faa_registry_by_hex("a66ad3")
+        assert fetched is not None
+        assert fetched["n_number"] == "512WB"
+        assert fetched["name"] == "EXAMPLE LLC"
+
+
+def test_insert_faa_registry_replaces(tmp_path):
+    """Re-inserting the same hex key replaces the prior row (idempotent update)."""
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        row = ["X"] * len(MASTER_COLUMNS)
+        row[0] = "512WB"
+        row[6] = "OLD OWNER"
+        row[-1] = "a66ad3"
+        db.insert_faa_registry([tuple(row)])
+        row[6] = "NEW OWNER"
+        db.insert_faa_registry([tuple(row)])
+        fetched = db.get_faa_registry_by_hex("a66ad3")
+        assert fetched["name"] == "NEW OWNER"
+
+
+def test_get_faa_registry_by_n_number(tmp_path):
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        row = ["X"] * len(MASTER_COLUMNS)
+        row[0] = "512WB"
+        row[6] = "EXAMPLE"
+        row[-1] = "a66ad3"
+        db.insert_faa_registry([tuple(row)])
+        fetched = db.get_faa_registry_by_n_number("512WB")
+        assert fetched is not None
+        assert fetched["mode_s_code_hex"] == "a66ad3"
+
+
+def test_search_faa_registry_by_name(tmp_path):
+    """LIKE search over the name column, case-insensitive."""
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        for tail, name, hex_ in [
+            ("1A", "ACME CORP", "a00001"),
+            ("2A", "acme holdings llc", "a00002"),
+            ("3A", "OTHER LLC", "a00003"),
+        ]:
+            row = ["X"] * len(MASTER_COLUMNS)
+            row[0] = tail
+            row[6] = name
+            row[-1] = hex_
+            db.insert_faa_registry([tuple(row)])
+        matches = db.search_faa_registry_by_name("acme")
+        tails = {m["n_number"] for m in matches}
+        assert tails == {"1A", "2A"}
+
+
+def test_search_faa_registry_by_address(tmp_path):
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        for tail, street, city, state, hex_ in [
+            ("1A", "100 MAIN ST", "AUSTIN", "TX", "a00001"),
+            ("2A", "200 OAK AVE", "AUSTIN", "TX", "a00002"),
+            ("3A", "100 MAIN ST", "DALLAS", "TX", "a00003"),
+        ]:
+            row = ["X"] * len(MASTER_COLUMNS)
+            row[0] = tail
+            row[6] = "OWNER"
+            row[7] = street
+            row[9] = city
+            row[10] = state
+            row[-1] = hex_
+            db.insert_faa_registry([tuple(row)])
+        # Street match hits both buildings at 100 MAIN ST.
+        matches = db.search_faa_registry_by_address(street="100 MAIN")
+        assert {m["n_number"] for m in matches} == {"1A", "3A"}
+        # City+state narrows to AUSTIN, TX.
+        matches = db.search_faa_registry_by_address(city="AUSTIN", state="TX")
+        assert {m["n_number"] for m in matches} == {"1A", "2A"}
+
+
+def test_insert_and_check_faa_deregistered(tmp_path):
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        row = ["X"] * len(MASTER_COLUMNS)
+        row[0] = "99SK"
+        row[6] = "GHOST HELI LLC"
+        row[-1] = "abc123"
+        db.insert_faa_deregistered([tuple(row)])
+        fetched = db.get_faa_deregistered_by_hex("abc123")
+        assert fetched is not None
+        assert fetched["n_number"] == "99SK"
+
+
+def test_insert_faa_aircraft_ref(tmp_path):
+    from adsbtrack.db import Database
+
+    with Database(tmp_path / "t.db") as db:
+        db.insert_faa_aircraft_ref([("1152015", "CESSNA", "172", "4", "1")])
+        ref = db.get_faa_aircraft_ref("1152015")
+        assert ref is not None
+        assert ref["mfr"] == "CESSNA"
+        assert ref["model"] == "172"
+
+
+def test_truncate_faa_tables(tmp_path):
+    """The bulk-import update flow DELETEs all rows before reinserting."""
+    from adsbtrack.db import Database
+    from adsbtrack.registry import MASTER_COLUMNS
+
+    with Database(tmp_path / "t.db") as db:
+        row = ["X"] * len(MASTER_COLUMNS)
+        row[0] = "1A"
+        row[6] = "OWNER"
+        row[-1] = "a00001"
+        db.insert_faa_registry([tuple(row)])
+        db.truncate_faa_tables()
+        assert db.get_faa_registry_by_hex("a00001") is None

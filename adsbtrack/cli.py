@@ -455,5 +455,31 @@ def links(hex_code, tail_number, db_path, urls_only):
             console.print(f"[cyan]{flight_date}[/] {origin} -> {dest}  [dim]{url}[/]")
 
 
+@cli.group()
+def registry():
+    """FAA aircraft registry import and lookup."""
+
+
+@registry.command("update")
+@click.option(
+    "--zip",
+    "zip_path",
+    type=click.Path(path_type=Path, dir_okay=False),
+    default=None,
+    help="Use a local ReleasableAircraft.zip instead of downloading.",
+)
+@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+def registry_update(zip_path, db_path):
+    """Download the FAA ReleasableAircraft.zip and (re)import MASTER/DEREG/ACFTREF."""
+    from .registry import refresh_faa_registry
+
+    cfg = Config(db_path=Path(db_path))
+    with Database(cfg.db_path) as db:
+        stats = refresh_faa_registry(db, cfg, local_zip=zip_path)
+    console.print(
+        f"[green]FAA registry loaded:[/] MASTER {stats['master']}, DEREG {stats['dereg']}, ACFTREF {stats['acftref']}"
+    )
+
+
 if __name__ == "__main__":
     cli()

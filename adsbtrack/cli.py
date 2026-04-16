@@ -539,5 +539,41 @@ def registry_lookup(hex_code, tail_number, db_path):
             _print_faa_registry_row(dereg, deregistered=True)
 
 
+def _print_registry_summary_rows(rows, *, empty_message: str) -> None:
+    """Shared table renderer for owner/address searches."""
+    if not rows:
+        console.print(f"[yellow]{empty_message}[/]")
+        return
+    table = Table(show_header=True)
+    table.add_column("Tail", style="cyan")
+    table.add_column("ICAO hex", style="dim")
+    table.add_column("Registrant", style="green")
+    table.add_column("City, State", style="yellow")
+    table.add_column("MFR/MDL", style="dim")
+    for r in rows:
+        tail = f"N{r['n_number']}" if r["n_number"] else "-"
+        city_state = ", ".join(p for p in (r["city"], r["state"]) if p) or "-"
+        table.add_row(
+            tail,
+            r["mode_s_code_hex"] or "-",
+            r["name"] or "-",
+            city_state,
+            r["mfr_mdl_code"] or "-",
+        )
+    console.print(table)
+    console.print(f"\n{len(rows)} aircraft")
+
+
+@registry.command("owner")
+@click.option("--name", required=True, help="Owner name to search (LIKE match, case-insensitive)")
+@click.option("--limit", default=500, show_default=True, help="Max rows to return")
+@click.option("--db", "db_path", default="adsbtrack.db")
+def registry_owner(name, limit, db_path):
+    """Search faa_registry by registrant name (LIKE match)."""
+    with Database(Path(db_path)) as db:
+        rows = db.search_faa_registry_by_name(name, limit=limit)
+        _print_registry_summary_rows(rows, empty_message=f"No aircraft match name {name!r}")
+
+
 if __name__ == "__main__":
     cli()

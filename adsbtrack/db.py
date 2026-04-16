@@ -967,6 +967,32 @@ class Database:
             (lat - delta, lat + delta, lon - delta, lon + delta, *types),
         ).fetchall()
 
+    # -- runways --
+
+    def insert_runway_ends(self, rows: list[tuple]) -> None:
+        """Bulk upsert runway ends. Each tuple must match the column order of
+        the runways table (see SCHEMA). Uses INSERT OR REPLACE keyed on
+        (airport_ident, runway_name) so repeated refreshes are idempotent."""
+        self.conn.executemany(
+            """INSERT OR REPLACE INTO runways
+               (airport_ident, runway_name, latitude_deg, longitude_deg,
+                elevation_ft, heading_deg_true, length_ft, width_ft,
+                surface, closed, displaced_threshold_ft)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        self.conn.commit()
+
+    def clear_runways_for_airport(self, airport_ident: str) -> None:
+        """Delete all runway rows for one airport. Used by the refresh pipeline
+        to drop ends that disappeared from the upstream CSV."""
+        self.conn.execute("DELETE FROM runways WHERE airport_ident = ?", (airport_ident,))
+        self.conn.commit()
+
+    def runway_count(self) -> int:
+        row = self.conn.execute("SELECT COUNT(*) AS cnt FROM runways").fetchone()
+        return int(row["cnt"])
+
     # -- aircraft_registry (authoritative per-ICAO identity, v3) --
 
     def upsert_aircraft_registry(self, icao: str, trace_rows: list[sqlite3.Row]) -> dict | None:

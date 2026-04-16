@@ -1046,3 +1046,45 @@ def test_runways_index_on_airport_ident(db_path):
     names = {r["name"] for r in indexes}
     assert "idx_runways_airport_ident" in names
     database.close()
+
+
+def test_insert_runway_ends_roundtrip(db):
+    """Insert two ends for one airport, assert we can read both back."""
+    rows = [
+        # (airport_ident, runway_name, lat, lon, elev, heading, length_ft,
+        #  width_ft, surface, closed, displaced_threshold_ft)
+        ("KSPG", "18", 27.7656, -82.6271, 7, 180.0, 2864, 75, "ASPH", 0, 0),
+        ("KSPG", "36", 27.7735, -82.6271, 7, 360.0, 2864, 75, "ASPH", 0, 0),
+    ]
+    db.insert_runway_ends(rows)
+    fetched = db.conn.execute(
+        "SELECT runway_name FROM runways WHERE airport_ident = ? ORDER BY runway_name",
+        ("KSPG",),
+    ).fetchall()
+    assert [r["runway_name"] for r in fetched] == ["18", "36"]
+
+
+def test_insert_runway_ends_is_idempotent(db):
+    """Re-inserting the same (airport_ident, runway_name) should overwrite, not duplicate."""
+    row = ("KSPG", "18", 27.7656, -82.6271, 7, 180.0, 2864, 75, "ASPH", 0, 0)
+    db.insert_runway_ends([row])
+    # Re-run with a changed surface - row count stays at 1, surface updates.
+    updated = ("KSPG", "18", 27.7656, -82.6271, 7, 180.0, 2864, 75, "CONC", 0, 0)
+    db.insert_runway_ends([updated])
+    rows = db.conn.execute("SELECT surface FROM runways WHERE airport_ident = ?", ("KSPG",)).fetchall()
+    assert len(rows) == 1
+    assert rows[0]["surface"] == "CONC"
+
+
+def test_clear_runways_for_airport(db):
+    """clear_runways_for_airport removes only that airport's rows."""
+    db.insert_runway_ends(
+        [
+            ("KSPG", "18", 27.77, -82.63, 7, 180.0, 2864, 75, "ASPH", 0, 0),
+            ("KSPG", "36", 27.77, -82.63, 7, 360.0, 2864, 75, "ASPH", 0, 0),
+            ("KATL", "09L", 33.63, -84.44, 1026, 94.0, 9000, 150, "CONC", 0, 0),
+        ]
+    )
+    db.clear_runways_for_airport("KSPG")
+    remaining = db.conn.execute("SELECT airport_ident FROM runways").fetchall()
+    assert {r["airport_ident"] for r in remaining} == {"KATL"}

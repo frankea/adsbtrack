@@ -129,3 +129,56 @@ def test_registry_update_from_local_zip(tmp_path):
         assert db.get_faa_registry_by_hex("a66ad3") is not None
         assert db.get_faa_deregistered_by_hex("000001") is not None
         assert db.get_faa_aircraft_ref("1152015") is not None
+
+
+def test_registry_lookup_by_hex(tmp_path):
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    # Import first.
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    # Then lookup.
+    result = runner.invoke(cli, ["registry", "lookup", "--hex", "a66ad3", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "EXAMPLE OWNER LLC" in result.output
+    assert "AUSTIN" in result.output
+    assert "N512WB" in result.output
+
+
+def test_registry_lookup_by_tail(tmp_path):
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    result = runner.invoke(cli, ["registry", "lookup", "--tail", "N512WB", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "EXAMPLE OWNER LLC" in result.output
+
+
+def test_registry_lookup_shows_deregistered_flag(tmp_path):
+    """When the hex is present in faa_deregistered only, the output calls it out."""
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    # 000001 is the hex in faa_deregistered only.
+    result = runner.invoke(cli, ["registry", "lookup", "--hex", "000001", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "GHOST HELI LLC" in result.output
+    assert "deregistered" in result.output.lower()
+
+
+def test_registry_lookup_unknown_hex(tmp_path):
+    db_path = tmp_path / "t.db"
+    with Database(db_path):
+        pass
+    runner = CliRunner()
+    result = runner.invoke(cli, ["registry", "lookup", "--hex", "ffffff", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "no record" in result.output.lower() or "not found" in result.output.lower()

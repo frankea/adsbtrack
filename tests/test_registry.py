@@ -260,6 +260,36 @@ def test_refresh_faa_registry_from_local_zip(tmp_path):
         assert db.get_faa_registry_by_hex("deadbe") is None
 
 
+def test_refresh_faa_registry_from_nested_zip(tmp_path):
+    """If the FAA ever re-packages the zip with a nested folder, the
+    refresh should still resolve MASTER/DEREG/ACFTREF by basename."""
+    from adsbtrack.config import Config
+    from adsbtrack.registry import refresh_faa_registry
+
+    master_body = _MASTER_HEADER + "\n" + _MASTER_ROWS[0] + "\n"
+    dereg_body = _MASTER_HEADER + "\n" + _MASTER_ROWS[1] + "\n"
+    acftref_body = (
+        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
+        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    )
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        # Everything is nested one level deep instead of at the top.
+        zf.writestr("ReleasableAircraft/MASTER.txt", master_body)
+        zf.writestr("ReleasableAircraft/DEREG.txt", dereg_body)
+        zf.writestr("ReleasableAircraft/ACFTREF.txt", acftref_body)
+    zip_path.write_bytes(buf.getvalue())
+
+    cfg = Config(db_path=tmp_path / "t.db", faa_registry_cache_path=zip_path)
+    with Database(cfg.db_path) as db:
+        stats = refresh_faa_registry(db, cfg, local_zip=zip_path)
+
+    assert stats == {"master": 1, "dereg": 1, "acftref": 1}
+    with Database(cfg.db_path) as db:
+        assert db.get_faa_registry_by_hex("a66ad3") is not None
+
+
 def test_end_to_end_update_lookup_owner(tmp_path):
     """One-shot: run `registry update` then `registry lookup` + `registry owner`
     against the fake zip. Exercises the full wiring, not just the pieces."""

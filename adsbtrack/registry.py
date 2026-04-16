@@ -10,6 +10,17 @@ registrant identity, address, and deregistration history.
 
 from __future__ import annotations
 
+import csv
+from pathlib import Path
+
+from .db import Database
+
+# FAA files ship with latin-1 / cp1252 bytes in a small fraction of rows
+# (accented owner names, odd punctuation). UTF-8 would crash on these,
+# so open with latin-1 which round-trips every byte.
+_FAA_ENCODING = "latin-1"
+_FAA_DELIMITER = "|"
+
 
 def octal_mode_s_to_icao_hex(octal_str: str) -> str:
     """Convert FAA MODE S CODE (8-digit octal) to 6-char ICAO hex.
@@ -101,3 +112,66 @@ ACFTREF_COLUMNS: tuple[str, ...] = tuple(snake for _, snake in _ACFTREF_HEADERS)
 
 def parse_acftref_row(row: dict[str, str]) -> tuple:
     return tuple(_clean(row.get(header)) for header, _snake in _ACFTREF_HEADERS)
+
+
+def _iter_pipe_rows(path: Path):
+    """Yield csv.DictReader rows from a pipe-delimited FAA file."""
+    with path.open("r", encoding=_FAA_ENCODING, newline="") as fh:
+        reader = csv.DictReader(fh, delimiter=_FAA_DELIMITER)
+        yield from reader
+
+
+def _import_master_like(db: Database, path: Path, insert_fn) -> int:
+    """Shared loop for MASTER.txt / DEREG.txt import.
+
+    Accumulates parsed tuples in memory and bulk-inserts in one
+    transaction. Malformed rows (bad MODE S, missing fields) are
+    counted and printed but never abort the load.
+    """
+    parsed: list[tuple] = []
+    skipped = 0
+    for row in _iter_pipe_rows(path):
+        try:
+            parsed.append(parse_master_row(row))
+        except (ValueError, KeyError):
+            skipped += 1
+    # Single transaction for perf. WAL mode means readers are not blocked.
+    db.conn.execute("BEGIN")
+    try:
+        insert_fn(parsed)
+        db.conn.execute("COMMIT")
+    except Exception:
+        db.conn.execute("ROLLBACK")
+        raise
+    if skipped:
+        # Keep the UX minimal: single-line note, not per-row spam.
+        print(f"  [dim]skipped {skipped} malformed rows from {path.name}[/]")
+    return len(parsed)
+
+
+def import_master_from_path(db: Database, path: Path) -> int:
+    return _import_master_like(db, path, db.insert_faa_registry)
+
+
+def import_dereg_from_path(db: Database, path: Path) -> int:
+    return _import_master_like(db, path, db.insert_faa_deregistered)
+
+
+def import_acftref_from_path(db: Database, path: Path) -> int:
+    parsed: list[tuple] = []
+    skipped = 0
+    for row in _iter_pipe_rows(path):
+        try:
+            parsed.append(parse_acftref_row(row))
+        except KeyError:
+            skipped += 1
+    db.conn.execute("BEGIN")
+    try:
+        db.insert_faa_aircraft_ref(parsed)
+        db.conn.execute("COMMIT")
+    except Exception:
+        db.conn.execute("ROLLBACK")
+        raise
+    if skipped:
+        print(f"  [dim]skipped {skipped} malformed rows from {path.name}[/]")
+    return len(parsed)

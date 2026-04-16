@@ -19,8 +19,13 @@ both.
 from __future__ import annotations
 
 import csv
+import io
 from pathlib import Path
 
+import httpx
+from rich.progress import Progress
+
+from .config import Config
 from .db import Database
 
 # Pinned in the plan on 2026-04-16; lives in Config so tests can override.
@@ -161,4 +166,40 @@ def import_runways_from_path(db: Database, path: Path) -> int:
         for row in reader:
             ends.extend(parse_runway_row(row))
     db.insert_runway_ends(ends)
+    return len(ends)
+
+
+def refresh_runways(
+    db: Database,
+    cfg: Config,
+    *,
+    local_csv: Path | None = None,
+    timeout: float = 120.0,
+) -> int:
+    """Refresh the runways table from the upstream OurAirports CSV.
+
+    When `local_csv` is provided, the HTTP fetch is skipped and the file is
+    parsed directly. Otherwise, the CSV is streamed into memory via httpx
+    (file is ~5MB), written nowhere - we parse the text straight from the
+    response body.
+
+    Raises httpx.HTTPError variants unchanged; the CLI wrapper surfaces
+    them as click.ClickException. Returns the number of runway ends
+    inserted.
+    """
+    if local_csv is not None:
+        return import_runways_from_path(db, local_csv)
+
+    with Progress() as progress:
+        task = progress.add_task("Downloading OurAirports runways.csv...", total=None)
+        resp = httpx.get(cfg.runways_csv_url, follow_redirects=True, timeout=timeout)
+        resp.raise_for_status()
+        progress.update(task, completed=50)
+
+        reader = csv.DictReader(io.StringIO(resp.text))
+        ends: list[RunwayEnd] = []
+        for row in reader:
+            ends.extend(parse_runway_row(row))
+        db.insert_runway_ends(ends)
+        progress.update(task, completed=100)
     return len(ends)

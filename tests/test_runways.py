@@ -4,8 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from adsbtrack.config import Config
 from adsbtrack.db import Database
-from adsbtrack.runways import import_runways_from_path, parse_runway_row
+from adsbtrack.runways import import_runways_from_path, parse_runway_row, refresh_runways
 
 FIXTURE = Path(__file__).parent / "fixtures" / "runways_sample.csv"
 
@@ -202,3 +203,26 @@ def test_import_runways_from_path_is_idempotent(tmp_path):
         first = db.runway_count()
         import_runways_from_path(db, FIXTURE)
         assert db.runway_count() == first
+
+
+def test_refresh_runways_accepts_local_csv(tmp_path):
+    """refresh_runways should accept a local path and skip the HTTP fetch."""
+    cfg = Config(db_path=tmp_path / "t.db")
+    with Database(cfg.db_path) as db:
+        inserted = refresh_runways(db, cfg, local_csv=FIXTURE)
+        assert inserted == 13
+        assert db.runway_count() == 13
+
+
+def test_refresh_runways_is_idempotent(tmp_path):
+    cfg = Config(db_path=tmp_path / "t.db")
+    with Database(cfg.db_path) as db:
+        first = refresh_runways(db, cfg, local_csv=FIXTURE)
+        second = refresh_runways(db, cfg, local_csv=FIXTURE)
+        assert first == second == 13
+        assert db.runway_count() == 13
+
+
+def test_config_has_runways_csv_url_default():
+    cfg = Config()
+    assert cfg.runways_csv_url == "https://davidmegginson.github.io/ourairports-data/runways.csv"

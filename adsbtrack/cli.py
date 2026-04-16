@@ -16,6 +16,7 @@ from .db import Database
 from .fetcher import fetch_traces, fetch_traces_opensky
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
+from .runways import refresh_runways
 
 ALL_SOURCES = list(SOURCE_URLS.keys()) + ["opensky"]
 # "all" fetches from every readsb source (excludes opensky which needs creds)
@@ -808,6 +809,41 @@ def registry_address(street, city, state, limit, db_path):
             filters.append(f"state = {state!r}")
         msg = "No aircraft match " + ", ".join(filters)
         _print_registry_summary_rows(rows, empty_message=msg)
+
+
+@cli.group()
+def runways():
+    """OurAirports runway geometry ingestion."""
+
+
+@runways.command("refresh")
+@click.option(
+    "--csv",
+    "csv_path",
+    type=click.Path(exists=True, path_type=Path, dir_okay=False),
+    default=None,
+    help="Use a local runways.csv instead of downloading from OurAirports.",
+)
+@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+def runways_refresh(csv_path, db_path):
+    """Download OurAirports runways.csv and upsert runway geometry.
+
+    Idempotent - re-running overwrites existing rows keyed by
+    (airport_ident, runway_name).
+    """
+    import httpx
+
+    cfg = Config(db_path=Path(db_path))
+    try:
+        with Database(cfg.db_path) as db:
+            count = refresh_runways(db, cfg, local_csv=csv_path)
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"failed to download runways.csv: {e}") from e
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+    except OSError as e:
+        raise click.ClickException(f"filesystem error: {e}") from e
+    console.print(f"[green]Runway geometry loaded:[/] {count} runway ends")
 
 
 # -----------------------------------------------------------------------------

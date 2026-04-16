@@ -3,6 +3,7 @@
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 from adsbtrack.config import Config
 from adsbtrack.db import Database
@@ -226,3 +227,34 @@ def test_refresh_runways_is_idempotent(tmp_path):
 def test_config_has_runways_csv_url_default():
     cfg = Config()
     assert cfg.runways_csv_url == "https://davidmegginson.github.io/ourairports-data/runways.csv"
+
+
+def test_cli_runways_refresh_with_local_csv(tmp_path):
+    """`adsbtrack runways refresh --csv FIXTURE` should load and print a summary."""
+    from adsbtrack.cli import cli
+
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["runways", "refresh", "--csv", str(FIXTURE), "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "13" in result.output  # count surfaces in the summary
+
+    # Verify rows landed in the DB
+    with Database(db_path) as db:
+        assert db.runway_count() == 13
+
+
+def test_cli_runways_refresh_surfaces_missing_file(tmp_path):
+    from adsbtrack.cli import cli
+
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["runways", "refresh", "--csv", str(tmp_path / "does-not-exist.csv"), "--db", str(db_path)],
+    )
+    assert result.exit_code != 0
+    assert "does-not-exist.csv" in result.output or "not exist" in result.output.lower()

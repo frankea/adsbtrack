@@ -135,17 +135,14 @@ def _import_master_like(db: Database, path: Path, insert_fn) -> int:
             parsed.append(parse_master_row(row))
         except (ValueError, KeyError):
             skipped += 1
-    # Single transaction for perf. WAL mode means readers are not blocked.
-    db.conn.execute("BEGIN")
-    try:
+    # Single transaction for perf. `with db.conn:` commits on clean exit
+    # and rolls back on exception, and it composes safely with any
+    # outer transaction the caller may already hold.
+    with db.conn:
         insert_fn(parsed)
-        db.conn.execute("COMMIT")
-    except Exception:
-        db.conn.execute("ROLLBACK")
-        raise
     if skipped:
         # Keep the UX minimal: single-line note, not per-row spam.
-        print(f"  [dim]skipped {skipped} malformed rows from {path.name}[/]")
+        print(f"  skipped {skipped} malformed rows from {path.name}")
     return len(parsed)
 
 
@@ -165,13 +162,8 @@ def import_acftref_from_path(db: Database, path: Path) -> int:
             parsed.append(parse_acftref_row(row))
         except KeyError:
             skipped += 1
-    db.conn.execute("BEGIN")
-    try:
+    with db.conn:
         db.insert_faa_aircraft_ref(parsed)
-        db.conn.execute("COMMIT")
-    except Exception:
-        db.conn.execute("ROLLBACK")
-        raise
     if skipped:
-        print(f"  [dim]skipped {skipped} malformed rows from {path.name}[/]")
+        print(f"  skipped {skipped} malformed rows from {path.name}")
     return len(parsed)

@@ -575,5 +575,28 @@ def registry_owner(name, limit, db_path):
         _print_registry_summary_rows(rows, empty_message=f"No aircraft match name {name!r}")
 
 
+@registry.command("address")
+@click.option("--street", default=None, help="Street substring match (case-insensitive)")
+@click.option("--city", default=None, help="Exact city match (case-insensitive)")
+@click.option("--state", default=None, help="Exact state abbreviation match")
+@click.option("--limit", default=500, show_default=True, help="Max rows to return")
+@click.option("--db", "db_path", default="adsbtrack.db")
+def registry_address(street, city, state, limit, db_path):
+    """Search faa_registry by address. Provide at least one filter."""
+    if not any([street, city, state]):
+        raise click.UsageError("Provide at least one of --street, --city, --state.")
+    with Database(Path(db_path)) as db:
+        rows = db.search_faa_registry_by_address(street=street, city=city, state=state, limit=limit)
+        filters = []
+        if street:
+            filters.append(f"street ~ {street!r}")
+        if city:
+            filters.append(f"city = {city!r}")
+        if state:
+            filters.append(f"state = {state!r}")
+        msg = "No aircraft match " + ", ".join(filters)
+        _print_registry_summary_rows(rows, empty_message=msg)
+
+
 if __name__ == "__main__":
     cli()

@@ -208,3 +208,43 @@ def test_registry_owner_no_match(tmp_path):
     result = runner.invoke(cli, ["registry", "owner", "--name", "NONEXISTENT", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "no" in result.output.lower() and "match" in result.output.lower()
+
+
+def test_registry_address_by_street(tmp_path):
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    result = runner.invoke(
+        cli,
+        ["registry", "address", "--street", "100 MAIN", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "N512WB" in result.output
+
+
+def test_registry_address_by_city_state(tmp_path):
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    result = runner.invoke(
+        cli,
+        ["registry", "address", "--city", "AUSTIN", "--state", "TX", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "N512WB" in result.output
+
+
+def test_registry_address_requires_filter(tmp_path):
+    db_path = tmp_path / "t.db"
+    with Database(db_path):
+        pass
+    runner = CliRunner()
+    result = runner.invoke(cli, ["registry", "address", "--db", str(db_path)])
+    # Missing filters -> UsageError -> non-zero exit.
+    assert result.exit_code != 0

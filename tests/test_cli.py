@@ -1,5 +1,7 @@
 """Tests for adsbtrack.cli -- Click command surface."""
 
+import io
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -77,3 +79,53 @@ def test_links_urls_only_emits_one_url_per_line(tmp_path):
     joined = "\n".join(lines)
     assert "showTrace=2022-06-16" in joined
     assert "showTrace=2022-06-15" in joined
+
+
+def _build_fake_releasable_zip(path):
+    master_header = (
+        "N-NUMBER|SERIAL NUMBER|MFR MDL CODE|ENG MFR MDL|YEAR MFR|TYPE REGISTRANT|"
+        "NAME|STREET|STREET2|CITY|STATE|ZIP CODE|REGION|COUNTY|COUNTRY|"
+        "LAST ACTION DATE|CERT ISSUE DATE|CERTIFICATION|TYPE AIRCRAFT|TYPE ENGINE|"
+        "STATUS CODE|MODE S CODE|FRACT OWNER|AIR WORTH DATE|EXPIRATION DATE|"
+        "UNIQUE ID|KIT MFR|KIT MODEL|MODE S CODE HEX\n"
+    )
+    master_body = master_header + (
+        "512WB|66-1099|1152015|41514|1966|1|EXAMPLE OWNER LLC|100 MAIN ST||"
+        "AUSTIN|TX|78701|2|453|US|20231201|20201115|1N|4|1|V|51465323|N|19660601|"
+        "20260101|00123456|||A66AD3\n"
+    )
+    dereg_body = master_header + (
+        "99SK|12345|1234567|54321|2001|1|GHOST HELI LLC|200 OAK AVE||"
+        "DALLAS|TX|75201|2|113|US|20240101|20210101|1N|6|1|V|00000001|N|20010101|"
+        "20270101|00789012|||000001\n"
+    )
+    acftref_body = (
+        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
+        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("MASTER.txt", master_body)
+        zf.writestr("DEREG.txt", dereg_body)
+        zf.writestr("ACFTREF.txt", acftref_body)
+    path.write_bytes(buf.getvalue())
+
+
+def test_registry_update_from_local_zip(tmp_path):
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    _build_fake_releasable_zip(zip_path)
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    # Progress summary mentions at least the MASTER count.
+    assert "MASTER" in result.output or "master" in result.output.lower()
+
+    with Database(db_path) as db:
+        assert db.get_faa_registry_by_hex("a66ad3") is not None
+        assert db.get_faa_deregistered_by_hex("000001") is not None
+        assert db.get_faa_aircraft_ref("1152015") is not None

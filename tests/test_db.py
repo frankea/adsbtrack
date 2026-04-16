@@ -1088,3 +1088,53 @@ def test_clear_runways_for_airport(db):
     db.clear_runways_for_airport("KSPG")
     remaining = db.conn.execute("SELECT airport_ident FROM runways").fetchall()
     assert {r["airport_ident"] for r in remaining} == {"KATL"}
+
+
+def test_flights_landing_anchor_method_column_exists(db_path):
+    """Schema should include landing_anchor_method on the flights table."""
+    database = Database(db_path)
+    cols = {row[1] for row in database.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert "landing_anchor_method" in cols
+    database.close()
+
+
+def test_insert_flight_persists_landing_anchor_method(db, db_path):
+    """insert_flight should roundtrip the landing_anchor_method value."""
+    from datetime import UTC, datetime
+
+    f = Flight(
+        icao="aaaaaa",
+        takeoff_time=datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+        takeoff_lat=30.0,
+        takeoff_lon=-90.0,
+        takeoff_date="2026-04-16",
+        landing_anchor_method="alt_min",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute("SELECT landing_anchor_method FROM flights WHERE icao = ?", ("aaaaaa",)).fetchone()
+    assert row["landing_anchor_method"] == "alt_min"
+
+
+def test_insert_flight_landing_anchor_method_defaults_to_null(db):
+    """Flights without an explicit method should store NULL."""
+    from datetime import UTC, datetime
+
+    f = Flight(
+        icao="bbbbbb",
+        takeoff_time=datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+        takeoff_lat=30.0,
+        takeoff_lon=-90.0,
+        takeoff_date="2026-04-16",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute("SELECT landing_anchor_method FROM flights WHERE icao = ?", ("bbbbbb",)).fetchone()
+    assert row["landing_anchor_method"] is None
+
+
+def test_config_has_landing_anchor_window_minutes_default():
+    from adsbtrack.config import Config
+
+    cfg = Config()
+    assert cfg.landing_anchor_window_minutes == 10.0

@@ -273,6 +273,12 @@ class Config:
     post_landing_max_points: int = 5  # or this many ground points, whichever first
     baro_error_geom_threshold_ft: float = 300.0  # geom > this while baro=ground is a baro error
 
+    # --- landing airport matching anchor ---
+    # Final-N-minute window used by adsbtrack.landing_anchor.compute_landing_anchor
+    # to find the altitude-minimum point for airport matching. 10 min is a
+    # reasonable default for most approach profiles.
+    landing_anchor_window_minutes: float = 10.0
+
     # Endurance
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown
     type_endurance_minutes: dict[str, float] = field(default_factory=lambda: dict(TYPE_ENDURANCE_MINUTES))

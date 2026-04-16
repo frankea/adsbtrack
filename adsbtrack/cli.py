@@ -496,11 +496,27 @@ def registry():
 @click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
 def registry_update(zip_path, db_path):
     """Download the FAA ReleasableAircraft.zip and (re)import MASTER/DEREG/ACFTREF."""
+    import sqlite3
+    import zipfile
+
+    import httpx
+
     from .registry import refresh_faa_registry
 
     cfg = Config(db_path=Path(db_path))
-    with Database(cfg.db_path) as db:
-        stats = refresh_faa_registry(db, cfg, local_zip=zip_path)
+    try:
+        with Database(cfg.db_path) as db:
+            stats = refresh_faa_registry(db, cfg, local_zip=zip_path)
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"failed to download FAA registry: {e}") from e
+    except zipfile.BadZipFile as e:
+        raise click.ClickException(f"FAA registry zip is corrupt: {e}") from e
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+    except sqlite3.DatabaseError as e:
+        raise click.ClickException(f"database error: {e}") from e
+    except OSError as e:
+        raise click.ClickException(f"filesystem error: {e}") from e
     console.print(
         f"[green]FAA registry loaded:[/] MASTER {stats['master']}, DEREG {stats['dereg']}, ACFTREF {stats['acftref']}"
     )

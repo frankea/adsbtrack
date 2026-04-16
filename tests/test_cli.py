@@ -131,6 +131,23 @@ def test_registry_update_from_local_zip(tmp_path):
         assert db.get_faa_aircraft_ref("1152015") is not None
 
 
+def test_registry_update_reports_corrupt_zip(tmp_path):
+    """A corrupt local zip should produce a friendly error, not a traceback."""
+    bad_zip = tmp_path / "bad.zip"
+    bad_zip.write_bytes(b"not actually a zip file")
+    db_path = tmp_path / "t.db"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["registry", "update", "--zip", str(bad_zip), "--db", str(db_path)],
+    )
+    assert result.exit_code != 0
+    assert "corrupt" in result.output.lower()
+    # Tracebacks should be suppressed by ClickException.
+    assert "Traceback" not in result.output
+
+
 def test_registry_lookup_by_hex(tmp_path):
     zip_path = tmp_path / "ReleasableAircraft.zip"
     _build_fake_releasable_zip(zip_path)

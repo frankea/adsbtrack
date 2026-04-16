@@ -331,6 +331,34 @@ def status(hex_code, db_path):
             console.print(f"  Owner:         {td['owner_operator']}")
             console.print()
 
+        # FAA registry block: show registrant, address, cert info when
+        # we have FAA data loaded. Also flag deregistered hexes so the
+        # user knows the aircraft was pulled from the registry (common
+        # in the ghost-helicopter pattern).
+        faa_reg = db.get_faa_registry_by_hex(hex_code)
+        faa_dereg = db.get_faa_deregistered_by_hex(hex_code)
+        if faa_reg or faa_dereg:
+            source = faa_reg or faa_dereg
+            label = "FAA registry" if faa_reg else "FAA registry (DEREGISTERED)"
+            color = "cyan" if faa_reg else "red"
+            console.print(f"\n[bold {color}]{label}[/]\n")
+            tail = f"N{source['n_number']}" if source["n_number"] else "-"
+            console.print(f"  Tail:          {tail}")
+            console.print(f"  Registrant:    {source['name'] or '-'}")
+            street_line = source["street"] or ""
+            if source["street2"]:
+                street_line = (street_line + " " + source["street2"]).strip()
+            city_state_zip = " ".join(p for p in (source["city"], source["state"], source["zip_code"]) if p)
+            console.print(f"  Address:       {street_line or '-'}")
+            if city_state_zip:
+                console.print(f"                 {city_state_zip}")
+            console.print(f"  Cert issued:   {source['cert_issue_date'] or '-'}")
+            console.print(f"  Last action:   {source['last_action_date'] or '-'}")
+            console.print(f"  Expiration:    {source['expiration_date'] or '-'}")
+            # Second line of deregistration context when both are present.
+            if faa_reg and faa_dereg:
+                console.print("  [dim yellow]Note: prior deregistration record also on file[/]")
+
         console.print(f"  Date range:    {first_date or 'N/A'} to {last_date or 'N/A'}")
         console.print(f"  Days checked:  {total_fetched}")
         console.print(f"  Days w/ data:  {days_with_data}")

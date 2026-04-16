@@ -810,5 +810,174 @@ def registry_address(street, city, state, limit, db_path):
         _print_registry_summary_rows(rows, empty_message=msg)
 
 
+# -----------------------------------------------------------------------------
+# Hex cross-reference enrichment
+# -----------------------------------------------------------------------------
+
+
+def _print_hex_crossref_row(row) -> None:
+    """Pretty-print a hex_crossref sqlite3.Row."""
+    source = row["source"] or "-"
+    if row["is_military"]:
+        console.print(f"\n[bold red]Military aircraft ({source})[/]")
+    else:
+        console.print(f"\n[bold green]Aircraft identity ({source})[/]")
+    console.print(f"  ICAO hex:        {row['icao']}")
+    console.print(f"  Registration:    {row['registration'] or '-'}")
+    console.print(f"  Type code:       {row['type_code'] or '-'}")
+    console.print(f"  Type:            {row['type_description'] or '-'}")
+    console.print(f"  Operator:        {row['operator'] or '-'}")
+    if row["is_military"]:
+        console.print(f"  [yellow]Mil country:    {row['mil_country'] or '-'}[/]")
+        console.print(f"  [yellow]Mil branch:     {row['mil_branch'] or '-'}[/]")
+    console.print(f"  Last updated:    {row['last_updated'] or '-'}")
+
+
+@cli.group()
+def enrich():
+    """Hex cross-reference enrichment (FAA / Mictronics / hexdb.io)."""
+
+
+@enrich.command("hex")
+@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--db", "db_path", default="adsbtrack.db")
+@click.option(
+    "--mictronics-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory holding Mictronics JSON files (defaults to config path).",
+)
+@click.option("--no-hexdb", is_flag=True, help="Skip the hexdb.io live lookup.")
+def enrich_hex_cmd(hex_code, db_path, mictronics_dir, no_hexdb):
+    """Enrich a single ICAO hex. Prefers FAA registry, then Mictronics, then hexdb.io."""
+    from .hex_crossref import HexdbClient, _load_mictronics_files, enrich_hex
+
+    cfg = Config(db_path=Path(db_path))
+    resolved_mictronics = mictronics_dir or cfg.mictronics_cache_dir
+    mictronics_cache = None
+    if (resolved_mictronics / "aircrafts.json").exists():
+        aircrafts, types, operators, _ = _load_mictronics_files(resolved_mictronics)
+        mictronics_cache = (aircrafts, types, operators)
+
+    hexdb_client: HexdbClient | None = None
+    if not no_hexdb:
+        hexdb_client = HexdbClient(base_url=cfg.hexdb_base_url, rate_limit_per_min=cfg.hexdb_rate_limit_per_min)
+
+    try:
+        with Database(cfg.db_path) as db:
+            row, conflicts = enrich_hex(
+                db,
+                hex_code,
+                hexdb_client=hexdb_client,
+                mictronics_cache=mictronics_cache,
+            )
+    finally:
+        if hexdb_client is not None:
+            hexdb_client.close()
+
+    if row is None:
+        console.print(f"[yellow]No data found for {hex_code}[/]")
+        return
+    _print_hex_crossref_row(row)
+    if conflicts:
+        console.print("\n[bold yellow]Source conflicts:[/]")
+        for note in conflicts:
+            console.print(f"  - {note}")
+
+
+@enrich.command("all")
+@click.option("--db", "db_path", default="adsbtrack.db")
+@click.option(
+    "--mictronics-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory holding Mictronics JSON files (defaults to config path).",
+)
+@click.option("--no-hexdb", is_flag=True, help="Skip hexdb.io live lookups (Mictronics only).")
+@click.option("--download-mictronics", is_flag=True, help="Refresh the Mictronics cache before running.")
+def enrich_all_cmd(db_path, mictronics_dir, no_hexdb, download_mictronics):
+    """Backfill hex_crossref for every icao in trace_days / flights missing an entry."""
+    from .hex_crossref import download_mictronics as dl_mictronics
+    from .hex_crossref import enrich_all
+
+    cfg = Config(db_path=Path(db_path))
+    resolved_mictronics = mictronics_dir or cfg.mictronics_cache_dir
+    if download_mictronics:
+        console.print(f"Downloading Mictronics DB into {resolved_mictronics}...")
+        dl_mictronics(cfg, cache_dir=resolved_mictronics)
+
+    with Database(cfg.db_path) as db:
+        stats = enrich_all(
+            db,
+            cfg=cfg,
+            mictronics_cache_dir=resolved_mictronics,
+            use_hexdb=not no_hexdb,
+        )
+    console.print(
+        f"[green]Enrich complete.[/] Processed {stats['processed']}, "
+        f"wrote {stats['written']}, no_data {stats['no_data']}, "
+        f"conflicts {stats['conflicts']}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Military hex range checks
+# -----------------------------------------------------------------------------
+
+
+@cli.group()
+def mil():
+    """Check ICAO hex codes against known military allocation ranges."""
+
+
+@mil.command("hex")
+@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--db", "db_path", default="adsbtrack.db")
+def mil_hex_cmd(hex_code, db_path):
+    """Check whether a single hex falls into a known military range."""
+    with Database(Path(db_path)) as db:
+        row = db.lookup_mil_hex_range(hex_code)
+    if row is None:
+        console.print(f"[green]{hex_code.lower()} is not in any known military range.[/]")
+        return
+    console.print(f"\n[bold red]Military hex: {hex_code.lower()}[/]")
+    console.print(f"  Range:    {row['range_start']}-{row['range_end']}")
+    console.print(f"  Country:  {row['country']}")
+    console.print(f"  Branch:   {row['branch']}")
+    console.print(f"  Notes:    {row['notes']}")
+
+
+@mil.command("scan")
+@click.option("--db", "db_path", default="adsbtrack.db")
+def mil_scan_cmd(db_path):
+    """Scan every icao in trace_days / flights against military ranges.
+
+    Prints a table of matches. Useful for finding government / military
+    aircraft hiding in an otherwise-civilian trace dataset.
+    """
+    from rich.table import Table
+
+    with Database(Path(db_path)) as db:
+        icaos = db.get_all_icaos()
+        matches = []
+        for icao in icaos:
+            row = db.lookup_mil_hex_range(icao)
+            if row is not None:
+                matches.append((icao, row["country"], row["branch"], row["notes"]))
+
+    if not matches:
+        console.print(f"[green]No military hexes found across {len(icaos)} aircraft.[/]")
+        return
+
+    table = Table(title=f"Military hexes ({len(matches)} of {len(icaos)} aircraft)")
+    table.add_column("ICAO", style="cyan")
+    table.add_column("Country", style="yellow")
+    table.add_column("Branch", style="magenta")
+    table.add_column("Notes", style="dim")
+    for icao, country, branch, notes in matches:
+        table.add_row(icao, country or "-", branch or "-", notes or "-")
+    console.print(table)
+
+
 if __name__ == "__main__":
     cli()

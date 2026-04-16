@@ -548,3 +548,128 @@ def test_status_shows_acars_section(tmp_path):
     assert result.exit_code == 0, result.output
     assert "ACARS" in result.output
     assert "5" in result.output  # message count
+
+
+# ---------------------------------------------------------------------------
+# enrich / mil commands
+# ---------------------------------------------------------------------------
+
+
+def _write_mictronics_fixture(cache_dir):
+    import json
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    (cache_dir / "aircrafts.json").write_text(
+        json.dumps(
+            {
+                "a66ad3": ["N512WB", "PC12", "00"],
+                "c01234": ["C-ABCD", "B737", "00"],
+            }
+        )
+    )
+    (cache_dir / "types.json").write_text(
+        json.dumps({"PC12": ["PILATUS PC-12", "M", "L"], "B737": ["BOEING 737", "M", "L"]})
+    )
+    (cache_dir / "operators.json").write_text("{}")
+    (cache_dir / "dbversion.json").write_text(json.dumps({"version": "20260101"}))
+
+
+def test_enrich_hex_uses_mictronics_cache(tmp_path):
+    """`enrich hex` with a Mictronics cache fills the row."""
+    db_path = tmp_path / "t.db"
+    cache_dir = tmp_path / "mictronics"
+    _write_mictronics_fixture(cache_dir)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "enrich",
+            "hex",
+            "--hex",
+            "a66ad3",
+            "--mictronics-dir",
+            str(cache_dir),
+            "--no-hexdb",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "N512WB" in result.output
+    assert "PILATUS PC-12" in result.output
+
+
+def test_enrich_hex_no_data_reports_yellow(tmp_path):
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["enrich", "hex", "--hex", "a66ad3", "--no-hexdb", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "no data" in result.output.lower()
+
+
+def test_enrich_hex_military_flags_military(tmp_path):
+    """A seeded military range should flag is_military regardless of identity sources."""
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["enrich", "hex", "--hex", "ae1234", "--no-hexdb", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Military" in result.output
+    assert "United States" in result.output
+
+
+def test_mil_hex_reports_range(tmp_path):
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mil", "hex", "--hex", "ae1234", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Military hex" in result.output
+    assert "United States" in result.output
+
+
+def test_mil_hex_civilian_is_clear(tmp_path):
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mil", "hex", "--hex", "a66ad3", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "not in any known military range" in result.output
+
+
+def test_mil_scan_finds_military_aircraft(tmp_path):
+    from datetime import UTC, datetime
+
+    from adsbtrack.db import Database
+    from adsbtrack.models import Flight
+
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ae1234",
+                takeoff_time=datetime(2022, 6, 15, 12, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-118.0,
+                takeoff_date="2022-06-15",
+            )
+        )
+        db.insert_flight(
+            Flight(
+                icao="a66ad3",
+                takeoff_time=datetime(2022, 6, 15, 13, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-118.0,
+                takeoff_date="2022-06-15",
+            )
+        )
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["mil", "scan", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "ae1234" in result.output
+    assert "United States" in result.output

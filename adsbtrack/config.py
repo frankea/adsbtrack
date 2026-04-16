@@ -228,6 +228,10 @@ class Config:
     airports_csv_url: str = "https://davidmegginson.github.io/ourairports-data/airports.csv"
     faa_registry_url: str = "https://registry.faa.gov/database/ReleasableAircraft.zip"
     faa_registry_cache_path: Path = Path(".cache/ReleasableAircraft.zip")
+    mictronics_base_url: str = "https://raw.githubusercontent.com/Mictronics/readsb-protobuf/dev/webapp/src/db"
+    mictronics_cache_dir: Path = Path(".cache/mictronics")
+    hexdb_base_url: str = "https://hexdb.io"
+    hexdb_rate_limit_per_min: int = 60
     rate_limit: float = 0.5  # seconds between requests
     rate_limit_max: float = 30.0  # max backoff after 429s
     rate_limit_recovery: int = 10  # successes before reducing delay

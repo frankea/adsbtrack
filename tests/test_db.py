@@ -927,3 +927,87 @@ def test_update_registry_airframes_id(db):
     db.commit()
     row = db.conn.execute("SELECT airframes_id FROM aircraft_registry WHERE icao = ?", ("06A0A5",)).fetchone()
     assert row["airframes_id"] == 14166
+
+
+# ---------------------------------------------------------------------------
+# hex_crossref / mil_hex_ranges
+# ---------------------------------------------------------------------------
+
+
+def test_mil_hex_ranges_seeded_on_init(db):
+    """Fresh Database should have the curated military ranges loaded."""
+    count = db.conn.execute("SELECT COUNT(*) FROM mil_hex_ranges").fetchone()[0]
+    assert count >= 20, f"expected >=20 seed rows, got {count}"
+
+
+def test_lookup_mil_hex_range_matches_us_dod(db):
+    """US DoD range (AE*) should hit for a generic AE hex."""
+    row = db.lookup_mil_hex_range("AE1234")
+    assert row is not None
+    assert row["country"] == "United States"
+    assert "DoD" in row["branch"]
+
+
+def test_lookup_mil_hex_range_civilian_returns_none(db):
+    """A typical civilian hex must not match any military range."""
+    # N512WB (FAA registered Pilatus PC-12) = a66ad3
+    assert db.lookup_mil_hex_range("a66ad3") is None
+
+
+def test_lookup_mil_hex_range_is_case_insensitive(db):
+    assert db.lookup_mil_hex_range("AE0100") is not None
+    assert db.lookup_mil_hex_range("ae0100") is not None
+
+
+def test_upsert_and_get_hex_crossref(db):
+    db.upsert_hex_crossref(
+        {
+            "icao": "A66AD3",
+            "registration": "N512WB",
+            "type_code": "PC12",
+            "type_description": "PC-12 45",
+            "operator": "Air Pilatus LLC",
+            "source": "faa",
+            "is_military": False,
+            "last_updated": "2026-04-16T10:00:00Z",
+        }
+    )
+    row = db.get_hex_crossref("a66ad3")
+    assert row is not None
+    assert row["registration"] == "N512WB"
+    assert row["type_code"] == "PC12"
+    assert row["is_military"] == 0
+    assert row["source"] == "faa"
+
+
+def test_get_icaos_missing_crossref(db):
+    """Pulls icao codes from trace_days + flights minus those already
+    present in hex_crossref."""
+    from datetime import UTC, datetime
+
+    from adsbtrack.models import Flight
+
+    db.insert_flight(
+        Flight(
+            icao="aaaaaa",
+            takeoff_time=datetime(2022, 6, 15, 12, 0, 0, tzinfo=UTC),
+            takeoff_lat=35.0,
+            takeoff_lon=-118.0,
+            takeoff_date="2022-06-15",
+        )
+    )
+    db.insert_flight(
+        Flight(
+            icao="bbbbbb",
+            takeoff_time=datetime(2022, 6, 15, 13, 0, 0, tzinfo=UTC),
+            takeoff_lat=35.0,
+            takeoff_lon=-118.0,
+            takeoff_date="2022-06-15",
+        )
+    )
+    # aaaaaa already has a crossref entry
+    db.upsert_hex_crossref({"icao": "aaaaaa", "registration": "N-A", "source": "faa"})
+
+    missing = db.get_icaos_missing_crossref()
+    assert "bbbbbb" in missing
+    assert "aaaaaa" not in missing

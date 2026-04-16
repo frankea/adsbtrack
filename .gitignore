@@ -36,3 +36,9 @@ htmlcov/
 
 # Worktrees for isolated feature development
 .worktrees/
+
+# FAA registry download cache
+.cache/
+
+# Scratch notes and per-aircraft analysis scribbles
+notes/

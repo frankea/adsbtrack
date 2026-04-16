@@ -642,6 +642,16 @@ def test_search_faa_registry_by_address(tmp_path):
         assert {m["n_number"] for m in matches} == {"1A", "2A"}
 
 
+def test_search_faa_registry_by_address_requires_filter(tmp_path):
+    """Calling with no filters should raise, not silently full-scan."""
+    import pytest
+
+    from adsbtrack.db import Database
+
+    with Database(tmp_path / "t.db") as db, pytest.raises(ValueError, match="at least one"):
+        db.search_faa_registry_by_address()
+
+
 def test_insert_and_check_faa_deregistered(tmp_path):
     from adsbtrack.db import Database
     from adsbtrack.registry import MASTER_COLUMNS

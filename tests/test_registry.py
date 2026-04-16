@@ -258,3 +258,38 @@ def test_refresh_faa_registry_from_local_zip(tmp_path):
         assert db.get_faa_registry_by_hex("a66ad3") is not None
         # Stale row must be gone (truncate ran before the fresh load).
         assert db.get_faa_registry_by_hex("deadbe") is None
+
+
+def test_end_to_end_update_lookup_owner(tmp_path):
+    """One-shot: run `registry update` then `registry lookup` + `registry owner`
+    against the fake zip. Exercises the full wiring, not just the pieces."""
+    from click.testing import CliRunner
+
+    from adsbtrack.cli import cli
+
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    header = _MASTER_HEADER + "\n"
+    # Only EXAMPLE OWNER into MASTER; GHOST HELI goes into DEREG so the owner
+    # search below has no match in faa_registry.
+    master_body = header + _MASTER_ROWS[0] + "\n"
+    dereg_body = header + _MASTER_ROWS[1] + "\n"
+    acftref_body = (
+        "CODE|MFR|MODEL|TYPE-ACFT|TYPE-ENG|AC-CAT|BUILD-CERT-IND|NO-ENG|NO-SEATS|AC-WEIGHT|SPEED\n"
+        "1152015|CESSNA|172|4|1|1||1|4|CLASS 1|140\n"
+    )
+    zip_path.write_bytes(_build_releasable_zip(master_body, dereg_body, acftref_body))
+
+    db_path = tmp_path / "t.db"
+    runner = CliRunner()
+    r = runner.invoke(cli, ["registry", "update", "--zip", str(zip_path), "--db", str(db_path)])
+    assert r.exit_code == 0, r.output
+
+    r = runner.invoke(cli, ["registry", "lookup", "--hex", "a66ad3", "--db", str(db_path)])
+    assert r.exit_code == 0, r.output
+    assert "EXAMPLE OWNER LLC" in r.output
+
+    r = runner.invoke(cli, ["registry", "owner", "--name", "GHOST", "--db", str(db_path)])
+    # GHOST HELI is only in DEREG, not MASTER, so owner search (which hits
+    # faa_registry) should return nothing.
+    assert r.exit_code == 0, r.output
+    assert "no" in r.output.lower() and "match" in r.output.lower()

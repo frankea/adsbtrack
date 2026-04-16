@@ -731,12 +731,18 @@ def infer_destination(
     metrics: FlightMetrics,
     candidates: list,
     config: Config,
+    anchor_lat: float | None = None,
+    anchor_lon: float | None = None,
 ) -> dict:
     """Compute probable destination for signal_lost / dropped_on_approach.
 
     ``candidates`` is a list of airport rows (as returned by
     ``db.find_nearby_airports``) that parser.py has already queried around
-    the last-seen position. This function is pure - no db calls.
+    the anchor position. This function is pure - no db calls.
+
+    ``anchor_lat`` / ``anchor_lon`` override the proximity reference point.
+    When omitted, the function falls back to ``flight.last_seen_lat`` /
+    ``flight.last_seen_lon`` (the historical behavior).
     """
     if flight.landing_type not in ("signal_lost", "dropped_on_approach"):
         return {
@@ -744,7 +750,10 @@ def infer_destination(
             "probable_destination_distance_km": None,
             "probable_destination_confidence": None,
         }
-    if flight.last_seen_lat is None or flight.last_seen_lon is None or not candidates:
+
+    ref_lat = anchor_lat if anchor_lat is not None else flight.last_seen_lat
+    ref_lon = anchor_lon if anchor_lon is not None else flight.last_seen_lon
+    if ref_lat is None or ref_lon is None or not candidates:
         return {
             "probable_destination_icao": None,
             "probable_destination_distance_km": None,
@@ -755,7 +764,7 @@ def infer_destination(
     best = None
     best_dist = float("inf")
     for ap in candidates:
-        d_m = _haversine_m(flight.last_seen_lat, flight.last_seen_lon, ap["latitude_deg"], ap["longitude_deg"])
+        d_m = _haversine_m(ref_lat, ref_lon, ap["latitude_deg"], ap["longitude_deg"])
         d_km = d_m / 1000.0
         if d_km <= max_km and d_km < best_dist:
             best = ap
@@ -768,7 +777,9 @@ def infer_destination(
             "probable_destination_confidence": None,
         }
 
-    # Confidence factors
+    # Confidence factors (altitude factor still uses flight.last_seen_alt_ft
+    # - that is a property of the trace-end, not the anchor - and descent
+    # score is computed from metrics, both unchanged).
     alt = flight.last_seen_alt_ft or 5000
     alt_factor = max(0.0, min(1.0, (5000.0 - alt) / 4500.0))  # 500ft->1.0, 5000ft->0.0
     prox_factor = max(0.0, min(1.0, 1.0 - best_dist / max_km))

@@ -481,5 +481,63 @@ def registry_update(zip_path, db_path):
     )
 
 
+def _print_faa_registry_row(row, *, deregistered: bool) -> None:
+    """Pretty-print a faa_registry / faa_deregistered sqlite3.Row."""
+    heading = "Deregistered aircraft" if deregistered else "Registered aircraft"
+    color = "red" if deregistered else "green"
+    console.print(f"\n[bold {color}]{heading}[/]")
+    tail_display = f"N{row['n_number']}" if row["n_number"] else "(unknown)"
+    console.print(f"  Tail:            {tail_display}")
+    console.print(f"  ICAO hex:        {row['mode_s_code_hex']}")
+    console.print(f"  Serial:          {row['serial_number'] or '-'}")
+    console.print(f"  Registrant:      {row['name'] or '-'}")
+    # Address block
+    street_line = row["street"] or ""
+    if row["street2"]:
+        street_line = (street_line + " " + row["street2"]).strip()
+    city_state = ", ".join(p for p in (row["city"], row["state"]) if p)
+    console.print(f"  Address:         {street_line or '-'}")
+    if city_state or row["zip_code"]:
+        console.print(f"                   {city_state} {row['zip_code'] or ''}".rstrip())
+    console.print(f"  Country:         {row['country'] or '-'}")
+    console.print(f"  Cert issued:     {row['cert_issue_date'] or '-'}")
+    console.print(f"  Last action:     {row['last_action_date'] or '-'}")
+    console.print(f"  Airworthy date:  {row['air_worth_date'] or '-'}")
+    console.print(f"  Expiration:      {row['expiration_date'] or '-'}")
+    console.print(f"  Status code:     {row['status_code'] or '-'}")
+    console.print(f"  MFR/MDL code:    {row['mfr_mdl_code'] or '-'}")
+
+
+@registry.command("lookup")
+@click.option("--hex", "hex_code", default=None, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help="FAA N-number (with or without leading N)")
+@click.option("--db", "db_path", default="adsbtrack.db")
+def registry_lookup(hex_code, tail_number, db_path):
+    """Show full FAA registration for an aircraft, including deregistration status."""
+    if bool(hex_code) == bool(tail_number):
+        raise click.UsageError("Provide exactly one of --hex or --tail.")
+    with Database(Path(db_path)) as db:
+        if hex_code:
+            reg = db.get_faa_registry_by_hex(hex_code)
+            dereg = db.get_faa_deregistered_by_hex(hex_code)
+        else:
+            reg = db.get_faa_registry_by_n_number(tail_number)
+            dereg = db.get_faa_deregistered_by_n_number(tail_number)
+
+        if not reg and not dereg:
+            query = hex_code or tail_number
+            console.print(f"[yellow]No record for {query}[/]")
+            return
+
+        if reg:
+            _print_faa_registry_row(reg, deregistered=False)
+            # Also mention if a deregistered row exists (common when an
+            # aircraft was reregistered with a new owner).
+            if dereg:
+                console.print("\n[dim]Prior deregistration record also on file[/]")
+        else:
+            _print_faa_registry_row(dereg, deregistered=True)
+
+
 if __name__ == "__main__":
     cli()

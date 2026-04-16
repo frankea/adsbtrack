@@ -28,9 +28,6 @@ from rich.progress import Progress
 from .config import Config
 from .db import Database
 
-# Pinned in the plan on 2026-04-16; lives in Config so tests can override.
-OURAIRPORTS_RUNWAYS_URL = "https://davidmegginson.github.io/ourairports-data/runways.csv"
-
 # Order must match db.Database.insert_runway_ends INSERT column order.
 RunwayEnd = tuple[
     str,  # airport_ident
@@ -152,6 +149,15 @@ def parse_runway_row(row: dict[str, str]) -> list[RunwayEnd]:
     return ends
 
 
+def _import_runways_from_reader(db: Database, reader: csv.DictReader) -> int:
+    """Core loop: iterate CSV rows, parse, bulk-insert. Returns count inserted."""
+    ends: list[RunwayEnd] = []
+    for row in reader:
+        ends.extend(parse_runway_row(row))
+    db.insert_runway_ends(ends)
+    return len(ends)
+
+
 def import_runways_from_path(db: Database, path: Path) -> int:
     """Parse a local runways.csv at `path`, upsert every valid end, return
     the count of ends inserted.
@@ -160,13 +166,8 @@ def import_runways_from_path(db: Database, path: Path) -> int:
     the total row count is bounded by the unique-key space, not the call
     count.
     """
-    ends: list[RunwayEnd] = []
     with path.open("r", encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh)
-        for row in reader:
-            ends.extend(parse_runway_row(row))
-    db.insert_runway_ends(ends)
-    return len(ends)
+        return _import_runways_from_reader(db, csv.DictReader(fh))
 
 
 def refresh_runways(
@@ -197,9 +198,6 @@ def refresh_runways(
         progress.update(task, completed=50)
 
         reader = csv.DictReader(io.StringIO(resp.text))
-        ends: list[RunwayEnd] = []
-        for row in reader:
-            ends.extend(parse_runway_row(row))
-        db.insert_runway_ends(ends)
+        count = _import_runways_from_reader(db, reader)
         progress.update(task, completed=100)
-    return len(ends)
+    return count

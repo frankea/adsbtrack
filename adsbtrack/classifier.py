@@ -63,13 +63,20 @@ class PointData:
 
 @dataclass
 class _PointSample:
-    """A lightweight snapshot of a trace point kept for descent scoring."""
+    """A lightweight snapshot of a trace point kept for descent scoring and
+    landing airport anchor selection."""
 
     ts: float  # absolute unix timestamp
     baro_alt: int | None  # None when trace reports 'ground'
     geom_alt: int | None
     gs: float | None
     baro_rate: float | None
+    # Position is used by adsbtrack.landing_anchor to pick the alt-min anchor
+    # for destination airport matching. Defaults to None so any future
+    # constructor that omits them still compiles (existing consumers of
+    # recent_points only read ts / alt / gs / baro_rate).
+    lat: float | None = None
+    lon: float | None = None
 
 
 @dataclass
@@ -278,6 +285,8 @@ class FlightMetrics:
                 geom_alt=int(geom_alt) if isinstance(geom_alt, (int, float)) else None,
                 gs=gs,
                 baro_rate=baro_rate,
+                lat=lat,
+                lon=lon,
             )
         )
 

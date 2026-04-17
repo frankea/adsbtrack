@@ -218,7 +218,7 @@ def test_phase_budget_short_flight_null_cruise():
     m.climb_secs = 30
     m.descent_secs = 30
     m.level_secs = 0
-    m.max_altitude = 1000
+    m._raw_max_altitude = 1000
     m.first_point_ts = 1000.0
     m.last_point_ts = 1060.0  # 60s total - below threshold
     p = compute_phase_budget(m, config=_cfg())
@@ -231,7 +231,7 @@ def test_phase_budget_long_flight_with_cruise():
     m.climb_secs = 300
     m.descent_secs = 300
     m.level_secs = 1200
-    m.max_altitude = 35000
+    m._raw_max_altitude = 35000
     m.first_point_ts = 1000.0
     m.last_point_ts = 10_000.0
     # level_buf samples all in the cruise band (> 70% of 35000)
@@ -473,7 +473,7 @@ def test_phase_budget_rescales_overrun_to_duration():
     m.climb_secs = 600
     m.descent_secs = 600
     m.level_secs = 2580  # all above cruise threshold, goes to cruise_secs
-    m.max_altitude = 35_000
+    m._raw_max_altitude = 35_000
     m.level_buf = [(2580.0, 31_000, 450.0)]  # one big cruise sample
     p = compute_phase_budget(m, config=_cfg())
     phase_sum = (p["climb_secs"] or 0) + (p["descent_secs"] or 0) + (p["level_secs"] or 0) + (p["cruise_secs"] or 0)
@@ -492,7 +492,7 @@ def test_phase_budget_no_inflation_when_underrun():
     m.climb_secs = 300
     m.descent_secs = 300
     m.level_secs = 1680
-    m.max_altitude = 35_000
+    m._raw_max_altitude = 35_000
     m.level_buf = [(1680.0, 31_000, 450.0)]
     p = compute_phase_budget(m, config=_cfg())
     phase_sum = (p["climb_secs"] or 0) + (p["descent_secs"] or 0) + (p["level_secs"] or 0) + (p["cruise_secs"] or 0)

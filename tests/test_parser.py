@@ -753,7 +753,7 @@ def _make_found_mid_flight_fragment(
     metrics.last_seen_lat = end_lat
     metrics.last_seen_lon = end_lon
     metrics.last_airborne_alt = start_alt_ft
-    metrics.max_altitude = start_alt_ft
+    metrics._raw_max_altitude = start_alt_ft
     metrics.takeoff_type = "found_mid_flight"
     return flight, metrics
 

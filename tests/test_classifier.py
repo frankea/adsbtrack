@@ -183,6 +183,61 @@ def test_max_gs_kt_updates_on_sustained_cruise_speed():
 
 
 # ---------------------------------------------------------------------------
+# max_altitude / max_gs_kt are derived from _raw_* / _persisted_*
+# ---------------------------------------------------------------------------
+
+
+def test_max_altitude_reflects_persisted_mutation_without_recompute():
+    """Setting _persisted_max_altitude must be visible immediately via the
+    public max_altitude accessor; no write-through step required."""
+    m = FlightMetrics()
+    m._raw_max_altitude = 12_000
+    assert m.max_altitude == 12_000
+
+    m._persisted_max_altitude = 30_000
+    assert m.max_altitude == 30_000
+
+
+def test_max_altitude_selects_raw_when_persisted_zero_then_persisted_when_set():
+    """max_altitude falls back to _raw_max_altitude only when _persisted is 0."""
+    m = FlightMetrics()
+    assert m.max_altitude == 0
+
+    m._raw_max_altitude = 8_000
+    assert m.max_altitude == 8_000
+
+    m._persisted_max_altitude = 15_000
+    assert m.max_altitude == 15_000
+
+    m._raw_max_altitude = 50_000
+    assert m.max_altitude == 15_000
+
+
+def test_max_gs_kt_reflects_persisted_mutation_without_recompute():
+    """Same invariant as max_altitude: property accessor reflects state mutation."""
+    m = FlightMetrics()
+    m._raw_max_gs_kt = 120
+    assert m.max_gs_kt == 120
+
+    m._persisted_max_gs_kt = 250
+    assert m.max_gs_kt == 250
+
+
+def test_max_gs_kt_selects_raw_when_persisted_zero_then_persisted_when_set():
+    m = FlightMetrics()
+    assert m.max_gs_kt == 0
+
+    m._raw_max_gs_kt = 90
+    assert m.max_gs_kt == 90
+
+    m._persisted_max_gs_kt = 280
+    assert m.max_gs_kt == 280
+
+    m._raw_max_gs_kt = 999
+    assert m.max_gs_kt == 280
+
+
+# ---------------------------------------------------------------------------
 # B4: callsign_changes counts real transitions
 # ---------------------------------------------------------------------------
 

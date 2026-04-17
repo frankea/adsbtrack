@@ -357,9 +357,15 @@ def _stitch_fragments(
                             next_metrics.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
                         if next_metrics.emergency_flag is None and metrics.emergency_flag is not None:
                             next_metrics.emergency_flag = metrics.emergency_flag
-                        # Max altitude of the merged flight is the max of both
-                        if metrics.max_altitude > next_metrics.max_altitude:
-                            next_metrics.max_altitude = metrics.max_altitude
+                        # Max altitude of the merged flight: take the max of
+                        # both dual-track peaks so the derived max_altitude
+                        # property continues to prefer persisted over raw
+                        # after the stitch (preserves the AP-validated
+                        # channel across fragment merges).
+                        if metrics._raw_max_altitude > next_metrics._raw_max_altitude:
+                            next_metrics._raw_max_altitude = metrics._raw_max_altitude
+                        if metrics._persisted_max_altitude > next_metrics._persisted_max_altitude:
+                            next_metrics._persisted_max_altitude = metrics._persisted_max_altitude
                         next_metrics.baro_error_points += metrics.baro_error_points
                         next_metrics.total_ground_points += metrics.total_ground_points
                         next_metrics.ground_speed_while_ground += metrics.ground_speed_while_ground

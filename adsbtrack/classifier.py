@@ -107,14 +107,13 @@ class FlightMetrics:
     adsb_points: int = 0
     mlat_points: int = 0
     tisb_points: int = 0
-    max_altitude: int = 0
-    max_gs_kt: int = 0
-    # v6 fix: dual-track raw and persisted peaks. The raw value is updated
-    # every point (warmup fallback). The persisted value is updated only
-    # when the persistence filter has >= min_samples points in its window.
-    # max_altitude / max_gs_kt use persisted when > 0, else raw. This
-    # corrects the v5 bug where a spike during warmup (< min_samples)
-    # pegged the raw max permanently.
+    # Dual-track raw and persisted peaks. The raw value is updated every
+    # point (warmup fallback). The persisted value is updated only when
+    # the persistence filter has >= min_samples points in its window.
+    # max_altitude / max_gs_kt are computed properties: persisted wins
+    # when > 0, else raw. Deriving rather than writing through closes a
+    # class of bug where a code path updates _raw_/_persisted_ and
+    # forgets to re-assign the public field.
     _raw_max_altitude: int = 0
     _persisted_max_altitude: int = 0
     _raw_max_gs_kt: int = 0
@@ -249,6 +248,14 @@ class FlightMetrics:
     # recent airborne positions for bearing-based heading fallback
     # when track data is unavailable (helicopter hover approaches).
     _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
+
+    @property
+    def max_altitude(self) -> int:
+        return self._persisted_max_altitude if self._persisted_max_altitude > 0 else self._raw_max_altitude
+
+    @property
+    def max_gs_kt(self) -> int:
+        return self._persisted_max_gs_kt if self._persisted_max_gs_kt > 0 else self._raw_max_gs_kt
 
     def record_point(
         self,
@@ -402,10 +409,6 @@ class FlightMetrics:
                     sustained = min(a for _, a in self._alt_persist_window)
                     if sustained > self._persisted_max_altitude:
                         self._persisted_max_altitude = sustained
-                # Public value: persisted wins when available, else raw
-                self.max_altitude = (
-                    self._persisted_max_altitude if self._persisted_max_altitude > 0 else self._raw_max_altitude
-                )
             if isinstance(geom_alt, (int, float)):
                 self.last_airborne_geom = int(geom_alt)
             if gs is not None:
@@ -424,7 +427,6 @@ class FlightMetrics:
                     sustained_gs = int(min(g for _, g in self._gs_persist_window))
                     if sustained_gs > self._persisted_max_gs_kt:
                         self._persisted_max_gs_kt = sustained_gs
-                self.max_gs_kt = self._persisted_max_gs_kt if self._persisted_max_gs_kt > 0 else self._raw_max_gs_kt
             if baro_rate is not None:
                 self.last_airborne_baro_rate = baro_rate
 

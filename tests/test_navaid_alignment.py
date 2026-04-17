@@ -222,10 +222,13 @@ def test_detect_matches_brute_force_and_completes_under_budget():
     reference is O(points × navaids) and is intentionally simple so
     regressions in the optimized path are caught structurally.
 
-    Performance: detector must complete in under 0.7 s. The brute-force
-    reference lands around 0.85 s on a developer laptop; the grid index
-    should come in comfortably under that by pruning navaids that are
-    never within range of any flight point.
+    Performance: detector must be noticeably faster than the brute-force
+    reference (>= 1.3x on the same machine). Using a ratio (rather than an
+    absolute budget) keeps the assertion machine-independent across dev
+    laptops and slower CI runners while still catching a silent regression
+    of the grid index back to O(points x navaids) scan. The margin is
+    intentionally lenient to tolerate scheduling jitter; the correctness
+    assertion above is the primary guard.
     """
     rng = random.Random(20260417)
     track_deg = 75.0
@@ -268,13 +271,18 @@ def test_detect_matches_brute_force_and_completes_under_budget():
             }
         )
 
+    ref_start = time.perf_counter()
     expected = _brute_force_detect(points, navaids)
+    ref_elapsed = time.perf_counter() - ref_start
     # Sanity: dataset must actually exercise segment emission.
     assert len(expected) > 0
 
-    start = time.perf_counter()
+    opt_start = time.perf_counter()
     actual = detect_navaid_alignments(points, navaids=navaids)
-    elapsed = time.perf_counter() - start
+    opt_elapsed = time.perf_counter() - opt_start
 
     assert actual == expected
-    assert elapsed < 0.7, f"detect_navaid_alignments took {elapsed:.2f}s, budget 0.7s"
+    assert opt_elapsed * 1.3 < ref_elapsed, (
+        f"detect_navaid_alignments took {opt_elapsed:.2f}s vs brute force "
+        f"{ref_elapsed:.2f}s; expected at least 1.3x speedup"
+    )

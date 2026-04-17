@@ -1,17 +1,22 @@
 """Geometric navaid-alignment detector.
 
 For each candidate navaid (pre-filtered by bbox to keep cost bounded) the
-algorithm walks ``metrics.recent_points`` and keeps every point whose
+algorithm walks the flight's point stream and keeps every point whose
 bearing-to-navaid lies within a degree or so of the ground track, subject to
 a maximum range. Kept points are split into segments on long gaps, then
 filtered by minimum duration and minimum closest-approach distance. The
 surviving list is this flight's navaid track fingerprint.
 
+Callers pass points directly rather than a ``FlightMetrics``: navaid
+alignment is enroute by nature, so it needs the full per-flight trajectory
+rather than ``FlightMetrics.recent_points`` (a 240-sample tail deque that
+only covers the last ~20 minutes).
+
 Attribution: the geometric idea (|bearing-to-beacon - track| under a
 threshold, split-on-gap, duration + close-pass filter) mirrors xoolive/
 traffic's ``BeaconTrackBearingAlignment`` (MIT-licensed). No code is copied
 from traffic; this module reimplements the algorithm in our style against
-the FlightMetrics / recent_points layer already present in this codebase.
+the ``_PointSample`` layer already present in this codebase.
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from .classifier import FlightMetrics, _PointSample
+from .classifier import _PointSample
 
 _KM_PER_NM = 1.852
 _EARTH_R_KM = 6371.0
@@ -119,7 +124,7 @@ def _alignments_for_navaid(
 
 
 def detect_navaid_alignments(
-    metrics: FlightMetrics,
+    points: Iterable[_PointSample],
     *,
     navaids: Iterable[Mapping[str, object]],
     tolerance_deg: float = 1.0,
@@ -129,8 +134,13 @@ def detect_navaid_alignments(
     near_pass_max_nm: float = 80.0,
 ) -> list[NavaidAlignmentSegment]:
     """Return every qualifying alignment segment across all provided navaids,
-    chronologically ordered by start_ts. Empty list if no segments qualify."""
-    samples = list(metrics.recent_points)
+    chronologically ordered by start_ts. Empty list if no segments qualify.
+
+    ``points`` should be the full chronological per-flight stream. Passing a
+    truncated tail (for example ``FlightMetrics.recent_points``) will cause
+    the algorithm to miss navaids overflown earlier in the flight.
+    """
+    samples = list(points)
     if not samples:
         return []
     max_distance_km = max_distance_nm * _KM_PER_NM

@@ -1165,3 +1165,51 @@ def test_get_runways_for_airport_returns_ordered_rows(tmp_path):
         rows = db.get_runways_for_airport("KFAKE")
     names = [r["runway_name"] for r in rows]
     assert names == ["08R", "26L"]
+
+
+def test_insert_flight_persists_alignment_columns(db):
+    """insert_flight should roundtrip the three alignment columns.
+
+    Guards against the column list / placeholder group / value tuple drifting
+    out of sync for aligned_runway, aligned_seconds, aligned_min_offset_m.
+    A schema-only test won't notice a reordered value tuple; this will.
+    """
+    f = Flight(
+        icao="cccccc",
+        takeoff_time=datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+        takeoff_lat=30.0,
+        takeoff_lon=-90.0,
+        takeoff_date="2026-04-16",
+        aligned_runway="08R",
+        aligned_seconds=45.0,
+        aligned_min_offset_m=23.5,
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT aligned_runway, aligned_seconds, aligned_min_offset_m FROM flights WHERE icao = ?",
+        ("cccccc",),
+    ).fetchone()
+    assert row["aligned_runway"] == "08R"
+    assert row["aligned_seconds"] == 45.0
+    assert row["aligned_min_offset_m"] == 23.5
+
+
+def test_insert_flight_alignment_columns_default_to_null(db):
+    """Flights constructed without alignment kwargs should store NULL for all three."""
+    f = Flight(
+        icao="dddddd",
+        takeoff_time=datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+        takeoff_lat=30.0,
+        takeoff_lon=-90.0,
+        takeoff_date="2026-04-16",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT aligned_runway, aligned_seconds, aligned_min_offset_m FROM flights WHERE icao = ?",
+        ("dddddd",),
+    ).fetchone()
+    assert row["aligned_runway"] is None
+    assert row["aligned_seconds"] is None
+    assert row["aligned_min_offset_m"] is None

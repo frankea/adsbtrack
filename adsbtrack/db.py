@@ -1011,6 +1011,7 @@ class Database:
         return int(row["cnt"])
 
     def get_runways_for_airport(self, airport_ident: str) -> list[sqlite3.Row]:
+        """Return all runway ends for `airport_ident`, ordered by `runway_name`."""
         return self.conn.execute(
             "SELECT * FROM runways WHERE airport_ident = ? ORDER BY runway_name",
             (airport_ident,),

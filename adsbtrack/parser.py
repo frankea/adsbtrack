@@ -1,5 +1,6 @@
 import contextlib
 import json
+import math
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -418,6 +419,54 @@ def _any_climb_between(
     return False
 
 
+def _compute_navaid_track_json(
+    metrics: FlightMetrics,
+    *,
+    db: Database,
+    config: Config,
+    navaid_cache: dict[tuple[int, int, int, int], list],
+) -> str | None:
+    """Emit the navaid_track JSON column value for one flight. Returns None
+    when the flight has no qualifying alignment, so flights with no data
+    stay uniform with legacy rows where the column is NULL."""
+    from .navaid_alignment import detect_navaid_alignments
+    from .navaids import flight_bbox_from_points, query_navaids_in_bbox
+
+    bbox = flight_bbox_from_points(metrics.all_points, buffer_nm=config.navaid_bbox_buffer_nm)
+    if bbox is None:
+        return None
+
+    # Quantize to 0.5 deg so near-duplicate routes share cached navaid rows.
+    key = tuple(int(math.floor(v * 2)) for v in bbox)  # type: ignore[assignment]
+    if key not in navaid_cache:
+        navaid_cache[key] = query_navaids_in_bbox(db.conn, *bbox)
+    navaids = navaid_cache[key]
+    if not navaids:
+        return None
+
+    segments = detect_navaid_alignments(
+        metrics.all_points,
+        navaids=[dict(r) for r in navaids],
+        tolerance_deg=config.navaid_alignment_tolerance_deg,
+        max_distance_nm=config.navaid_max_distance_nm,
+        split_gap_secs=config.navaid_split_gap_secs,
+        min_duration_secs=config.navaid_min_duration_secs,
+        near_pass_max_nm=config.navaid_near_pass_max_nm,
+    )
+    if not segments:
+        return None
+    payload = [
+        {
+            "navaid_ident": s.navaid_ident,
+            "start_ts": s.start_ts,
+            "end_ts": s.end_ts,
+            "min_distance_nm": round(s.min_distance_km / 1.852, 2),
+        }
+        for s in segments
+    ]
+    return json.dumps(payload, ensure_ascii=True)
+
+
 def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
     if reprocess:
         db.clear_flights(hex_code)
@@ -819,6 +868,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # issue 2N DB queries against the same ICAOs.
     airport_elev_cache: dict[str, int | None] = {}
     runway_cache: dict[str, list] = {}
+    navaid_cache: dict[tuple[int, int, int, int], list] = {}
     for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
         has_landing = flight.landing_lat is not None
 
@@ -1154,6 +1204,16 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             and flight.mission_type in ("unknown", "transport", "pattern")
         ):
             flight.mission_type = "pattern"
+
+        # --- Navaid alignment (adsbtrack/navaid_alignment.py) ---
+        # Emits a JSON route fingerprint of navaids the aircraft's ground
+        # track pointed directly toward for long enough to be meaningful.
+        flight.navaid_track = _compute_navaid_track_json(
+            metrics,
+            db=db,
+            config=config,
+            navaid_cache=navaid_cache,
+        )
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
         # v8 N8: cap at 72 hours (4320 min). Anything longer reflects a

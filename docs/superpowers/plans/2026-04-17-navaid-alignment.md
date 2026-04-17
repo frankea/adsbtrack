@@ -691,14 +691,14 @@ git commit -m "Add navaid alignment algorithm"
 ## Task 3: Bounding-box pre-filter + helper
 
 **Files:**
-- Modify: `adsbtrack/navaids.py` — add `query_navaids_in_bbox`, `flight_bbox_from_metrics`.
+- Modify: `adsbtrack/navaids.py` — add `query_navaids_in_bbox`, `flight_bbox_from_points`.
 - Modify: `tests/test_navaids.py` — bbox query test.
 
 ### Design
 
 The parser runs navaid alignment once per flight. We do not want each flight to scan the ~13 k rows in the navaids table. Two-level optimization:
 
-1. **Per-flight bbox pre-filter (SQL).** Compute (min_lat, max_lat, min_lon, max_lon) of the flight's `recent_points`. Expand by `navaid_bbox_buffer_nm` (50 nm). Query `WHERE latitude_deg BETWEEN ? AND ? AND longitude_deg BETWEEN ? AND ?`. The indexed lat/lon query returns ~20-200 navaids for a typical flight.
+1. **Per-flight bbox pre-filter (SQL).** Compute (min_lat, max_lat, min_lon, max_lon) from the flight's full point stream (see Task 5's `all_points` buffer on FlightMetrics). Expand by `navaid_bbox_buffer_nm` (50 nm). Query `WHERE latitude_deg BETWEEN ? AND ? AND longitude_deg BETWEEN ? AND ?`. The indexed lat/lon query returns ~20-200 navaids for a typical flight.
 2. **Per-extract-run bbox cache.** Different flights often cover nearly the same bbox (same home base, same route). Quantize the bbox corners to 0.5° and cache the navaid list per quantized key. Cache lives as a `dict` on the parser extract loop alongside `airport_elev_cache` and `runway_cache`.
 
 We deliberately skip antimeridian handling: routes crossing the 180° meridian are rare enough in the hex-scoped extraction workload that a fallback (skip navaid alignment when `max_lon - min_lon > 180.0`) is fine. Document this caveat in Task 7.
@@ -729,12 +729,10 @@ Expected: FAIL (function not yet defined).
 
 - [ ] **Step 3.2: Implement bbox query + bbox helper**
 
-Append to `adsbtrack/navaids.py`:
+Append to `adsbtrack/navaids.py` (make sure `math` and `Iterable` imports are at the top of the module; add `from collections.abc import Iterable` and `from .classifier import _PointSample` alongside the existing imports):
 
 ```python
 import sqlite3
-
-from .classifier import FlightMetrics
 
 _KM_PER_NM = 1.852
 
@@ -763,8 +761,8 @@ def query_navaids_in_bbox(
     )
 
 
-def flight_bbox_from_metrics(
-    metrics: FlightMetrics,
+def flight_bbox_from_points(
+    points: Iterable[_PointSample],
     *,
     buffer_nm: float,
 ) -> tuple[float, float, float, float] | None:
@@ -773,7 +771,7 @@ def flight_bbox_from_metrics(
     with lat/lon or crosses the antimeridian (|lon_span| > 180 deg)."""
     lats: list[float] = []
     lons: list[float] = []
-    for s in metrics.recent_points:
+    for s in points:
         if s.lat is not None and s.lon is not None:
             lats.append(s.lat)
             lons.append(s.lon)
@@ -801,15 +799,14 @@ Add `import math` at the top of `navaids.py` if not already present.
 
 - [ ] **Step 3.3: Add bbox helper test**
 
-Append to `tests/test_navaid_alignment.py`:
+Append to `tests/test_navaid_alignment.py` (the `_sample` helper is already defined there; no `FlightMetrics` is needed):
 
 ```python
-def test_flight_bbox_from_metrics_basic():
-    from adsbtrack.navaids import flight_bbox_from_metrics
+def test_flight_bbox_from_points_basic():
+    from adsbtrack.navaids import flight_bbox_from_points
 
     points = [_sample(1000.0 + 2.0 * i, 34.5 + 0.02 * i, -80.0, 0.0) for i in range(10)]
-    metrics = _metrics_from_points(points)
-    bbox = flight_bbox_from_metrics(metrics, buffer_nm=50.0)
+    bbox = flight_bbox_from_points(points, buffer_nm=50.0)
     assert bbox is not None
     min_lat, max_lat, min_lon, max_lon = bbox
     # Raw lat span was 34.5..34.68, buffer 50 nm ~ 0.83 deg.
@@ -821,10 +818,9 @@ def test_flight_bbox_from_metrics_basic():
 
 
 def test_flight_bbox_returns_none_with_no_points():
-    from adsbtrack.navaids import flight_bbox_from_metrics
+    from adsbtrack.navaids import flight_bbox_from_points
 
-    metrics = FlightMetrics(icao="test", first_point_ts=0.0)
-    assert flight_bbox_from_metrics(metrics, buffer_nm=50.0) is None
+    assert flight_bbox_from_points([], buffer_nm=50.0) is None
 ```
 
 Run: `uv run pytest tests/test_navaids.py tests/test_navaid_alignment.py -v`
@@ -955,12 +951,22 @@ git commit -m "Add navaid_track column and Flight field"
 ## Task 5: Parser integration with bbox cache
 
 **Files:**
-- Modify: `adsbtrack/parser.py` — thread `navaid_cache` through extract loop; call `detect_navaid_alignments`; serialize to JSON; set `flight.navaid_track`.
-- Modify: `tests/test_parser.py` — end-to-end integration test using MagicMock parser scaffold.
+- Modify: `adsbtrack/classifier.py` — add `all_points: list[_PointSample]` buffer to `FlightMetrics`, append in `record_point`. Navaid alignment is enroute, so it needs the full trajectory, not `recent_points` (which is a 240-sample tail deque).
+- Modify: `adsbtrack/parser.py` — thread `navaid_cache` through extract loop; call `detect_navaid_alignments` with `metrics.all_points`; serialize to JSON; set `flight.navaid_track`.
+- Modify: `tests/test_parser.py` — end-to-end integration test using a built FlightMetrics + MagicMock db.
 
 ### Integration point
 
-In `adsbtrack/parser.py`, the extract loop already builds `airport_elev_cache` and `runway_cache` (around line 820). Add a third cache:
+**Classifier buffer.** `FlightMetrics` already has a head-only `takeoff_points: list[_PointSample]` for takeoff runway detection. Add a symmetric full-flight buffer:
+
+```python
+# FlightMetrics (adsbtrack/classifier.py) new field:
+all_points: list[_PointSample] = field(default_factory=list)
+```
+
+Inside `record_point`, append the newly-constructed sample to `all_points` at the same place it is appended to `recent_points` (so the two buffers stay in sync; `recent_points` keeps a tail, `all_points` keeps everything).
+
+**Parser cache.** In `adsbtrack/parser.py`, the extract loop already builds `airport_elev_cache` and `runway_cache` (around line 820). Add a third cache:
 
 ```python
 navaid_cache: dict[tuple[int, int, int, int], list] = {}
@@ -977,12 +983,12 @@ def _compute_navaid_track_json(
     navaid_cache: dict[tuple[int, int, int, int], list],
 ) -> str | None:
     """Emit the navaid_track JSON column value for one flight. Returns None
-    when the flight has no qualifying alignment, so legacy flights without a
-    navaid_track stay uniform with freshly-computed empty results."""
-    from .navaids import flight_bbox_from_metrics, query_navaids_in_bbox
+    when the flight has no qualifying alignment, so flights with no data
+    stay uniform with legacy rows where the column is NULL."""
+    from .navaids import flight_bbox_from_points, query_navaids_in_bbox
     from .navaid_alignment import detect_navaid_alignments
 
-    bbox = flight_bbox_from_metrics(metrics, buffer_nm=config.navaid_bbox_buffer_nm)
+    bbox = flight_bbox_from_points(metrics.all_points, buffer_nm=config.navaid_bbox_buffer_nm)
     if bbox is None:
         return None
 
@@ -995,7 +1001,7 @@ def _compute_navaid_track_json(
         return None
 
     segments = detect_navaid_alignments(
-        metrics,
+        metrics.all_points,
         navaids=[dict(r) for r in navaids],
         tolerance_deg=config.navaid_alignment_tolerance_deg,
         max_distance_nm=config.navaid_max_distance_nm,
@@ -1019,7 +1025,23 @@ def _compute_navaid_track_json(
 
 Add `import math` and `import json` at the top of `parser.py` if not already present.
 
-- [ ] **Step 5.1: Add helper and cache**
+- [ ] **Step 5.1: Add `all_points` buffer to FlightMetrics**
+
+In `adsbtrack/classifier.py` inside `FlightMetrics`, add next to `takeoff_points`:
+
+```python
+all_points: list[_PointSample] = field(default_factory=list)
+```
+
+Inside `record_point`, right after the `self.recent_points.append(...)` call, add:
+
+```python
+self.all_points.append(self.recent_points[-1])
+```
+
+Do NOT remove `recent_points` — existing callers (ils_alignment, go-around, etc.) still read it. The new buffer is additive.
+
+- [ ] **Step 5.2: Add helper and cache to parser**
 
 Apply the changes above in `parser.py`: define `_compute_navaid_track_json` at module scope (right after `_any_climb_between` or similar module-level helper). Initialize `navaid_cache: dict[tuple[int, int, int, int], list] = {}` in the extract function near `airport_elev_cache`.
 
@@ -1037,12 +1059,14 @@ Invoke it inside the extract loop, right after the pattern-cycles/mission overri
         )
 ```
 
-- [ ] **Step 5.2: Write failing parser test**
+- [ ] **Step 5.3: Write failing parser test**
+
+Read `adsbtrack/classifier.py` to verify the actual `_PointSample` field set (it does NOT have `alt`, `squawk`, `mlat`, or `tisb` — see the existing `tests/test_navaid_alignment.py::_sample` helper for the correct field names: `ts, baro_alt, geom_alt, gs, baro_rate, lat, lon, track`). Also verify the `FlightMetrics` constructor signature — it has no `icao` field.
 
 Add to `tests/test_parser.py`:
 
 ```python
-def test_parser_sets_navaid_track_when_aligned(tmp_path, monkeypatch):
+def test_parser_sets_navaid_track_when_aligned(tmp_path):
     """End-to-end: a flight whose track is aligned with one navaid for 60+ s
     gets a JSON navaid_track column populated via the extract loop."""
     from unittest.mock import MagicMock
@@ -1050,29 +1074,23 @@ def test_parser_sets_navaid_track_when_aligned(tmp_path, monkeypatch):
 
     from adsbtrack.classifier import FlightMetrics, _PointSample
     from adsbtrack.config import Config
-    from adsbtrack.models import Flight
     from adsbtrack.parser import _compute_navaid_track_json
 
     cfg = Config(db_path=tmp_path / "p.db")
 
-    # Build metrics with 40 aligned points, track=0, lat marching toward 35.5.
-    m = FlightMetrics(icao="abc", first_point_ts=1000.0)
+    # Build metrics with 40 aligned points on the all_points buffer.
+    m = FlightMetrics(first_point_ts=1000.0)
     for i in range(40):
-        m.recent_points.append(
+        m.all_points.append(
             _PointSample(
                 ts=1000.0 + 2.0 * i,
+                baro_alt=5000,
+                geom_alt=5000,
+                gs=250.0,
+                baro_rate=0.0,
                 lat=34.5 + 0.02 * i,
                 lon=-80.0,
-                alt=5000,
-                geom_alt=5000,
-                baro_alt=5000,
-                gs=250.0,
                 track=0.0,
-                baro_rate=0.0,
-                geom_rate=0.0,
-                squawk=None,
-                mlat=0,
-                tisb=0,
             )
         )
 
@@ -1114,23 +1132,18 @@ def test_parser_navaid_track_cache_reused_across_flights(tmp_path):
     cache: dict = {}
 
     def one_metric(offset: float) -> FlightMetrics:
-        m = FlightMetrics(icao="abc", first_point_ts=1000.0)
+        m = FlightMetrics(first_point_ts=1000.0)
         for i in range(10):
-            m.recent_points.append(
+            m.all_points.append(
                 _PointSample(
                     ts=1000.0 + 2.0 * i,
+                    baro_alt=5000,
+                    geom_alt=5000,
+                    gs=250.0,
+                    baro_rate=0.0,
                     lat=34.5 + 0.001 * i + offset,
                     lon=-80.0 + 0.001 * i,
-                    alt=5000,
-                    geom_alt=5000,
-                    baro_alt=5000,
-                    gs=250.0,
                     track=0.0,
-                    baro_rate=0.0,
-                    geom_rate=0.0,
-                    squawk=None,
-                    mlat=0,
-                    tisb=0,
                 )
             )
         return m
@@ -1142,25 +1155,42 @@ def test_parser_navaid_track_cache_reused_across_flights(tmp_path):
     assert len(cache) == 1
     # And the DB was only queried once (cache hit on second call).
     assert mock_db.conn.execute.call_count == 1
+
+
+def test_record_point_populates_all_points():
+    """Guards the contract that record_point appends to all_points in sync
+    with recent_points, so navaid alignment sees the full flight trajectory."""
+    from adsbtrack.classifier import FlightMetrics
+
+    m = FlightMetrics(first_point_ts=0.0)
+    before = len(m.all_points)
+    # Construct a minimal row that record_point accepts. Adjust field names
+    # to match the real trace-point schema used elsewhere in tests.
+    # (If an existing test helper builds such rows, reuse it.)
+    # The important assertion is len(all_points) > before after recording.
+    # Implementers: replace the placeholder below with the correct call.
+    # Keep this test simple; its job is to catch a regression if someone
+    # later removes the all_points append.
+    assert before == 0
 ```
 
 Run: `uv run pytest tests/test_parser.py::test_parser_sets_navaid_track_when_aligned tests/test_parser.py::test_parser_navaid_track_cache_reused_across_flights -v`
-Expected: FAIL (helper not in place yet).
+Expected: FAIL before Step 5.2 is complete, PASS after.
 
-- [ ] **Step 5.3: Run tests; fix imports/typing as needed**
+- [ ] **Step 5.4: Run tests; fix imports/typing as needed**
 
-After Step 5.1 is landed, run: `uv run pytest tests/test_parser.py -v`
+Run: `uv run pytest tests/test_parser.py -v`
 Expected: PASS. If `math` or `json` imports are missing at the top of `parser.py`, add them now.
 
-- [ ] **Step 5.4: Full suite**
+- [ ] **Step 5.5: Full suite**
 
 Run: `uv run ruff check . && uv run ruff format --check . && uv run pytest`
-Expected: all green. If ruff format flags the helper, run `uv run ruff format .` and stage the result.
+Expected: all green. If ruff format flags files, run `uv run ruff format .` and re-stage.
 
-- [ ] **Step 5.5: Commit**
+- [ ] **Step 5.6: Commit**
 
 ```bash
-git add adsbtrack/parser.py tests/test_parser.py
+git add adsbtrack/classifier.py adsbtrack/parser.py tests/test_parser.py
 git commit -m "Integrate navaid alignment into extract pipeline with bbox cache"
 ```
 

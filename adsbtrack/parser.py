@@ -437,7 +437,13 @@ def _compute_navaid_track_json(
         return None
 
     # Quantize to 0.5 deg so near-duplicate routes share cached navaid rows.
-    key = tuple(int(math.floor(v * 2)) for v in bbox)  # type: ignore[assignment]
+    min_lat, max_lat, min_lon, max_lon = bbox
+    key: tuple[int, int, int, int] = (
+        int(math.floor(min_lat * 2)),
+        int(math.floor(max_lat * 2)),
+        int(math.floor(min_lon * 2)),
+        int(math.floor(max_lon * 2)),
+    )
     if key not in navaid_cache:
         navaid_cache[key] = query_navaids_in_bbox(db.conn, *bbox)
     navaids = navaid_cache[key]

@@ -56,6 +56,14 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 
 **Squawks.** `squawk_first` / `squawk_last`, `squawk_changes` (transition count), `emergency_squawk` (most severe of any 7500/7600/7700), `vfr_flight` (1 when >= 80% of squawks were 1200).
 
+**Squawk signals.** `squawks_observed`, `had_emergency`, `primary_squawk`, plus the pre-existing `squawk_first`, `squawk_last`, `squawk_changes`, `emergency_squawk`, `vfr_flight`. Every trace point carries a transponder squawk code; the extractor credits each point's inter-point interval to the then-held code and emits three new aggregate columns at end of flight.
+
+- `squawks_observed` is a JSON-encoded sorted list of every unique squawk code seen, e.g. `'["1200","5201","7700"]'`. NULL when the flight carried no squawk data.
+- `had_emergency = 1` when any of the three emergency codes (7500 hijack, 7600 radio failure, 7700 emergency) appeared at any point. Independent of `emergency_squawk`, which records the single most-severe code observed.
+- `primary_squawk` is the squawk held for the greatest cumulative duration. On exact duration ties the alphabetically earliest code wins (deterministic). For steady-state VFR flights this is typically "1200" (US) or "7000" (EU); for flights with ATC handoffs it is the code held for the longest single segment.
+
+These columns are diagnostic only and do not feed into mission classification or confidence scoring. Military-allocation squawks (US 4000-4777 block, MODE 3/A) are persisted in `squawks_observed` like any other code; the extractor deliberately does not tag or visually highlight them.
+
 **Callsigns.** `callsigns` is a JSON array of distinct callsigns seen. `callsign_changes` is capped at `max(0, distinct - 1)` so ping-pong flicker doesn't inflate the count. `callsign_count` is the distinct count.
 
 **Probable destination.** For `signal_lost` and `dropped_on_approach` flights, `probable_destination_icao` is inferred from the last-seen position with a separate confidence score based on altitude, distance, and descent rate.

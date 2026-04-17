@@ -66,6 +66,9 @@ Extracted flights with airport matching, quality classification, confidence scor
 | squawk_changes | INTEGER | Number of transitions between distinct squawks |
 | emergency_squawk | TEXT | Most severe of any 7500/7600/7700 observed |
 | vfr_flight | INTEGER | 1 when >= 80% of squawks were 1200 |
+| squawks_observed | TEXT | JSON-encoded sorted list of unique squawk codes seen during the flight. NULL when no squawk data was observed or for legacy rows. |
+| had_emergency | INTEGER | 1 when any of 7500 / 7600 / 7700 appeared at any point, 0 otherwise. NULL for legacy rows. |
+| primary_squawk | TEXT | Squawk code held for the longest cumulative duration during the flight. NULL when no squawk data was observed or for legacy rows. |
 | mission_type | TEXT | `ems_hems` / `offshore` / `exec_charter` / `training` / `survey` / `pattern` / `transport` / `unknown` |
 | category_do260 | TEXT | DO-260B category (A0-B7) |
 | autopilot_target_alt_ft | INTEGER | Last `nav_altitude_mcp` before first sustained descent |

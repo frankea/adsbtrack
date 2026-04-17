@@ -19,8 +19,12 @@ from rich.progress import Progress
 from .config import Config
 from .db import Database
 
+# Row shape matches the INSERT OR REPLACE column order below:
+# (ident, name, type, latitude_deg, longitude_deg, elevation_ft, frequency_khz, iso_country).
+NavaidRow = tuple[str, str | None, str | None, float, float, int | None, int | None, str | None]
 
-def _parse_row(row: dict) -> tuple | None:
+
+def _parse_row(row: dict) -> NavaidRow | None:
     try:
         lat = float(row["latitude_deg"])
         lon = float(row["longitude_deg"])
@@ -49,9 +53,9 @@ def _parse_row(row: dict) -> tuple | None:
     )
 
 
-def _read_csv(text: str) -> list[tuple]:
+def _read_csv(text: str) -> list[NavaidRow]:
     reader = csv.DictReader(io.StringIO(text))
-    rows: list[tuple] = []
+    rows: list[NavaidRow] = []
     for raw in reader:
         parsed = _parse_row(raw)
         if parsed is not None:
@@ -71,7 +75,7 @@ def refresh_navaids(
     rows with identical primary key (ident, latitude_deg, longitude_deg).
     """
     if local_csv is not None:
-        text = Path(local_csv).read_text()
+        text = Path(local_csv).read_text(encoding="utf-8")
     else:
         with Progress() as progress:
             task = progress.add_task("Downloading navaids...", total=None)

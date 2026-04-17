@@ -292,7 +292,7 @@ class FlightMetrics:
                 baro_rate=baro_rate,
                 lat=lat,
                 lon=lon,
-                track=float(point.track) if point.track is not None else None,
+                track=point.track,
             )
         )
 

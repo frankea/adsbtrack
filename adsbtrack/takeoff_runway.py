@@ -175,6 +175,7 @@ def detect_takeoff_runway(
     *,
     airport_elev_ft: float,
     runway_ends: Iterable[Mapping[str, object]],
+    config=None,
     max_ft_above_airport: float = 2000.0,
     zone_length_m: float = 6000.0,
     little_base_m: float = 50.0,
@@ -187,7 +188,18 @@ def detect_takeoff_runway(
 
     Assumes ``metrics.takeoff_points`` is in chronological order (it is, by
     ``FlightMetrics.record_point``'s append-only contract).
+
+    When ``config`` is supplied, any threshold kwarg not explicitly passed
+    is sourced from the corresponding ``Config.takeoff_runway_*`` field.
+    ``min_gs_kt`` is runtime-computed (scales by type), so callers always
+    pass it explicitly.
     """
+    if config is not None:
+        max_ft_above_airport = config.takeoff_runway_max_ft_above_airport
+        zone_length_m = config.takeoff_runway_zone_length_m
+        little_base_m = config.takeoff_runway_little_base_m
+        opening_deg = config.takeoff_runway_opening_deg
+        min_vert_rate_fpm = config.takeoff_runway_min_vert_rate_fpm
     filtered = _filter_takeoff_samples(
         metrics.takeoff_points,
         airport_elev_ft=airport_elev_ft,

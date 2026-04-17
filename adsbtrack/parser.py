@@ -883,14 +883,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flight.landing_type = classify_landing(
             metrics,
             has_landing,
+            config=config,
             duration_minutes=flight.duration_minutes,
             type_code=type_code,
-            type_endurance_minutes=config.type_endurance_minutes,
-            default_endurance_minutes=config.max_endurance_minutes,
-            dropped_tail_window=config.dropped_tail_window,
-            dropped_tail_descent_min_count=config.dropped_tail_descent_min_count,
-            dropped_tail_descent_rate_fpm=config.dropped_tail_descent_rate_fpm,
-            dropped_max_alt_ft=config.dropped_max_alt_ft,
         )
 
         # Landing airport-matching anchor. Altitude-minimum point within the
@@ -965,12 +960,8 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     # load, so both are present or both are absent).
                     airport_elev_ft=float(origin_elev) if origin_elev is not None else 0.0,
                     runway_ends=[dict(r) for r in origin_runways],
-                    max_ft_above_airport=config.takeoff_runway_max_ft_above_airport,
-                    zone_length_m=config.takeoff_runway_zone_length_m,
-                    little_base_m=config.takeoff_runway_little_base_m,
-                    opening_deg=config.takeoff_runway_opening_deg,
+                    config=config,
                     min_gs_kt=min_gs,
-                    min_vert_rate_fpm=config.takeoff_runway_min_vert_rate_fpm,
                 )
                 if to_result is not None:
                     flight.takeoff_runway = to_result.runway_name

@@ -998,14 +998,9 @@ def classify_landing(
     metrics: FlightMetrics,
     has_landing: bool,
     *,
+    config,
     duration_minutes: float | None = None,
     type_code: str | None = None,
-    type_endurance_minutes: dict[str, float] | None = None,
-    default_endurance_minutes: float = 240.0,
-    dropped_tail_window: int = 5,
-    dropped_tail_descent_min_count: int = 3,
-    dropped_tail_descent_rate_fpm: float = -200.0,
-    dropped_max_alt_ft: float = 5000.0,
 ) -> str:
     """Classify how a flight ended.
 
@@ -1043,12 +1038,12 @@ def classify_landing(
             # earlier descent phase.
             if (
                 last_alt is not None
-                and last_alt < dropped_max_alt_ft
+                and last_alt < config.dropped_max_alt_ft
                 and sustained_descent(
                     metrics.recent_points,
-                    tail_window=dropped_tail_window,
-                    min_count=dropped_tail_descent_min_count,
-                    descent_rate_fpm=dropped_tail_descent_rate_fpm,
+                    tail_window=config.dropped_tail_window,
+                    min_count=config.dropped_tail_descent_min_count,
+                    descent_rate_fpm=config.dropped_tail_descent_rate_fpm,
                 )
             ):
                 return "dropped_on_approach"
@@ -1056,9 +1051,7 @@ def classify_landing(
         return "uncertain"
 
     # Duration sanity check. Per-type cap beats the global default.
-    endurance_cap = default_endurance_minutes
-    if type_endurance_minutes is not None:
-        endurance_cap = endurance_for(type_code, type_endurance_minutes, default_endurance_minutes)
+    endurance_cap = endurance_for(type_code, config.type_endurance_minutes, config.max_endurance_minutes)
     if duration_minutes is not None and duration_minutes > endurance_cap:
         return "uncertain"
 

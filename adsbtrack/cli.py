@@ -514,6 +514,33 @@ def status(hex_code, db_path):
                     pct = q["count"] / flight_count * 100 if flight_count > 0 else 0
                     console.print(f"  [{color}]{label}:{' ' * (22 - len(label))}{q['count']:>4} ({pct:.0f}%)[/]")
 
+        # Emergency-squawk breakdown: per-code counts. Only rendered when
+        # at least one flight in the scope has an emergency.
+        try:
+            emergency_rows = db.conn.execute(
+                """SELECT emergency_squawk, COUNT(*) AS cnt FROM flights
+                   WHERE icao = ? AND emergency_squawk IS NOT NULL
+                   GROUP BY emergency_squawk ORDER BY emergency_squawk""",
+                (hex_code,),
+            ).fetchall()
+        except Exception:
+            emergency_rows = []
+        if emergency_rows:
+            parts = ", ".join(f"{row['cnt']} ({row['emergency_squawk']})" for row in emergency_rows)
+            console.print(f"  [red]Emergencies:{' ' * (22 - len('Emergencies:'))}{parts}[/]")
+
+        # Average squawk changes per flight. Rendered when any flight has
+        # a non-null squawk_changes value.
+        try:
+            avg_row = db.conn.execute(
+                "SELECT AVG(squawk_changes) AS avg_changes, COUNT(squawk_changes) AS n FROM flights WHERE icao = ?",
+                (hex_code,),
+            ).fetchone()
+        except Exception:
+            avg_row = None
+        if avg_row and avg_row["n"] and avg_row["avg_changes"] is not None:
+            console.print(f"  Squawk changes per flight (avg): {avg_row['avg_changes']:.1f}")
+
         # Go-around + pattern-work counters. Wrapped in try/except so a
         # pre-migration DB without the new columns degrades gracefully
         # (the whole section simply doesn't render).

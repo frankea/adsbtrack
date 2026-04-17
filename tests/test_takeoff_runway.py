@@ -55,10 +55,19 @@ def _walk_departure(
 
 
 def test_destination_point_roundtrip() -> None:
-    """Destination-point math: 1000m east of (0, 0) should be near (0, 1000/111000/cos(0))."""
-    lat, lon = _destination_point(0.0, 0.0, 90.0, 1000.0)
-    assert abs(lat - 0.0) < 1e-5
-    assert abs(lon - (1000.0 / 111_000.0)) < 1e-4
+    """Roundtripping a destination point should return close to the origin."""
+    # Equatorial cardinal: 1000m east, then 1000m west, back to start
+    lat1, lon1 = _destination_point(0.0, 0.0, 90.0, 1000.0)
+    lat2, lon2 = _destination_point(lat1, lon1, 270.0, 1000.0)
+    assert abs(lat2 - 0.0) < 1e-6
+    assert abs(lon2 - 0.0) < 1e-6
+
+    # Off-equator, non-cardinal: 2000m at bearing 45 from (45, -80), then
+    # 2000m at bearing 225 back -- should return within 1m.
+    lat3, lon3 = _destination_point(45.0, -80.0, 45.0, 2000.0)
+    lat4, lon4 = _destination_point(lat3, lon3, 225.0, 2000.0)
+    assert abs(lat4 - 45.0) < 1e-5
+    assert abs(lon4 - (-80.0)) < 1e-5
 
 
 def test_no_runways_returns_none() -> None:
@@ -66,8 +75,6 @@ def test_no_runways_returns_none() -> None:
     assert (
         detect_takeoff_runway(
             metrics,
-            airport_lat=27.77,
-            airport_lon=-82.67,
             airport_elev_ft=7,
             runway_ends=[],
         )
@@ -81,8 +88,6 @@ def test_empty_takeoff_points_returns_none() -> None:
     assert (
         detect_takeoff_runway(
             metrics,
-            airport_lat=27.77,
-            airport_lon=-82.67,
             airport_elev_ft=7,
             runway_ends=[runway],
         )
@@ -110,8 +115,6 @@ def test_clean_commercial_departure_identifies_runway() -> None:
     metrics = _Metrics(samples)
     result = detect_takeoff_runway(
         metrics,
-        airport_lat=27.76,
-        airport_lon=-82.63,
         airport_elev_ft=7,
         runway_ends=[runway],
     )
@@ -140,17 +143,13 @@ def test_too_slow_returns_none() -> None:
     metrics = _Metrics(samples)
     result = detect_takeoff_runway(
         metrics,
-        airport_lat=27.76,
-        airport_lon=-82.63,
         airport_elev_ft=7,
         runway_ends=[runway],
     )
     assert result is None  # below default 140 kt
-    # Now retry with low min_gs_kt (helicopter/GA) — should pass
+    # Now retry with low min_gs_kt (helicopter/GA) -- should pass
     result2 = detect_takeoff_runway(
         metrics,
-        airport_lat=27.76,
-        airport_lon=-82.63,
         airport_elev_ft=7,
         runway_ends=[runway],
         min_gs_kt=60.0,
@@ -177,8 +176,6 @@ def test_too_high_returns_none() -> None:
     metrics = _Metrics(samples)
     result = detect_takeoff_runway(
         metrics,
-        airport_lat=27.76,
-        airport_lon=-82.63,
         airport_elev_ft=7,
         runway_ends=[runway],
     )
@@ -205,8 +202,6 @@ def test_offset_departure_not_aligned_returns_none() -> None:
     assert (
         detect_takeoff_runway(
             metrics,
-            airport_lat=27.76,
-            airport_lon=-82.63,
             airport_elev_ft=7,
             runway_ends=[runway],
         )
@@ -234,8 +229,6 @@ def test_multi_runway_picks_longest() -> None:
     metrics = _Metrics(samples)
     result = detect_takeoff_runway(
         metrics,
-        airport_lat=27.76,
-        airport_lon=-82.63,
         airport_elev_ft=7,
         runway_ends=[runway_24, runway_06],
     )
@@ -261,8 +254,6 @@ def test_missing_heading_skips_runway() -> None:
     assert (
         detect_takeoff_runway(
             metrics,
-            airport_lat=27.76,
-            airport_lon=-82.63,
             airport_elev_ft=7,
             runway_ends=[runway],
         )

@@ -145,9 +145,6 @@ def _longest_inside_run(
             best_max_gs = run_max_gs
 
     for s in samples:
-        if s.lat is None or s.lon is None:
-            prev_ts = s.ts
-            continue
         inside = polygon.contains(Point(s.lon, s.lat))
         gap = prev_ts is not None and (s.ts - prev_ts) > split_gap_secs
         if inside and (run_start is None or gap):
@@ -176,8 +173,6 @@ def _longest_inside_run(
 def detect_takeoff_runway(
     metrics: FlightMetrics,
     *,
-    airport_lat: float,  # noqa: ARG001 -- reserved for future tuning
-    airport_lon: float,  # noqa: ARG001 -- reserved for future tuning
     airport_elev_ft: float,
     runway_ends: Iterable[Mapping[str, object]],
     max_ft_above_airport: float = 2000.0,

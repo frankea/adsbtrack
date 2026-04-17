@@ -23,8 +23,6 @@ from .classifier import _PointSample
 from .config import Config
 from .db import Database
 
-_KM_PER_NM = 1.852
-
 # Row shape matches the INSERT OR REPLACE column order below:
 # (ident, name, type, latitude_deg, longitude_deg, elevation_ft, frequency_khz, iso_country).
 NavaidRow = tuple[str, str | None, str | None, float, float, int | None, int | None, str | None]

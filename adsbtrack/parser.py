@@ -874,6 +874,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 min_gs = config.takeoff_runway_min_gs_kt_low if is_low_gs else config.takeoff_runway_min_gs_kt_default
                 to_result: TakeoffRunwayResult | None = detect_takeoff_runway(
                     metrics,
+                    # Fallback 0.0 is safe because the `if origin_runways:`
+                    # guard above only fires when the airport is in our DB
+                    # (runways and elevations come from the same OurAirports
+                    # load, so both are present or both are absent).
                     airport_elev_ft=float(origin_elev) if origin_elev is not None else 0.0,
                     runway_ends=[dict(r) for r in origin_runways],
                     max_ft_above_airport=config.takeoff_runway_max_ft_above_airport,

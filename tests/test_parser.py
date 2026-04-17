@@ -1917,8 +1917,10 @@ def test_takeoff_runway_helicopter_threshold_scaled():
 
 
 def test_takeoff_runway_sparse_data_fails_gracefully():
-    """A flight with too few usable takeoff samples should leave
-    takeoff_runway NULL but still be extracted (no crash, no rejection)."""
+    """A flight whose takeoff samples lack track data (or exceed the AGL cap)
+    should leave takeoff_runway NULL. _make_trace_point sets track=None, which
+    _filter_takeoff_samples rejects; this exercises the detector's graceful-
+    fail path rather than skipping the detector entirely."""
     config = _make_config()
 
     threshold_lat = 27.76

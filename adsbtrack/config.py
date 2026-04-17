@@ -99,18 +99,18 @@ CALLSIGN_PREFIX_MISSIONS: dict[str, str] = {
     "BHI": "offshore",  # Bristow
     "TWY": "exec_charter",
     "GLF": "exec_charter",
-    "GS5": "exec_charter",  # round-4 §3.6: alt callsign for Solairus aircraft
+    "GS5": "exec_charter",  # alt callsign for Solairus aircraft
     "LJ": "exec_charter",
     "NJE": "exec_charter",  # NetJets
     "EJA": "exec_charter",  # NetJets legacy
-    "QE7": "exec_charter",  # round-4 §3.6: Qatari amiri 7-prefix
-    "A7": "exec_charter",  # round-4 §3.6: Qatari nationality prefix on tail-number callsigns
+    "QE7": "exec_charter",  # Qatari amiri 7-prefix
+    "A7": "exec_charter",  # Qatari nationality prefix on tail-number callsigns
     "SCH": "training",
     "SIK": "training",
 }
 
 
-# v4 (§3.6): owner_operator substring keywords for the offshore mission.
+# owner_operator substring keywords for the offshore mission.
 # Used by classify_mission as a fallback when the callsign prefix doesn't
 # match. PHI Aviation, ERA, Bristow, Cougar, CHC are the major offshore
 # helicopter operators in the dataset.
@@ -128,7 +128,7 @@ OFFSHORE_OPERATOR_KEYWORDS: tuple[str, ...] = (
 )
 
 
-# v8 R4: type-specific service ceilings (feet). Used as a backstop after
+# type-specific service ceilings (feet). Used as a backstop after
 # persistence filtering to cap max_altitude at physically plausible values.
 # If max_altitude exceeds the ceiling by >10%, it is clamped.
 TYPE_CEILINGS: dict[str, int] = {
@@ -136,7 +136,7 @@ TYPE_CEILINGS: dict[str, int] = {
     # book ceiling per AP-validated data -- 39,675 ft peak with AP set)
     "B748": 43_100,
     # Helicopters
-    "B407": 18_500,  # v16 R4d: lowered from 22,000; service ceiling 18,690 ft
+    "B407": 18_500,  # lowered from 22,000; service ceiling 18,690 ft
     "S92": 15_000,
     "S76": 15_000,
     "H60": 19_000,
@@ -169,7 +169,7 @@ TYPE_CEILINGS: dict[str, int] = {
 }
 
 
-# v9 R3: type-specific max ground speed (knots). Used as a backstop after
+# type-specific max ground speed (knots). Used as a backstop after
 # persistence filtering to cap max_gs_kt at physically plausible values.
 # If max_gs_kt exceeds the cap by >10%, it is clamped. Same pattern as
 # TYPE_CEILINGS for altitude. Values are Vne/Vmo + margin.
@@ -247,21 +247,21 @@ class Config:
     min_flight_minutes: float = 5.0  # minimum duration for a valid flight
     min_flight_distance_km: float = 5.0  # minimum travel for a short flight
 
-    # v5 (B7) minimum-viable-flight gate for non-confirmed flights. A
+    # minimum-viable-flight gate for non-confirmed flights. A
     # signal_lost / dropped / uncertain fragment shorter than this is
     # dropped as a sliver. Confirmed landings are never gated out.
-    # v8 R5: raised from 2.0 to 3.0 min to tighten the tiny-flight guard.
+    # raised from 2.0 to 3.0 min to tighten the tiny-flight guard.
     min_viable_flight_minutes: float = 3.0
     min_viable_flight_points: int = 10
 
-    # v5 (B8) stationary broadcaster detector. A "flight" where the aircraft
+    # stationary broadcaster detector. A "flight" where the aircraft
     # never moved, never climbed above ramp height, and never accelerated
     # beyond taxi speed is a parked transponder, not a mission.
     stationary_path_km: float = 0.5
-    stationary_max_alt_ft: float = 1000.0  # v6: raised from 500 to catch ramp at higher-elevation airports
+    stationary_max_alt_ft: float = 1000.0  # raised from 500 to catch ramp at higher-elevation airports
     stationary_max_gs_kt: float = 15.0
 
-    # v5 (D1) on-field threshold: origin_icao / destination_icao only get
+    # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km
     # find_nearest_airport gate) populate the diagnostic nearest_*_icao
@@ -354,14 +354,14 @@ class Config:
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown
     type_endurance_minutes: dict[str, float] = field(default_factory=lambda: dict(TYPE_ENDURANCE_MINUTES))
 
-    # v5 (B5, B6) persistence-filtered peaks. A candidate max_altitude or
+    # persistence-filtered peaks. A candidate max_altitude or
     # max_gs_kt only sets the new peak when it was held for at least
     # `min_samples` points across a rolling wall-clock window of
     # `window_secs`. Guards against single-sample baro or GS spikes
     # pegging the raw max() to garbage (B5 found a B748 at 125,898 ft
     # and a B407 at 197 kt, both from one-point glitches).
     alt_persistence_window_secs: float = 30.0
-    alt_persistence_min_samples: int = 3  # v6: lowered from 5 so S92 (15s spacing) activates
+    alt_persistence_min_samples: int = 3  # lowered from 5 so S92 (15s spacing) activates
     gs_persistence_window_secs: float = 30.0
     gs_persistence_min_samples: int = 3
 

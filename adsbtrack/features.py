@@ -73,7 +73,7 @@ def classify_mission(
             return "ems_hems"
 
     # 3. Physics rules
-    # v6 Q4: exempt large jets / VIP aircraft from survey and pattern.
+    # exempt large jets / VIP aircraft from survey and pattern.
     # A B748 BBJ or GLF6 with high loiter is in ATC holding or doing a
     # VIP security orbit, not flying a survey grid.
     _exempt_survey_pattern = ("B748", "GLF5", "GLF6", "GLF4", "SJ30", "FA7X", "CL60")
@@ -247,7 +247,7 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
         else:
             level_secs_val += dt
 
-    # v7 R1: cap cruise_alt_ft at max_altitude. Cruise can never exceed
+    # cap cruise_alt_ft at max_altitude. Cruise can never exceed
     # the peak. Also catches residual N1 cases where altitude source mixing
     # (baro for max, geom fallback in level_buf) produces cruise > max.
     cruise_alt_ft: int | None = None
@@ -256,7 +256,7 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
         if max_alt > 0 and cruise_alt_ft > max_alt:
             cruise_alt_ft = max_alt
 
-    # v11 R2: time-weighted median for cruise_gs_kt. Previous v10 used an
+    # time-weighted median for cruise_gs_kt. Previous v10 used an
     # unweighted median of level_buf gs values, which gave equal weight to
     # each sample point regardless of its duration (dt). Brief tailwind
     # bursts with many closely-spaced trace points were over-represented,
@@ -295,7 +295,7 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
                 # All rejected -- fall back to raw median
                 median_gs = weighted_gs[n // 2] if n % 2 else (weighted_gs[n // 2 - 1] + weighted_gs[n // 2]) / 2
                 cruise_gs_kt = int(round(median_gs))
-            # v17 R5: cap cruise_gs at the persistence-filtered max_gs.
+            # cap cruise_gs at the persistence-filtered max_gs.
             # Cruise GS is a subset of all GS samples, so the median
             # cannot exceed the max. The v13 removal of this cap caused
             # 3,134 flights (13.8%) to violate the cruise <= max
@@ -307,7 +307,7 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
             if max_gs > 0 and cruise_gs_kt is not None and cruise_gs_kt > max_gs:
                 cruise_gs_kt = max_gs
 
-    # v5 B2: proportional rescale so the four bins sum to exactly the
+    # proportional rescale so the four bins sum to exactly the
     # on-signal active time. The online classifier can double-count
     # boundary points between bins, causing the raw sum to overshoot.
     # active_secs is clamped to duration_secs so we never claim more
@@ -505,11 +505,11 @@ def compute_headings(metrics: FlightMetrics, *, config: Config) -> dict:
     # the fallback windows since helicopters approach slowly.
     landing_heading: float | None = None
     if metrics.landing_tracks and metrics.landing_transition_ts is not None:
-        # v8 N7: added (600s, 0.0) final fallback so helicopter landings
+        # added (600s, 0.0) final fallback so helicopter landings
         # with very low GS (hover approach) still get a heading when enough
         # track samples exist. The v4 fix stopped at gs > 10 kt which still
         # missed 358 B407 confirmed landings.
-        # v9 N7: use >= for the zero-floor window so gs=0 points are included,
+        # use >= for the zero-floor window so gs=0 points are included,
         # and lower minimum to 1 for the final fallback (a single track sample
         # is still a real heading observation).
         windows = [(heading_window, min_gs, 3), (120.0, 10.0, 3), (240.0, 10.0, 3), (600.0, 10.0, 3), (600.0, 0.0, 1)]
@@ -553,7 +553,7 @@ def compute_headings(metrics: FlightMetrics, *, config: Config) -> dict:
             if dist > 50:
                 landing_heading = _bearing_deg(first[1], first[2], last[1], last[2])
 
-    # v5 D5: wrap to [0, 360) after rounding so a 359.95 that rounds to
+    # wrap to [0, 360) after rounding so a 359.95 that rounds to
     # 360.0 becomes 0.0. _circular_mean_deg already normalizes but
     # round() can nudge the edge case past the boundary.
     to_hdg = round(takeoff_heading, 1) % 360.0 if takeoff_heading is not None else None
@@ -629,7 +629,7 @@ def compute_callsigns_summary(metrics: FlightMetrics) -> dict:
     if not metrics.callsigns_seen:
         return {"callsigns": None, "callsign_changes": None, "callsign_count": None}
     unique = sorted(set(metrics.callsigns_seen))
-    # v5 B4: cap callsign_changes at max(0, distinct - 1). The online
+    # cap callsign_changes at max(0, distinct - 1). The online
     # counter in FlightMetrics tracks real transitions between the last-
     # observed value, but legacy data or edge cases could still over-count.
     # The capped value means "how many distinct callsigns were used beyond
@@ -714,7 +714,7 @@ def compute_day_night(
     total = night_count + day_count
     night_flight: int | None = None
     if total > 0:
-        # v6 N5: redefine night_flight as "any phase of the flight occurs
+        # redefine night_flight as "any phase of the flight occurs
         # during night" per FAR 91.205(c). If either endpoint is night the
         # flight is a night flight. This resolves the inconsistency where
         # long flights could have night_flight=1 but both endpoints day (or
@@ -832,7 +832,7 @@ def derive_all(
     Destination inference is NOT run here - it needs a candidates list from
     the database. Call ``infer_destination`` separately in the parser.
     """
-    # v5 F1: signal budget (active_minutes, signal_gap_secs, signal_gap_count).
+    # signal budget (active_minutes, signal_gap_secs, signal_gap_count).
     # Must run before phase budget so B2's rescale can clamp to active_secs.
     duration_secs = (flight.duration_minutes or 0.0) * 60.0
     sig = compute_signal_budget(metrics, duration_secs=duration_secs)
@@ -840,7 +840,7 @@ def derive_all(
     flight.signal_gap_secs = sig["signal_gap_secs"]
     flight.signal_gap_count = sig["signal_gap_count"]
 
-    # v5 F2: fragment count passthrough
+    # fragment count passthrough
     flight.fragments_stitched = metrics.fragments_stitched
 
     # max_gs_kt cap is deferred to after phase budget so H1 military
@@ -871,12 +871,12 @@ def derive_all(
         flight.cruise_alt_ft = phase["cruise_alt_ft"]
         flight.cruise_gs_kt = phase["cruise_gs_kt"]
 
-        # v12 N15: cruise_detected flag. 1 when the phase budget found a
+        # cruise_detected flag. 1 when the phase budget found a
         # real cruise segment, 0 when cruise_alt_ft is NULL or set via the
         # fallback below. Makes the NULL informative for analytics.
         flight.cruise_detected = 1 if phase["cruise_alt_ft"] is not None else 0
 
-        # v10 N15: fallback cruise_alt_ft = max_altitude when no stable
+        # fallback cruise_alt_ft = max_altitude when no stable
         # cruise was detected but the flight is long enough (>10 min).
         # This closes the NULL gap where max_altitude is always populated
         # but cruise_alt_ft can be NULL on constantly-climbing flights.
@@ -885,7 +885,7 @@ def derive_all(
             if dur_min > 10.0 and flight.max_altitude > 0:
                 flight.cruise_alt_ft = flight.max_altitude
 
-        # v5 B2: recompute active_minutes from the rescaled phase secs so
+        # recompute active_minutes from the rescaled phase secs so
         # the stored columns satisfy climb+cruise+descent+level == active*60
         # by construction. The earlier compute_signal_budget used raw metrics
         # which can diverge from the rescaled values.
@@ -893,8 +893,8 @@ def derive_all(
             (flight.climb_secs or 0) + (flight.cruise_secs or 0) + (flight.descent_secs or 0) + (flight.level_secs or 0)
         )
         active_min = round(rescaled_active / 60.0, 1)
-        # v6 N2: clamp so active never exceeds wall-clock duration.
-        # v6 N3: floor at the metric span so flights with data never show 0.
+        # clamp so active never exceeds wall-clock duration.
+        # floor at the metric span so flights with data never show 0.
         dur_min = flight.duration_minutes or 0.0
         if dur_min > 0:
             active_min = min(active_min, dur_min)
@@ -908,11 +908,11 @@ def derive_all(
         flight.peak_climb_fpm = peak["peak_climb_fpm"]
         flight.peak_descent_fpm = peak["peak_descent_fpm"]
     else:
-        # v13 N25: altitude_error flights skip the phase budget entirely.
+        # altitude_error flights skip the phase budget entirely.
         # Set cruise_detected=0 so the column is never NULL.
         flight.cruise_detected = 0
 
-    # v18: heavy signal gap advisory flag. Flights where < 50% of the
+    # heavy signal gap advisory flag. Flights where < 50% of the
     # duration was observed should be excluded from speed analyses.
     dur = flight.duration_minutes or 0.0
     act = flight.active_minutes or 0.0
@@ -931,7 +931,7 @@ def derive_all(
     flight.takeoff_heading_deg = headings["takeoff_heading_deg"]
     flight.landing_heading_deg = headings["landing_heading_deg"]
 
-    # v8 H1: per-flight MIL_FW type override for ae69xx ICAOs. These are
+    # per-flight MIL_FW type override for ae69xx ICAOs. These are
     # registered as H60 (Black Hawk) but some flights show fixed-wing
     # profiles (FL350, 400+ kt) from C-17/KC-135/etc sharing the ICAO
     # block. Use OR logic: if EITHER cruise metric exceeds H60 capability,
@@ -942,11 +942,11 @@ def derive_all(
     if flight.icao.startswith("ae69"):
         cruise_alt = flight.cruise_alt_ft or 0
         cruise_gs = flight.cruise_gs_kt or 0
-        # v9 H1a: loosened from 15,000/250 to 12,000/220. ae69xx are
+        # loosened from 15,000/250 to 12,000/220. ae69xx are
         # single military ICAOs logging mixed rotary/fixed-wing profiles;
         # the lower gate catches flights at 10,000-19,000 ft / 180+ kt
         # that are clearly fixed-wing but fell below the old threshold.
-        # v10 R4b: added max_altitude > 15,000 for flights where no stable
+        # added max_altitude > 15,000 for flights where no stable
         # cruise was detected (cruise_alt=None) but altitude alone proves
         # fixed-wing -- e.g. ae69d7 at 20,025 ft with 840 data points.
         max_alt = flight.max_altitude or 0
@@ -954,7 +954,7 @@ def derive_all(
             effective_type = "MIL_FW"
             flight.type_override = "MIL_FW"
 
-    # v8 R3: removed the hard type-specific GS cap. The persistence filter
+    # removed the hard type-specific GS cap. The persistence filter
     # in classifier.py (gs_persistence_window_secs / gs_persistence_min_samples)
     # already suppresses single-sample GS spikes. The hard cap was masking
     # real data (e.g. rotorcraft capped at 250 kt regardless of whether the
@@ -987,7 +987,7 @@ def derive_all(
     flight.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
     flight.emergency_flag = metrics.emergency_flag
 
-    # v7 H4: null out autopilot_target for H60 / ae69xx AFTER the
+    # null out autopilot_target for H60 / ae69xx AFTER the
     # assignment above (otherwise the assignment overwrites the null).
     if effective_type == "H60" or flight.icao.startswith("ae69"):
         flight.autopilot_target_alt_ft = None

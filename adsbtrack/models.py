@@ -77,8 +77,8 @@ class Flight:
     level_secs: int | None = None
     cruise_alt_ft: int | None = None
     cruise_gs_kt: int | None = None
-    cruise_detected: int | None = None  # v12 N15: 1 if stable cruise segment found, 0 if fallback/NULL
-    heavy_signal_gap: int | None = None  # v18: 1 if active_minutes/duration_minutes < 0.5
+    cruise_detected: int | None = None  # 1 if stable cruise segment found, 0 if fallback/NULL
+    heavy_signal_gap: int | None = None  # 1 if active_minutes/duration_minutes < 0.5
 
     # --- v3: peak climb/descent rates (30-s rolling window) ---
     peak_climb_fpm: int | None = None
@@ -92,7 +92,7 @@ class Flight:
     # --- v3: callsigns history ---
     callsigns: str | None = None  # JSON array of distinct callsigns seen
     callsign_changes: int | None = None  # transitions count (not distinct), e.g. TWY501<->GS501 churn
-    callsign_count: int | None = None  # v4: distinct callsign count = len(set(callsigns))
+    callsign_count: int | None = None  # distinct callsign count = len(set(callsigns))
 
     # --- v3: destination inference for dropped flights ---
     probable_destination_icao: str | None = None

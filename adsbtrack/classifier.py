@@ -113,13 +113,13 @@ class FlightMetrics:
     _persisted_max_gs_kt: int = 0
     _alt_persist_window: deque = field(default_factory=deque)
     _gs_persist_window: deque = field(default_factory=deque)
-    # v5 F1: count of inter-point gaps longer than path_max_segment_secs
+    # count of inter-point gaps longer than path_max_segment_secs
     # observed while airborne. Used to produce signal_gap_count on the flight.
     signal_gap_count: int = 0
-    # v5 F2: number of raw fragments this metric represents. Non-stitched
+    # number of raw fragments this metric represents. Non-stitched
     # flights are 1 by definition; _stitch_fragments bumps this on merge.
     fragments_stitched: int = 1
-    # v5 B4: last observed raw callsign (distinct from callsigns_seen which
+    # last observed raw callsign (distinct from callsigns_seen which
     # is the distinct-in-order list). Needed to tell a real transition from
     # a flicker where [-1] of the distinct list is not the most recent.
     _last_callsign: str | None = None
@@ -236,7 +236,7 @@ class FlightMetrics:
     # not just a tail or head window. Consumed by adsbtrack.navaid_alignment
     # via the parser's navaid_track helper. Unbounded (grows with the flight).
     all_points: list[_PointSample] = field(default_factory=list)
-    # v9 N7: recent airborne positions for bearing-based heading fallback
+    # recent airborne positions for bearing-based heading fallback
     # when track data is unavailable (helicopter hover approaches).
     _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
 
@@ -341,7 +341,7 @@ class FlightMetrics:
         if ground_reason in ("baro_error", "speed_override"):
             self.baro_error_points += 1
 
-        # v9 N7: buffer recent airborne positions for bearing fallback
+        # buffer recent airborne positions for bearing fallback
         if ground_state == "airborne":
             self._recent_positions.append((ts, lat, lon))
 
@@ -376,12 +376,12 @@ class FlightMetrics:
                 # mode-S extended data). Type ceiling catches extremes.
                 if candidate_alt > self._raw_max_altitude:
                     self._raw_max_altitude = candidate_alt
-                # v14 R4a: AP-validated persistence filter. Only samples
+                # AP-validated persistence filter. Only samples
                 # with nav_altitude_mcp (autopilot target) present enter
                 # the persistence window. Squawk is NOT sufficient --
                 # it's always present on operating transponders and does
                 # not correlate with altitude validity.
-                # v15 R4c: AP must also AGREE with the altitude sample.
+                # AP must also AGREE with the altitude sample.
                 # S92 a7a622 had AP=3,008 ft while altitude=16,500 ft --
                 # a 13,000 ft disagreement from mixed trace segments.
                 # AP only validates the altitude when the two are within
@@ -563,7 +563,7 @@ class FlightMetrics:
                         if airborne_alt is not None:
                             self.level_buf.append((dt, airborne_alt, gs))
                 else:
-                    # v5 F1: count this inter-point gap so
+                    # count this inter-point gap so
                     # signal_gap_count tracks how fragmented the coverage was.
                     self.signal_gap_count += 1
                     # Coverage gap: attribute to cruise (level_buf with the
@@ -685,7 +685,7 @@ class FlightMetrics:
         # which we capture unconditionally - features.compute_headings will
         # filter by the landing transition timestamp.
         #
-        # v8 N7: takeoff tracks still require airborne state (ground tracks
+        # takeoff tracks still require airborne state (ground tracks
         # at takeoff are taxi noise). Landing tracks now also accept ground-
         # state points with a valid track, because helicopters transition to
         # baro=ground while still moving at low GS during final approach.

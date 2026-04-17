@@ -663,7 +663,7 @@ class Database:
         # databases pick up any columns that might have been added since the
         # schema string was last written (cheap, idempotent).
         _migrate_add_flight_columns(self.conn)
-        # v4: aircraft_registry / aircraft_stats column additions
+        # aircraft_registry / aircraft_stats column additions
         _migrate_add_v4_columns(self.conn)
         # Seed the curated military-hex allocations. Idempotent -- repeated
         # init calls just upsert the same rows. Lazy import avoids a
@@ -1111,7 +1111,7 @@ class Database:
             winner_type = latest["type_code"]
             winner_desc = latest["description"]
 
-        # v6 D3: military hex blocks have no FAA registration metadata.
+        # military hex blocks have no FAA registration metadata.
         # Fall back to a category-based inference when majority vote yields
         # nothing. US military blocks: ae0000-afffff (USAF), a00000-afffff
         # overlap with civil but ae69xx is distinctly military.
@@ -1206,7 +1206,7 @@ class Database:
         ).fetchall()
 
         if not core_rows:
-            # v6 N6: if filtering removed all flights for this ICAO, delete
+            # if filtering removed all flights for this ICAO, delete
             # the stale aircraft_stats row so it doesn't show ghost data.
             if icao:
                 self.conn.execute("DELETE FROM aircraft_stats WHERE icao = ?", (icao,))
@@ -1245,7 +1245,7 @@ class Database:
                 (this_icao,),
             ).fetchone()
 
-            # v4 (§3.2): home base = airport with the most takeoffs.
+            # home base = airport with the most takeoffs.
             # Compute the top two by takeoff count and their share of total
             # takeoffs that have an origin assigned.
             base_rows = self.conn.execute(
@@ -1266,7 +1266,7 @@ class Database:
             origin_total = origin_total_row["cnt"] if origin_total_row else 0
             home_base_icao = base_rows[0]["origin_icao"] if base_rows else None
             home_base_share = round(base_rows[0]["cnt"] / origin_total, 3) if base_rows and origin_total else None
-            # v11 N22: flag aircraft where home_base_share < 0.40 as uncertain.
+            # flag aircraft where home_base_share < 0.40 as uncertain.
             # These nomadic aircraft operate from multiple bases and don't have
             # a single "home" in the operational sense.
             home_base_uncertain = 1 if home_base_share is not None and home_base_share < 0.40 else 0
@@ -1311,7 +1311,7 @@ class Database:
                 ),
             )
 
-            # v4 (§3.1): write confirmation_rate and signal_quality_tier
+            # write confirmation_rate and signal_quality_tier
             # back to aircraft_registry. Tier thresholds per round-4 spec:
             # excellent (>50%), good (30-50%), poor (10-30%), very_poor (<10%).
             total_flights = row["total_flights"] or 0

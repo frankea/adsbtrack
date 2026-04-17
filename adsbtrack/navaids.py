@@ -11,13 +11,19 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import math
+import sqlite3
+from collections.abc import Iterable
 from pathlib import Path
 
 import httpx
 from rich.progress import Progress
 
+from .classifier import _PointSample
 from .config import Config
 from .db import Database
+
+_KM_PER_NM = 1.852
 
 # Row shape matches the INSERT OR REPLACE column order below:
 # (ident, name, type, latitude_deg, longitude_deg, elevation_ft, frequency_khz, iso_country).
@@ -94,3 +100,61 @@ def refresh_navaids(
     )
     db.conn.commit()
     return len(rows)
+
+
+def query_navaids_in_bbox(
+    conn: sqlite3.Connection,
+    min_lat: float,
+    max_lat: float,
+    min_lon: float,
+    max_lon: float,
+) -> list[sqlite3.Row]:
+    """Return navaid rows inside the [min_lat, max_lat] x [min_lon, max_lon] box.
+
+    Uses the (latitude_deg, longitude_deg) indexes. The caller is responsible
+    for buffering the box (see navaid_bbox_buffer_nm in Config).
+    """
+    return list(
+        conn.execute(
+            "SELECT ident, name, type, latitude_deg, longitude_deg,"
+            "       elevation_ft, frequency_khz, iso_country"
+            "  FROM navaids"
+            " WHERE latitude_deg BETWEEN ? AND ?"
+            "   AND longitude_deg BETWEEN ? AND ?",
+            (min_lat, max_lat, min_lon, max_lon),
+        ).fetchall()
+    )
+
+
+def flight_bbox_from_points(
+    points: Iterable[_PointSample],
+    *,
+    buffer_nm: float,
+) -> tuple[float, float, float, float] | None:
+    """Compute (min_lat, max_lat, min_lon, max_lon) of a flight, expanded by
+    buffer_nm in every direction. Returns None if the flight has no samples
+    with lat/lon or crosses the antimeridian (|lon_span| > 180 deg)."""
+    lats: list[float] = []
+    lons: list[float] = []
+    for s in points:
+        if s.lat is not None and s.lon is not None:
+            lats.append(s.lat)
+            lons.append(s.lon)
+    if not lats:
+        return None
+    min_lat, max_lat = min(lats), max(lats)
+    min_lon, max_lon = min(lons), max(lons)
+    if max_lon - min_lon > 180.0:
+        return None
+    # 1 deg lat ~ 60 nm. Longitude scales with cos(lat); use the higher-abs
+    # latitude to be safe so the box is always wide enough.
+    buffer_lat = buffer_nm / 60.0
+    worst_lat_rad = math.radians(max(abs(min_lat), abs(max_lat)))
+    cos_lat = max(0.01, math.cos(worst_lat_rad))  # clamp near the poles
+    buffer_lon = buffer_lat / cos_lat
+    return (
+        min_lat - buffer_lat,
+        max_lat + buffer_lat,
+        min_lon - buffer_lon,
+        max_lon + buffer_lon,
+    )

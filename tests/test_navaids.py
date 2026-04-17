@@ -31,3 +31,19 @@ def test_refresh_is_idempotent(tmp_path):
         refresh_navaids(db, cfg, local_csv=FIXTURE)
         count = db.conn.execute("SELECT COUNT(*) FROM navaids").fetchone()[0]
         assert count == 3
+
+
+def test_query_navaids_in_bbox(tmp_path):
+    from adsbtrack.navaids import query_navaids_in_bbox
+
+    cfg = Config(db_path=tmp_path / "nav.db")
+    with Database(cfg.db_path) as db:
+        refresh_navaids(db, cfg, local_csv=FIXTURE)
+        # All three fixture rows land between lat 34-37, lon -83 to -80.
+        rows = query_navaids_in_bbox(db.conn, 34.0, 37.0, -84.0, -80.0)
+        idents = {r["ident"] for r in rows}
+        assert idents == {"CLT", "SHAWZ", "KEEMO"}
+
+        # Narrow box around SHAWZ only.
+        rows = query_navaids_in_bbox(db.conn, 34.5, 34.6, -81.3, -81.2)
+        assert {r["ident"] for r in rows} == {"SHAWZ"}

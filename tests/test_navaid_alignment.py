@@ -97,3 +97,36 @@ def test_short_segment_filtered_by_min_duration():
     # 5 samples, 2s apart = 8s wall-clock -> below 30s floor.
     points = [_sample(1000.0 + 2.0 * i, 34.5 + 0.02 * i, -80.0, 0.0) for i in range(5)]
     assert detect_navaid_alignments(points, navaids=navaids) == []
+
+
+def test_flight_bbox_from_points_basic():
+    from adsbtrack.navaids import flight_bbox_from_points
+
+    points = [_sample(1000.0 + 2.0 * i, 34.5 + 0.02 * i, -80.0, 0.0) for i in range(10)]
+    bbox = flight_bbox_from_points(points, buffer_nm=50.0)
+    assert bbox is not None
+    min_lat, max_lat, min_lon, max_lon = bbox
+    # Raw lat span was 34.5..34.68, buffer 50 nm ~ 0.83 deg.
+    assert min_lat < 34.5 - 0.8
+    assert max_lat > 34.68 + 0.8
+    # Lon was constant at -80 so buffered box still symmetric.
+    assert min_lon < -80.0
+    assert max_lon > -80.0
+
+
+def test_flight_bbox_returns_none_with_no_points():
+    from adsbtrack.navaids import flight_bbox_from_points
+
+    assert flight_bbox_from_points([], buffer_nm=50.0) is None
+
+
+def test_flight_bbox_returns_none_on_antimeridian_span():
+    """A flight that straddles the 180 deg meridian would produce a giant
+    wrong-wrapping bbox; the helper declines rather than return garbage."""
+    from adsbtrack.navaids import flight_bbox_from_points
+
+    points = [
+        _sample(1000.0, 0.0, -179.0, 0.0),
+        _sample(2000.0, 0.0, 179.0, 0.0),
+    ]
+    assert flight_bbox_from_points(points, buffer_nm=50.0) is None

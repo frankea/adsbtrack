@@ -999,3 +999,105 @@ def test_trips_no_squawk_column_by_default(tmp_path, monkeypatch) -> None:
     result = runner.invoke(cli, ["trips", "--hex", "sqwk02", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "Squawk" not in result.output  # column hidden by default
+
+
+def test_navaids_refresh_local_csv(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from adsbtrack.cli import cli
+
+    db_path = tmp_path / "nav.db"
+    fixture = Path(__file__).parent / "fixtures" / "navaids_sample.csv"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["navaids", "refresh", "--csv", str(fixture), "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "3 navaids" in result.output
+
+
+def test_route_cli_prints_chain(tmp_path, monkeypatch):
+    import json
+    from datetime import datetime
+
+    from click.testing import CliRunner
+
+    from adsbtrack.cli import cli
+    from adsbtrack.db import Database
+    from adsbtrack.models import Flight
+
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "r.db"
+    track = json.dumps(
+        [
+            {"navaid_ident": "SHAWZ", "start_ts": 0.0, "end_ts": 900.0, "min_distance_nm": 30.0},
+            {"navaid_ident": "KEEMO", "start_ts": 900.0, "end_ts": 1380.0, "min_distance_nm": 20.0},
+            {"navaid_ident": "CLT", "start_ts": 1400.0, "end_ts": 1580.0, "min_distance_nm": 1.5},
+        ]
+    )
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="abc123",
+                takeoff_time=datetime(2026, 3, 27, 14, 0, 0),
+                takeoff_lat=35.0,
+                takeoff_lon=-80.0,
+                takeoff_date="2026-03-27",
+                origin_icao="KSPG",
+                destination_icao="KHKY",
+                navaid_track=track,
+            )
+        )
+
+    result = CliRunner().invoke(cli, ["route", "--hex", "abc123", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "2026-03-27 KSPG -> KHKY" in result.output
+    assert "SHAWZ (15m) -> KEEMO (8m) -> CLT (3m)" in result.output
+
+
+def test_route_cli_no_data(tmp_path):
+    from click.testing import CliRunner
+
+    from adsbtrack.cli import cli
+    from adsbtrack.db import Database
+
+    db_path = tmp_path / "r.db"
+    with Database(db_path):
+        pass  # empty DB, schema only
+
+    result = CliRunner().invoke(cli, ["route", "--hex", "abc123", "--db", str(db_path)])
+    assert result.exit_code == 0
+    assert "No navaid track" in result.output
+
+
+def test_route_cli_short_segment_under_a_minute(tmp_path, monkeypatch):
+    """A segment that lasts 40 s is rendered as '<1m' (stays visible but
+    not misreported as 0m)."""
+    import json
+    from datetime import datetime
+
+    from click.testing import CliRunner
+
+    from adsbtrack.cli import cli
+    from adsbtrack.db import Database
+    from adsbtrack.models import Flight
+
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "r.db"
+    track = json.dumps([{"navaid_ident": "NDB1", "start_ts": 0.0, "end_ts": 40.0, "min_distance_nm": 5.0}])
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="abc123",
+                takeoff_time=datetime(2026, 3, 27, 14, 0, 0),
+                takeoff_lat=35.0,
+                takeoff_lon=-80.0,
+                takeoff_date="2026-03-27",
+                navaid_track=track,
+            )
+        )
+    result = CliRunner().invoke(cli, ["route", "--hex", "abc123", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "NDB1 (<1m)" in result.output

@@ -1336,3 +1336,51 @@ def test_insert_flight_squawk_signals_default_to_null(db) -> None:
     assert row["squawks_observed"] is None
     assert row["had_emergency"] is None
     assert row["primary_squawk"] is None
+
+
+def test_navaids_table_schema(tmp_path):
+    from adsbtrack.db import Database
+
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(navaids)").fetchall()}
+    assert {
+        "ident",
+        "name",
+        "type",
+        "latitude_deg",
+        "longitude_deg",
+        "elevation_ft",
+        "frequency_khz",
+        "iso_country",
+    } <= cols
+
+
+def test_flights_navaid_track_column(tmp_path):
+    from adsbtrack.db import Database
+
+    with Database(tmp_path / "nt.db") as db:
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert "navaid_track" in cols
+
+
+def test_flight_insert_round_trip_navaid_track(tmp_path):
+    from datetime import datetime
+
+    from adsbtrack.db import Database
+    from adsbtrack.models import Flight
+
+    db_path = tmp_path / "rt.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="abc123",
+            takeoff_time=datetime(2026, 3, 27, 12, 0, 0),
+            takeoff_lat=35.0,
+            takeoff_lon=-80.0,
+            takeoff_date="2026-03-27",
+            navaid_track='[{"navaid_ident": "CLT", "start_ts": 100.0, "end_ts": 280.0, "min_distance_nm": 2.5}]',
+        )
+        db.insert_flight(f)
+        row = db.conn.execute("SELECT navaid_track FROM flights WHERE icao=?", ("abc123",)).fetchone()
+        assert row["navaid_track"].startswith("[")
+        assert "CLT" in row["navaid_track"]

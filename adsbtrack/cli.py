@@ -14,6 +14,7 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
 from .fetcher import fetch_traces, fetch_traces_opensky
+from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
 from .runways import refresh_runways
@@ -453,6 +454,51 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, show_squawk, db
 
         console.print(table)
         console.print(f"\nTotal: {len(flights)} flights")
+
+
+@cli.command()
+@click.option("--hex", "hex_code", help="ICAO hex code (6 chars)")
+@click.option("--tail", "tail_number", help="Tail number; resolved to hex")
+@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+def route(hex_code, tail_number, db_path):
+    """Print the navaid track fingerprint for each flight of an aircraft."""
+    import json as _json
+
+    resolved = _resolve_hex(hex_code, tail_number)
+    cfg = Config(db_path=Path(db_path))
+    with Database(cfg.db_path) as db:
+        rows = db.conn.execute(
+            "SELECT takeoff_date, origin_icao, destination_icao,"
+            "       nearest_origin_icao, nearest_destination_icao, navaid_track"
+            "  FROM flights"
+            " WHERE icao = ?"
+            "   AND navaid_track IS NOT NULL"
+            " ORDER BY takeoff_time",
+            (resolved,),
+        ).fetchall()
+
+    if not rows:
+        console.print(f"No navaid track data for [cyan]{resolved}[/]")
+        return
+
+    for row in rows:
+        try:
+            payload = _json.loads(row["navaid_track"])
+        except (ValueError, TypeError):
+            continue
+        if not payload:
+            continue
+        origin = row["origin_icao"] or (f"({row['nearest_origin_icao']})" if row["nearest_origin_icao"] else "-")
+        destination = row["destination_icao"] or (
+            f"({row['nearest_destination_icao']})" if row["nearest_destination_icao"] else "-"
+        )
+        chain_parts = []
+        for seg in payload:
+            dur_secs = float(seg.get("end_ts", 0.0)) - float(seg.get("start_ts", 0.0))
+            label = "<1m" if dur_secs < 60.0 else f"{int(round(dur_secs / 60.0))}m"
+            chain_parts.append(f"{seg['navaid_ident']} ({label})")
+        chain = " -> ".join(chain_parts)
+        console.print(f"{row['takeoff_date']} {origin} -> {destination}  {chain}")
 
 
 @cli.command()
@@ -935,6 +981,40 @@ def runways_refresh(csv_path, db_path):
     except OSError as e:
         raise click.ClickException(f"filesystem error: {e}") from e
     console.print(f"[green]Runway geometry loaded:[/] {count} runway ends")
+
+
+@cli.group()
+def navaids():
+    """OurAirports navaid reference data (VOR / NDB / fixes)."""
+
+
+@navaids.command("refresh")
+@click.option(
+    "--csv",
+    "csv_path",
+    type=click.Path(exists=True, path_type=Path, dir_okay=False),
+    default=None,
+    help="Use a local navaids.csv instead of downloading from OurAirports.",
+)
+@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+def navaids_refresh(csv_path, db_path):
+    """Download OurAirports navaids.csv and upsert global navaid reference data.
+
+    Idempotent - re-running replaces existing rows.
+    """
+    import httpx
+
+    cfg = Config(db_path=Path(db_path))
+    try:
+        with Database(cfg.db_path) as db:
+            count = _refresh_navaids(db, cfg, local_csv=csv_path)
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"failed to download navaids.csv: {e}") from e
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+    except OSError as e:
+        raise click.ClickException(f"filesystem error: {e}") from e
+    console.print(f"[green]Navaid reference data loaded:[/] {count} navaids")
 
 
 # -----------------------------------------------------------------------------

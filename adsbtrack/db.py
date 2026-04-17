@@ -134,6 +134,7 @@ CREATE TABLE IF NOT EXISTS flights (
     squawks_observed TEXT,
     had_emergency INTEGER,
     primary_squawk TEXT,
+    navaid_track TEXT,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -210,6 +211,18 @@ CREATE TABLE IF NOT EXISTS runways (
     closed INTEGER DEFAULT 0,
     displaced_threshold_ft INTEGER,
     PRIMARY KEY (airport_ident, runway_name)
+);
+
+CREATE TABLE IF NOT EXISTS navaids (
+    ident TEXT NOT NULL,
+    name TEXT,
+    type TEXT,
+    latitude_deg REAL NOT NULL,
+    longitude_deg REAL NOT NULL,
+    elevation_ft INTEGER,
+    frequency_khz INTEGER,
+    iso_country TEXT,
+    PRIMARY KEY (ident, latitude_deg, longitude_deg)
 );
 
 CREATE TABLE IF NOT EXISTS faa_registry (
@@ -340,6 +353,8 @@ CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_runways_airport_ident ON runways(airport_ident);
 CREATE INDEX IF NOT EXISTS idx_runways_latlon ON runways(latitude_deg, longitude_deg);
+CREATE INDEX IF NOT EXISTS idx_navaids_latlon ON navaids(latitude_deg, longitude_deg);
+CREATE INDEX IF NOT EXISTS idx_navaids_ident ON navaids(ident);
 CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
 CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_n_number ON faa_registry(n_number);
@@ -580,6 +595,7 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("squawks_observed", "TEXT"),
         ("had_emergency", "INTEGER"),
         ("primary_squawk", "TEXT"),
+        ("navaid_track", "TEXT"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -765,7 +781,7 @@ class Database:
                 mlat_pct, tisb_pct, adsb_pct,
                 acars_out, acars_off, acars_on, acars_in, landing_anchor_method,
                 aligned_runway, aligned_seconds, aligned_min_offset_m, takeoff_runway,
-                had_go_around, pattern_cycles, squawks_observed, had_emergency, primary_squawk)
+                had_go_around, pattern_cycles, squawks_observed, had_emergency, primary_squawk, navaid_track)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -785,7 +801,7 @@ class Database:
                        ?, ?, ?,
                        ?, ?, ?,
                        ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -888,6 +904,7 @@ class Database:
                 flight.squawks_observed,
                 flight.had_emergency,
                 flight.primary_squawk,
+                flight.navaid_track,
             ),
         )
 

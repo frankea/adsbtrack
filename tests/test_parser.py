@@ -2309,3 +2309,104 @@ def test_parser_normal_a_to_b_has_zero_go_around_and_low_pattern_cycles():
     assert flight.pattern_cycles is not None and flight.pattern_cycles <= 1, (
         f"expected pattern_cycles <= 1, got {flight.pattern_cycles}"
     )
+
+
+def test_parser_sets_navaid_track_when_aligned(tmp_path):
+    """End-to-end: a flight whose track is aligned with one navaid for 60+ s
+    gets a JSON navaid_track column populated via the extract helper."""
+    import json
+    from unittest.mock import MagicMock
+
+    from adsbtrack.classifier import FlightMetrics, _PointSample
+    from adsbtrack.config import Config
+    from adsbtrack.parser import _compute_navaid_track_json
+
+    cfg = Config(db_path=tmp_path / "p.db")
+
+    # 40 aligned points, track=0, lat marching toward 35.5.
+    m = FlightMetrics(first_point_ts=1000.0)
+    for i in range(40):
+        m.all_points.append(
+            _PointSample(
+                ts=1000.0 + 2.0 * i,
+                baro_alt=5000,
+                geom_alt=5000,
+                gs=250.0,
+                baro_rate=0.0,
+                lat=34.5 + 0.02 * i,
+                lon=-80.0,
+                track=0.0,
+            )
+        )
+
+    mock_db = MagicMock()
+    mock_db.conn.execute.return_value.fetchall.return_value = [
+        {
+            "ident": "TEST",
+            "name": "TESTNV",
+            "type": "VOR",
+            "latitude_deg": 35.5,
+            "longitude_deg": -80.0,
+            "elevation_ft": 0,
+            "frequency_khz": None,
+            "iso_country": "US",
+        }
+    ]
+
+    result = _compute_navaid_track_json(m, db=mock_db, config=cfg, navaid_cache={})
+    assert result is not None
+    payload = json.loads(result)
+    assert payload[0]["navaid_ident"] == "TEST"
+    assert payload[0]["end_ts"] - payload[0]["start_ts"] >= 30.0
+
+
+def test_parser_navaid_track_cache_reused_across_flights(tmp_path):
+    """A second call with an overlapping bbox hits the cache."""
+    from unittest.mock import MagicMock
+
+    from adsbtrack.classifier import FlightMetrics, _PointSample
+    from adsbtrack.config import Config
+    from adsbtrack.parser import _compute_navaid_track_json
+
+    cfg = Config(db_path=tmp_path / "p.db")
+    mock_db = MagicMock()
+    mock_db.conn.execute.return_value.fetchall.return_value = []
+
+    cache: dict = {}
+
+    def one_metric(offset: float) -> FlightMetrics:
+        m = FlightMetrics(first_point_ts=1000.0)
+        for i in range(10):
+            m.all_points.append(
+                _PointSample(
+                    ts=1000.0 + 2.0 * i,
+                    baro_alt=5000,
+                    geom_alt=5000,
+                    gs=250.0,
+                    baro_rate=0.0,
+                    lat=34.5 + 0.001 * i + offset,
+                    lon=-80.0 + 0.001 * i,
+                    track=0.0,
+                )
+            )
+        return m
+
+    _compute_navaid_track_json(one_metric(0.0), db=mock_db, config=cfg, navaid_cache=cache)
+    _compute_navaid_track_json(one_metric(0.01), db=mock_db, config=cfg, navaid_cache=cache)
+
+    # Both tight bboxes quantize to the same 0.5-deg key -> cache hit.
+    assert len(cache) == 1
+    assert mock_db.conn.execute.call_count == 1
+
+
+def test_parser_navaid_track_none_when_no_points(tmp_path):
+    """Empty metrics -> no bbox -> None."""
+    from unittest.mock import MagicMock
+
+    from adsbtrack.classifier import FlightMetrics
+    from adsbtrack.config import Config
+    from adsbtrack.parser import _compute_navaid_track_json
+
+    cfg = Config(db_path=tmp_path / "p.db")
+    m = FlightMetrics(first_point_ts=1000.0)
+    assert _compute_navaid_track_json(m, db=MagicMock(), config=cfg, navaid_cache={}) is None

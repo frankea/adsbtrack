@@ -126,3 +126,35 @@ Matched timestamps are anchored to the flight's calendar day (+/-1 day) via clos
 `enrich all` and `enrich hex` populate `hex_crossref` by merging three external sources in preference order: FAA registry -> Mictronics DB -> hexdb.io live lookup. Conflicts between sources (differing registrations or type codes) are reported to the caller for manual review but don't prevent the row from being written.
 
 Every hex is also checked against `mil_hex_ranges` independently of the civilian identity sources: a hex can carry a Mictronics registration AND be flagged `is_military=1` with country / branch attribution, which surfaces government-operated aircraft sitting in known military allocation blocks (e.g. Bell 407s in the US DoD AE-prefix range).
+
+## Navaid alignment
+
+**Column:** `navaid_track` (JSON string or NULL).
+
+**What it captures.** For each flight, the ordered list of VORs / NDBs / fixes whose bearing the ground track pointed directly toward for at least `navaid_min_duration_secs` seconds, excluding segments whose closest approach to the navaid exceeded `navaid_near_pass_max_nm` nm. This is a compact fingerprint of the enroute routing: a helicopter that always flies `SHAWZ -> KEEMO -> direct destination` will show that chain on most flights, while a point-to-point shuttle will typically show zero or one navaid.
+
+**Algorithm (adsbtrack/navaid_alignment.py).** For each flight and each pre-filtered navaid within the flight's bounding box (plus `navaid_bbox_buffer_nm` buffer), the per-point bearing-to-navaid is compared with the ground track. Points with delta under `navaid_alignment_tolerance_deg` and distance under `navaid_max_distance_nm` are kept. Kept points are split into segments on any gap longer than `navaid_split_gap_secs`, then segments are filtered by `navaid_min_duration_secs` duration and `navaid_near_pass_max_nm` closest-approach distance. Defaults: 1 degree tolerance, 500 nm cutoff, 120 s gap split, 30 s duration floor, 80 nm closest-approach cap.
+
+**Input source.** The detector is fed from `FlightMetrics.all_points`, which is a full per-flight list (unlike `recent_points`, which is a 240-sample tail deque insufficient for enroute alignment).
+
+**Output shape.** Each qualifying segment serializes as `{"navaid_ident": "<IDENT>", "start_ts": <unix>, "end_ts": <unix>, "min_distance_nm": <number>}`. Flights with no qualifying segments emit NULL rather than `[]` so the column is informative.
+
+**CLI.** `adsbtrack.cli route --hex <icao>` prints one line per flight with a non-empty navaid_track:
+
+    2026-03-27 KSPG -> KHKY  SHAWZ (15m) -> KEEMO (8m) -> CLT (3m)
+
+**Limitations.**
+
+- A 1-degree tolerance and 500 nm range mean that on any long straight leg, a passing sector can coincidentally align with a distant navaid. The 80 nm closest-approach filter rejects most such spurious matches but not all: navaids the aircraft actually flew past by 30-80 nm will register even when the pilot had no intent to track them. Alignment is not intent.
+- The algorithm treats each navaid independently. An aircraft that alternates between two parallel airways a few nm apart will produce both navaids in its fingerprint.
+- Antimeridian-crossing flights are skipped (`flight_bbox_from_points` returns None when the longitude span exceeds 180 deg). This is negligible for US / Europe / single-operator workloads; revisit if it becomes relevant for a future region.
+- The `navaids` table must be refreshed via `adsbtrack.cli navaids refresh` for this column to ever populate. With an empty navaids table, `navaid_track` is always NULL.
+
+**Performance.** Measured on a local 1.8 GB dev DB over two aircraft, `extract --reprocess` median wall-clock across three runs each:
+
+| Hex      | Flights | Avg points / flight | Empty navaids | 11,010 navaids | Delta |
+|----------|---------|---------------------|---------------|----------------|-------|
+| a7a622   | 1,609   | 119                 | 3.69 s        | 4.75 s         | +29%  |
+| a4aaa0   | 515     | 502                 | 5.33 s        | 12.71 s        | +138% |
+
+The light-trace rotorcraft hex stays under the <50% target; the heavy-trace fixed-wing hex with wide geographic spread (49 distinct origins across the eastern US) exceeds it because per-flight cost scales with `points_per_flight * navaids_in_bbox` and the bbox cache hits are diluted by operator diversity. Overhead is bounded by `O(flights * navaids_in_cached_bbox * points_per_flight)`; the per-extract-run bbox cache (quantized to 0.5 degrees) coalesces same-region flights so the SQL cost is paid once per ~0.5-degree grid cell rather than per flight. The 1-degree bearing tolerance rejects most points before any trig, which keeps the constant factor small but not small enough to hide at ~500 points / flight over a US-wide bbox. Users ingesting wide-ranging fleets should expect the navaid column to roughly double `extract --reprocess` time; narrow-operation fleets (helicopters, regional commuters) will see closer to the 30% range. Numbers are from a single developer machine and are indicative rather than authoritative.

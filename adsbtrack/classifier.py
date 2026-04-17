@@ -232,6 +232,10 @@ class FlightMetrics:
     # Capped at 240 samples OR 600 seconds from first_point_ts, whichever
     # first. Consumed by adsbtrack.takeoff_runway.
     takeoff_points: list[_PointSample] = field(default_factory=list)
+    # Full per-flight point stream for analyses that need the whole route,
+    # not just a tail or head window. Consumed by adsbtrack.navaid_alignment
+    # via the parser's navaid_track helper. Unbounded (grows with the flight).
+    all_points: list[_PointSample] = field(default_factory=list)
     # v9 N7: recent airborne positions for bearing-based heading fallback
     # when track data is unavailable (helicopter hover approaches).
     _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
@@ -314,6 +318,7 @@ class FlightMetrics:
         # so it's guaranteed non-None by here.
         if len(self.takeoff_points) < 240 and self.first_point_ts is not None and (ts - self.first_point_ts) <= 600.0:
             self.takeoff_points.append(self.recent_points[-1])
+        self.all_points.append(self.recent_points[-1])
 
         # Approach altitudes deque for go-around detection, phase budget
         # level_buf, and cruise altitude. v6 N1 fix: prefer baro_alt to

@@ -1,0 +1,4 @@
+id,filename,ident,name,type,frequency_khz,latitude_deg,longitude_deg,elevation_ft,iso_country,dme_frequency_khz,dme_channel,dme_latitude_deg,dme_longitude_deg,dme_elevation_ft,slaved_variation_deg,magnetic_variation_deg,usageType,power,associated_airport
+1,test1,CLT,CHARLOTTE,VOR-DME,115800,35.1888,-80.9508,750,US,,,,,,,,,,
+2,test2,SHAWZ,SHAWZ,FIX,,34.567,-81.234,,US,,,,,,,,,,
+3,test3,KEEMO,KEEMO,NDB,356,36.7777,-83.1234,1200,US,,,,,,,,,,

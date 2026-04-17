@@ -291,8 +291,14 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
         "alignment data (column auto-shows when data is present)."
     ),
 )
+@click.option(
+    "--show-squawk/--no-show-squawk",
+    "show_squawk",
+    default=False,
+    help="Show the primary squawk code held by each flight.",
+)
 @click.option("--db", "db_path", default="adsbtrack.db")
-def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
+def trips(hex_code, from_date, to_date, airport, show_alignment, show_squawk, db_path):
     """Show flight history."""
     hex_code = hex_code.lower()
     with Database(Path(db_path)) as db:
@@ -318,6 +324,8 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
         has_alignment_data = any(_col(f, "aligned_runway") is not None for f in flights)
         show_alignment_col = show_alignment or has_alignment_data
 
+        show_squawk_col = show_squawk
+
         table = Table(title=f"Flights for {hex_code}")
         table.add_column("Date", style="cyan")
         table.add_column("From", style="green")
@@ -331,6 +339,8 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
             table.add_column("ACARS", justify="right", style="cyan")
         if show_alignment_col:
             table.add_column("Aligned", justify="right", style="cyan")
+        if show_squawk_col:
+            table.add_column("Squawk", justify="right", style="cyan")
 
         mission_display = {
             "ems_hems": "EMS",
@@ -436,6 +446,9 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
                 else:
                     alignment_cell = "[dim]--[/]"
                 row_cells.append(alignment_cell)
+            if show_squawk_col:
+                squawk_cell = _col(f, "primary_squawk") or "[dim]--[/]"
+                row_cells.append(squawk_cell)
             table.add_row(*row_cells)
 
         console.print(table)

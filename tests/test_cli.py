@@ -935,3 +935,67 @@ def test_status_shows_emergency_breakdown_and_avg_squawk_changes(tmp_path, monke
     assert re.search(r"1\s*\(7600\)", result.output) is not None
     # Avg squawk changes should be (3+1+0+5+2)/5 = 2.2
     assert re.search(r"Squawk changes.*2\.2", result.output) is not None
+
+
+def test_trips_show_squawk_renders_primary_column(tmp_path, monkeypatch) -> None:
+    """trips --show-squawk adds a Squawk column and renders primary_squawk."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="sqwk01",
+            takeoff_time=datetime(2024, 6, 1, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2024-06-01",
+            landing_time=datetime(2024, 6, 1, 11, 0),
+            landing_lat=28.0,
+            landing_lon=-82.5,
+            landing_date="2024-06-01",
+            origin_icao="KSPG",
+            destination_icao="KPIE",
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+            primary_squawk="1200",
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["trips", "--hex", "sqwk01", "--db", str(db_path), "--show-squawk"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Squawk" in result.output
+    assert "1200" in result.output
+
+
+def test_trips_no_squawk_column_by_default(tmp_path, monkeypatch) -> None:
+    """Without --show-squawk the Squawk column is hidden."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="sqwk02",
+            takeoff_time=datetime(2024, 6, 1, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2024-06-01",
+            landing_time=datetime(2024, 6, 1, 11, 0),
+            landing_lat=28.0,
+            landing_lon=-82.5,
+            landing_date="2024-06-01",
+            origin_icao="KSPG",
+            destination_icao="KPIE",
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+            primary_squawk="1200",
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "sqwk02", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Squawk" not in result.output  # column hidden by default

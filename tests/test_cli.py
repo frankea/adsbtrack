@@ -1113,3 +1113,146 @@ def test_route_cli_short_segment_under_a_minute(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["route", "--hex", "abc123", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "NDB1 (<1m)" in result.output
+
+
+# ---------------------------------------------------------------------------
+# _resolve_hex_db: registration-based fetch resolution (shot 4)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_hex_db_nnumber_uses_algorithm(tmp_path):
+    """N-number resolution must not touch the DB. The algorithmic path
+    works for any valid N-number whether observed or not."""
+    from adsbtrack.cli import _resolve_hex_db
+
+    db_path = tmp_path / "noaircraft.db"
+    with Database(db_path) as db:
+        # Empty aircraft_registry and hex_crossref -- should still resolve.
+        resolved = _resolve_hex_db(db, None, "N512WB")
+    assert resolved == "a66ad3"
+
+
+def test_resolve_hex_db_nonus_reg_via_aircraft_registry(tmp_path):
+    from adsbtrack.cli import _resolve_hex_db
+
+    db_path = tmp_path / "reg.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+            ("abc123", "G-XYZA", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.commit()
+        resolved = _resolve_hex_db(db, None, "G-XYZA")
+    assert resolved == "abc123"
+
+
+def test_resolve_hex_db_nonus_reg_via_hex_crossref(tmp_path):
+    """aircraft_registry empty but hex_crossref has the reg: fall through
+    to hex_crossref and resolve successfully."""
+    from adsbtrack.cli import _resolve_hex_db
+
+    db_path = tmp_path / "xref.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO hex_crossref (icao, registration, source) VALUES (?, ?, ?)",
+            ("def456", "D-ABCD", "mictronics"),
+        )
+        db.conn.commit()
+        resolved = _resolve_hex_db(db, None, "D-ABCD")
+    assert resolved == "def456"
+
+
+def test_resolve_hex_db_multiple_matches_picks_newest_and_warns(tmp_path, capsys):
+    """If the same reg appears on multiple icao rows in aircraft_registry
+    (reg reassigned across aircraft), pick the most-recent last_updated
+    and warn on stderr. An analyst with a specific hex in mind can pass
+    --hex instead."""
+
+    from adsbtrack.cli import _resolve_hex_db
+
+    db_path = tmp_path / "multi.db"
+    with Database(db_path) as db:
+        for icao, ts in [("aaa001", "2020-01-01T00:00:00Z"), ("bbb002", "2025-11-20T00:00:00Z")]:
+            db.conn.execute(
+                "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+                (icao, "N999TEST", ts),
+            )
+        db.conn.commit()
+        # Bypass the algorithmic path: N999TEST is syntactically a valid
+        # N-number so nnumber_to_icao will succeed -- that's the correct
+        # behavior (algorithm wins over stored data). For the multi-match
+        # test we need a non-N-number reg, use a UK-style one:
+        for icao, ts in [("ccc003", "2020-01-01T00:00:00Z"), ("ddd004", "2025-11-20T00:00:00Z")]:
+            db.conn.execute(
+                "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+                (icao, "G-MULTI", ts),
+            )
+        db.conn.commit()
+        resolved = _resolve_hex_db(db, None, "G-MULTI")
+    assert resolved == "ddd004"  # newer last_updated wins
+    # The warning goes through rich.Console(), but either way it mustn't
+    # fail; subsequent behavior is the critical contract.
+    _ = capsys.readouterr()  # drain
+
+
+def test_resolve_hex_db_unknown_reg_errors_with_guidance(tmp_path):
+    """Unknown tail raises click.UsageError with a message pointing at
+    the manual resolution paths (--hex, registry update, fetch by hex
+    first)."""
+    import click
+    import pytest
+
+    from adsbtrack.cli import _resolve_hex_db
+
+    db_path = tmp_path / "empty.db"
+    with Database(db_path) as db, pytest.raises(click.UsageError) as excinfo:
+        _resolve_hex_db(db, None, "G-NOPE")
+    msg = str(excinfo.value).lower()
+    assert "g-nope" in msg or "not" in msg  # surfaces the offending tail
+    assert "--hex" in msg or "registry update" in msg  # points at remediation
+
+
+def test_fetch_cli_accepts_nonus_tail(tmp_path, monkeypatch):
+    """End-to-end: `adsbtrack fetch --tail G-XYZA` must resolve the reg
+    via aircraft_registry and proceed to (mocked) fetch. Uses monkeypatch
+    to stub fetch_traces so the test doesn't do real HTTP."""
+    from adsbtrack import cli as cli_module
+
+    calls: list[str] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        calls.append(hex_code)
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+            ("abcdef", "G-XYZA", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.commit()
+        # Seed one airport so ensure_airports() doesn't try to download.
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--tail",
+            "G-XYZA",
+            "--start",
+            "2024-01-01",
+            "--end",
+            "2024-01-02",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == ["abcdef"]

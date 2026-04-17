@@ -60,6 +60,69 @@ def _resolve_hex(hex_code: str | None, tail_number: str | None) -> str:
     return hex_code.lower()
 
 
+def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None) -> str:
+    """Resolve an ICAO hex code from --hex or --tail, with DB fallback.
+
+    Like _resolve_hex but falls back through aircraft_registry then
+    hex_crossref when the tail isn't a valid FAA N-number. Useful for
+    non-US registrations (G-, D-, VP-*) once the aircraft has been
+    observed or the cross-reference tables have been populated.
+
+    Multi-match: if a tail appears on multiple ICAO hexes (reg
+    reassigned across aircraft over time), pick the row with the
+    newest `last_updated` and warn. Analysts who want a specific
+    aircraft can pass --hex explicitly.
+    """
+    if hex_code and tail_number:
+        raise click.UsageError("Provide either --hex or --tail, not both.")
+    if not hex_code and not tail_number:
+        raise click.UsageError("Provide either --hex or --tail.")
+    if hex_code:
+        return hex_code.lower()
+
+    # Algorithmic N-number conversion. Works for any syntactically
+    # valid N-number regardless of DB state.
+    try:
+        resolved = nnumber_to_icao(tail_number)
+        console.print(f"[dim]Converted {tail_number} to hex {resolved}[/]")
+        return resolved.lower()
+    except ValueError:
+        pass  # not an N-number; try DB lookups
+
+    rows = db.conn.execute(
+        "SELECT icao, last_updated FROM aircraft_registry "
+        "WHERE registration = ? COLLATE NOCASE "
+        "ORDER BY COALESCE(last_updated, '') DESC",
+        (tail_number,),
+    ).fetchall()
+    if not rows:
+        rows = db.conn.execute(
+            "SELECT icao, last_updated FROM hex_crossref "
+            "WHERE registration = ? COLLATE NOCASE "
+            "ORDER BY COALESCE(last_updated, '') DESC",
+            (tail_number,),
+        ).fetchall()
+
+    if not rows:
+        raise click.UsageError(
+            f"Could not resolve tail {tail_number!r}. Options:\n"
+            f"  - Pass --hex <icao> directly if you know the ICAO hex\n"
+            f"  - Run `adsbtrack registry update` to populate the FAA registry\n"
+            f"  - Fetch by --hex first; aircraft_registry is populated as a side effect"
+        )
+
+    distinct_icaos = sorted({row["icao"] for row in rows})
+    if len(distinct_icaos) > 1:
+        console.print(
+            f"[yellow]Tail {tail_number!r} resolved to multiple hexes: "
+            f"{distinct_icaos}. Using newest ({rows[0]['icao']}). "
+            f"Pass --hex to disambiguate.[/]"
+        )
+    chosen = rows[0]["icao"]
+    console.print(f"[dim]Resolved {tail_number} to hex {chosen}[/]")
+    return chosen.lower()
+
+
 def _get_version() -> str:
     try:
         return pkg_version("adsbtrack")
@@ -76,7 +139,14 @@ def cli():
 
 @cli.command()
 @click.option("--hex", "hex_code", default=None, help="ICAO hex code (e.g. adf64f)")
-@click.option("--tail", "tail_number", default=None, help="FAA N-number (e.g. N512WB), converted to hex automatically")
+@click.option(
+    "--tail",
+    "tail_number",
+    default=None,
+    help="Tail/registration. FAA N-numbers are converted algorithmically; "
+    "other registrations (G-, D-, VP-*) are resolved via aircraft_registry "
+    "or hex_crossref if the aircraft has been observed or cross-referenced.",
+)
 @click.option(
     "--source",
     type=click.Choice(ALL_SOURCES_WITH_ALL),
@@ -98,9 +168,8 @@ def cli():
 @click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
 def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate, concurrency, db_path):
     """Download trace data from ADS-B data sources."""
-    hex_code = _resolve_hex(hex_code, tail_number)
-
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         config = Config(db_path=Path(db_path))
         config.rate_limit = rate
         config.fetch_concurrency = concurrency

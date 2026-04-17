@@ -96,6 +96,7 @@ Extracted flights with airport matching, quality classification, confidence scor
 | aligned_runway | TEXT | Runway end the aircraft was geometrically aligned with on short final, e.g. `"09"` / `"26L"`. NULL when no segment qualified. |
 | aligned_seconds | REAL | Duration in seconds of the longest qualifying alignment segment. NULL when no segment qualified. |
 | aligned_min_offset_m | REAL | Minimum perpendicular offset in meters from the extended centerline over the winning segment. NULL when no segment qualified. |
+| takeoff_runway | TEXT | Runway name (e.g. "24", "08R") the aircraft departed from. NULL when detection failed or runway data is unavailable. |
 | turnaround_minutes | REAL | Minutes from the previous flight's landing to this takeoff (same ICAO; NULL if > 72 h) |
 | turnaround_category | TEXT | `quick` (<30 min) / `medium` (30-240 min) / `overnight` (4-18 h) / `multi_day` (>18 h) / `extended_gap` (>72 h) / `first_observed` / `last_observed` (never NULL) |
 | is_first_observed_flight | INTEGER | 1 if no prior flight exists for this ICAO |

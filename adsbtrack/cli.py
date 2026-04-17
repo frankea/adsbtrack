@@ -286,7 +286,10 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     "--alignment/--no-alignment",
     "show_alignment",
     default=False,
-    help="Show ILS alignment runway and duration.",
+    help=(
+        "Force-show the ILS alignment column even when no flight in the result set has "
+        "alignment data (column auto-shows when data is present)."
+    ),
 )
 @click.option("--db", "db_path", default="adsbtrack.db")
 def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
@@ -419,6 +422,9 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
             if show_alignment_col:
                 runway = _col(f, "aligned_runway")
                 seconds = _col(f, "aligned_seconds")
+                # int(round(...)) uses banker's rounding (round-half-to-even); sub-second
+                # precision isn't meaningful for ADS-B samples (~1s cadence) so this is
+                # display-only and the minor round-half-to-even quirk is intentional.
                 if runway and seconds is not None:
                     alignment_cell = f"[green]RWY {runway} / {int(round(seconds))}s[/]"
                 else:

@@ -695,7 +695,7 @@ def test_mil_scan_finds_military_aircraft(tmp_path):
     assert "United States" in result.output
 
 
-def test_trips_renders_alignment_column_when_flag_set(tmp_path):
+def test_trips_renders_alignment_column_when_flag_set(tmp_path, monkeypatch):
     """`trips --alignment` must add the RWY column and render a row when
     alignment data exists."""
     db_path = tmp_path / "a.db"
@@ -723,18 +723,17 @@ def test_trips_renders_alignment_column_when_flag_set(tmp_path):
         db.insert_flight(f)
 
     runner = CliRunner()
+    monkeypatch.setenv("COLUMNS", "200")
     result = runner.invoke(
         cli,
         ["trips", "--hex", "abc123", "--db", str(db_path), "--alignment"],
     )
     assert result.exit_code == 0, result.output
-    # Rich may truncate the header to "Align..." at narrow widths, so
-    # assert on the stable prefix.
-    assert "Align" in result.output
+    assert "Aligned" in result.output
     assert "RWY 09" in result.output and "85s" in result.output
 
 
-def test_trips_auto_shows_alignment_column_when_any_row_has_data(tmp_path):
+def test_trips_auto_shows_alignment_column_when_any_row_has_data(tmp_path, monkeypatch):
     """If any row has aligned_runway, the column shows up even without the flag."""
     db_path = tmp_path / "a.db"
     with Database(db_path) as db:
@@ -761,12 +760,11 @@ def test_trips_auto_shows_alignment_column_when_any_row_has_data(tmp_path):
         db.insert_flight(f)
 
     runner = CliRunner()
+    monkeypatch.setenv("COLUMNS", "200")
     result = runner.invoke(
         cli,
         ["trips", "--hex", "abc456", "--db", str(db_path)],
     )
     assert result.exit_code == 0, result.output
-    # Rich may truncate the header to "Align..." at narrow widths, so
-    # assert on the stable prefix.
-    assert "Align" in result.output
+    assert "Aligned" in result.output
     assert "RWY 27" in result.output and "63s" in result.output  # 62.7 rounds to 63

@@ -7,14 +7,12 @@ from pathlib import Path
 import httpx
 from rich.progress import Progress
 
-from .classifier import _haversine_m
 from .config import Config
 from .db import Database
+from .geo import haversine_km
 from .models import AirportMatch
 
-
-def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    return _haversine_m(lat1, lon1, lat2, lon2) / 1000.0
+__all__ = ["haversine_km", "fetch_ourairports_csv", "download_airports", "enrich_helipad_names", "find_nearest_airport"]
 
 
 def fetch_ourairports_csv(

@@ -18,7 +18,7 @@ from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database
 from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments
 from .landing_anchor import compute_landing_anchor
-from .models import Flight
+from .models import Flight, LandingType
 from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
 
 
@@ -507,9 +507,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     (hex_code,),
                 ).fetchone()
                 if drift_json and drift_json[0]:
-                    import json as _json
-
-                    drift_vals = _json.loads(drift_json[0])
+                    drift_vals = json.loads(drift_json[0])
                     type_conflicts = [d for d in drift_vals if d.get("type_code") and d["type_code"] != type_code]
                     if type_conflicts:
                         conflict_types = ", ".join(f"{d['type_code']}({d['count']})" for d in type_conflicts)
@@ -565,7 +563,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # and is otherwise ignored; the second confirms the transition.
     prev_was_ground_no_gs = False
 
-    def _close_pending(reason: str) -> None:
+    def _close_pending() -> None:
         """Finalize the current pending flight (if any) and reset state variables."""
         nonlocal pending_flight, pending_metrics, state, prev_ground_point
         nonlocal ground_count_before_takeoff, post_landing_start_ts, prev_was_ground_no_gs
@@ -586,7 +584,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             prev = datetime.fromisoformat(prev_day_date)
             curr = datetime.fromisoformat(day_date)
             if curr - prev > max_day_gap:
-                _close_pending("day_gap")
+                _close_pending()
                 prev_point_ts = None
 
         prev_day_date = day_date
@@ -614,7 +612,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             # timestamp that survives sorting via a duplicate offset) also
             # triggers a close instead of silently corrupting state.
             if prev_point_ts is not None and abs(abs_ts - prev_point_ts) > max_point_gap_secs:
-                _close_pending("intra_trace_gap")
+                _close_pending()
             prev_point_ts = abs_ts
 
             # Classify the point using baro + geom altitude fusion
@@ -903,7 +901,11 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # confirmed landings (legitimate quick helicopter hops) regardless
         # of size. Threshold raised to 3 min and dropped_on_approach added
         # since a sub-3-min dropped fragment is noise, not a real approach.
-        if flight.landing_type in ("signal_lost", "uncertain", "dropped_on_approach") and (
+        if flight.landing_type in (
+            LandingType.SIGNAL_LOST,
+            LandingType.UNCERTAIN,
+            LandingType.DROPPED_ON_APPROACH,
+        ) and (
             flight.duration_minutes is not None
             and flight.duration_minutes < config.min_viable_flight_minutes
             and metrics.data_points < config.min_viable_flight_points
@@ -966,7 +968,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 if to_result is not None:
                     flight.takeoff_runway = to_result.runway_name
 
-        if has_landing and flight.landing_type not in ("signal_lost", "dropped_on_approach"):
+        if has_landing and flight.landing_type not in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
             # Use anchor (alt-min in final window) when available; fall back
             # to landing_lat/lon only if compute_landing_anchor returned None
             # (shouldn't happen on a has_landing flight but guards against
@@ -1077,7 +1079,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # Uses the alt-min anchor (falling back to last_seen) so candidates
         # are queried around "where the aircraft was trying to land" rather
         # than where it was last observed (which may be at altitude).
-        if flight.landing_type in ("signal_lost", "dropped_on_approach"):
+        if flight.landing_type in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
             ref_lat = anchor.lat if anchor is not None else flight.last_seen_lat
             ref_lon = anchor.lon if anchor is not None else flight.last_seen_lon
             if ref_lat is not None and ref_lon is not None:
@@ -1167,12 +1169,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             # type. Altitude gate uses last_airborne_alt vs airport_elev +
             # max_ft_above_airport to match the detector's AGL cap.
             if (
-                flight.landing_type == "signal_lost"
+                flight.landing_type == LandingType.SIGNAL_LOST
                 and alignment.duration_secs >= config.ils_alignment_bonus_long_secs
                 and metrics.last_airborne_alt is not None
                 and metrics.last_airborne_alt < airport_elev_ft + config.ils_alignment_max_ft_above_airport
             ):
-                flight.landing_type = "dropped_on_approach"
+                flight.landing_type = LandingType.DROPPED_ON_APPROACH
 
         # --- Go-around + pattern_cycles (adsbtrack/ils_alignment.py) ---
         # all_segments was already computed above and feeds both ILS and

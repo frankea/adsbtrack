@@ -1176,6 +1176,18 @@ class Database:
         If ``icao`` is given, only that aircraft is refreshed. Otherwise all
         aircraft in the flights table get rolled up. Returns the number of
         rows written.
+
+        The five per-icao side queries below look like an N+1 antipattern but
+        are intentional: each targets a small indexed slice through
+        idx_flights_icao_time and runs in microseconds. Consolidating them
+        into grouped/windowed queries (COUNT DISTINCT + GROUP BY icao,
+        ROW_NUMBER OVER PARTITION BY icao) was benchmarked slower at every
+        scale tested: 1.2 -> 1.5 ms (30 aircraft), 6.9 -> 9.2 ms (100),
+        64.5 -> 97.7 ms (500), 151.5 -> 221.2 ms (2000). The consolidation
+        pessimizes because SQLite serves indexed WHERE icao=? lookups from
+        small ranges cheaper than it scans the whole table for a single
+        grouped aggregate. Leave the per-icao loop in place unless the
+        schema changes or a different DB engine is introduced.
         """
         where_clause = ""
         params: list = []

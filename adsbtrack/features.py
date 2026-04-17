@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import json
 import math
+import statistics
 from collections import Counter
 from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .classifier import _haversine_m, descent_score
 from .ils_alignment import _bearing_deg
-from .models import MissionType
+from .models import LandingType, MissionType
 from .solar import is_night_at
 
 if TYPE_CHECKING:
@@ -274,28 +275,16 @@ def compute_phase_budget(metrics: FlightMetrics, *, config: Config, wall_clock_s
                 repeats = max(1, int(round(_dt)))
                 weighted_gs.extend([_gs] * repeats)
         if weighted_gs:
-            weighted_gs.sort()
             n = len(weighted_gs)
-            # First pass: compute mean and stdev for 2-sigma rejection
-            mean_gs = sum(weighted_gs) / n
             if n > 2:
-                variance = sum((g - mean_gs) ** 2 for g in weighted_gs) / (n - 1)
-                stdev = variance**0.5
+                mean_gs = statistics.fmean(weighted_gs)
+                stdev = statistics.stdev(weighted_gs)
                 lower = mean_gs - 2.0 * max(stdev, 5.0)
                 upper = mean_gs + 2.0 * max(stdev, 5.0)
                 trimmed = [g for g in weighted_gs if lower <= g <= upper]
             else:
                 trimmed = weighted_gs
-            # Use median of trimmed samples
-            if trimmed:
-                trimmed.sort()
-                m = len(trimmed)
-                median_gs = trimmed[m // 2] if m % 2 else (trimmed[m // 2 - 1] + trimmed[m // 2]) / 2
-                cruise_gs_kt = int(round(median_gs))
-            else:
-                # All rejected -- fall back to raw median
-                median_gs = weighted_gs[n // 2] if n % 2 else (weighted_gs[n // 2 - 1] + weighted_gs[n // 2]) / 2
-                cruise_gs_kt = int(round(median_gs))
+            cruise_gs_kt = int(round(statistics.median(trimmed if trimmed else weighted_gs)))
             # cap cruise_gs at the persistence-filtered max_gs.
             # Cruise GS is a subset of all GS samples, so the median
             # cannot exceed the max. The v13 removal of this cap caused
@@ -407,7 +396,7 @@ def compute_go_around(metrics: FlightMetrics, *, landing_type: str, config: Conf
     Only runs on confirmed landings - otherwise the "final descent" anchor
     doesn't exist and the algorithm is meaningless.
     """
-    if landing_type != "confirmed":
+    if landing_type != LandingType.CONFIRMED:
         return 0
     if not metrics.approach_alts or metrics.landing_transition_ts is None:
         return 0
@@ -762,7 +751,7 @@ def infer_destination(
     When omitted, the function falls back to ``flight.last_seen_lat`` /
     ``flight.last_seen_lon`` (the historical behavior).
     """
-    if flight.landing_type not in ("signal_lost", "dropped_on_approach"):
+    if flight.landing_type not in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
         return {
             "probable_destination_icao": None,
             "probable_destination_distance_km": None,
@@ -871,7 +860,7 @@ def derive_all(
     flight.path_efficiency = path["path_efficiency"]
 
     # Phase budget (gate altitude-derived fields for altitude_error flights)
-    if flight.landing_type != "altitude_error":
+    if flight.landing_type != LandingType.ALTITUDE_ERROR:
         phase = compute_phase_budget(metrics, config=config, wall_clock_secs=duration_secs)
         flight.climb_secs = phase["climb_secs"]
         flight.descent_secs = phase["descent_secs"]
@@ -963,14 +952,7 @@ def derive_all(
             effective_type = "MIL_FW"
             flight.type_override = "MIL_FW"
 
-    # removed the hard type-specific GS cap. The persistence filter
-    # in classifier.py (gs_persistence_window_secs / gs_persistence_min_samples)
-    # already suppresses single-sample GS spikes. The hard cap was masking
-    # real data (e.g. rotorcraft capped at 250 kt regardless of whether the
-    # value was sustained). The type-ceiling backstop (R4) catches residual
-    # physically-impossible values.
-    raw_gs = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
-    flight.max_gs_kt = raw_gs
+    flight.max_gs_kt = int(metrics.max_gs_kt) if metrics.max_gs_kt > 0 else None
 
     # Squawks
     sq = compute_squawk_summary(metrics, config=config)
@@ -992,14 +974,13 @@ def derive_all(
     # DO-260 category
     flight.category_do260 = classify_category_do260(metrics)
 
-    # Autopilot + detail emergency
-    flight.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
-    flight.emergency_flag = metrics.emergency_flag
-
-    # null out autopilot_target for H60 / ae69xx AFTER the
-    # assignment above (otherwise the assignment overwrites the null).
+    # Autopilot + detail emergency. H60 / ae69xx are excluded because their
+    # nav_altitude_mcp readouts are not reliable cruise-altitude selections.
     if effective_type == "H60" or flight.icao.startswith("ae69"):
         flight.autopilot_target_alt_ft = None
+    else:
+        flight.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
+    flight.emergency_flag = metrics.emergency_flag
 
     # v7 R1 final cap: cruise_alt_ft must not exceed the type-ceiling-
     # capped flight.max_altitude. The compute_phase_budget cap uses

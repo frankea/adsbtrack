@@ -11,6 +11,7 @@ no dependency on scikit-learn.
 from __future__ import annotations
 
 import sqlite3
+from collections import defaultdict
 
 from .airports import haversine_km
 
@@ -19,16 +20,55 @@ def _dbscan(points: list[tuple[float, float]], eps_km: float, min_samples: int) 
     """Minimal DBSCAN returning a cluster label per point (-1 = noise).
 
     ``points`` is a list of (lat, lon) tuples. Distance metric is haversine.
-    O(n^2) which is fine for the ~5,000 off-airport coordinates in a typical DB.
+    Candidate neighbors are pulled from a lat/lon bucket index so each
+    point only compares against the handful of points in its own cell
+    plus the 8 adjacent cells, rather than all N. The haversine check
+    stays as the fine filter.
+
+    Cell size: eps_km / 111 deg in both axes. Using the latitude width for
+    the longitude cells is intentionally conservative — lon degrees get
+    smaller at higher latitudes, so a lat-width lon cell guarantees we
+    never miss a neighbor, at the cost of some extra candidates in
+    equatorial data. The final haversine distance check discards the
+    overshoot.
+
+    Known edge cases left unhandled (extremely rare for helipad use):
+      - Antimeridian crossing (points near +/-180 lon): adjacent cells
+        wrap to a different integer key, so the handful of cross-meridian
+        neighbors could be missed. Document rather than complicate.
+      - Polar clusters (|lat| > 85 deg): longitude cells shrink toward
+        zero physical width, so 9-cell lookup becomes undersized. Same:
+        document rather than complicate.
     """
     n = len(points)
     labels = [-1] * n
     visited = [False] * n
     cluster_id = 0
 
+    # Same cell width in both axes (see docstring). defaultdict so absent
+    # cells cost nothing on insertion; _neighbors uses plain .get to avoid
+    # growing the dict with empty entries at query time.
+    cell_size_deg = eps_km / 111.0
+    grid: dict[tuple[int, int], list[int]] = defaultdict(list)
+    for i, (lat, lon) in enumerate(points):
+        grid[(int(lat / cell_size_deg), int(lon / cell_size_deg))].append(i)
+
     def _neighbors(idx: int) -> list[int]:
         lat_i, lon_i = points[idx]
-        return [j for j in range(n) if j != idx and haversine_km(lat_i, lon_i, points[j][0], points[j][1]) <= eps_km]
+        lat_cell = int(lat_i / cell_size_deg)
+        lon_cell = int(lon_i / cell_size_deg)
+        out: list[int] = []
+        for dlat in (-1, 0, 1):
+            for dlon in (-1, 0, 1):
+                bucket = grid.get((lat_cell + dlat, lon_cell + dlon))
+                if bucket is None:
+                    continue
+                for j in bucket:
+                    if j == idx:
+                        continue
+                    if haversine_km(lat_i, lon_i, points[j][0], points[j][1]) <= eps_km:
+                        out.append(j)
+        return out
 
     for i in range(n):
         if visited[i]:

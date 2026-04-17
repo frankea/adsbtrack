@@ -22,9 +22,11 @@ v2 changes (Apr 2026):
 from __future__ import annotations
 
 import math
+import statistics
 from collections import deque
 from dataclasses import dataclass, field
 
+from .geo import haversine_m as _haversine_m
 from .models import LandingType
 
 
@@ -84,6 +86,10 @@ class _PointSample:
     # ground samples). Placed last so every existing construction call site
     # continues to compile unchanged.
     track: float | None = None
+
+    def altitude(self) -> int | None:
+        """Preferred altitude reading: baro, falling back to geometric."""
+        return self.baro_alt if self.baro_alt is not None else self.geom_alt
 
 
 @dataclass
@@ -227,7 +233,7 @@ class FlightMetrics:
     # Tracks near takeoff / landing, for heading computation. Stored as
     # (ts, track_deg, gs) tuples for later filtering in features.compute_headings.
     takeoff_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
-    landing_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
+    landing_tracks: deque[tuple[float, float, float | None]] = field(default_factory=lambda: deque(maxlen=240))
     # First-N-window samples captured for takeoff-runway detection. Unlike
     # recent_points (which is a tail-only deque), takeoff_points is a
     # monotonically-growing list bounded by a time window and a sample cap.
@@ -588,9 +594,8 @@ class FlightMetrics:
             if len(self._rate_window) >= peak_min_samples:
                 span = self._rate_window[-1][0] - self._rate_window[0][0]
                 if span >= peak_min_span:
-                    rates = sorted(r for _, r in self._rate_window)
-                    n = len(rates)
-                    median = rates[n // 2] if n % 2 else (rates[n // 2 - 1] + rates[n // 2]) / 2
+                    rates = [r for _, r in self._rate_window]
+                    median = statistics.median(rates)
                     abs_median = max(1.0, abs(median))
                     filtered = [r for r in rates if abs(r - median) <= 3.0 * abs_median + 500.0]
                     if len(filtered) >= peak_min_samples:
@@ -674,9 +679,6 @@ class FlightMetrics:
                 # Ground-state points with movement: include in landing buffer
                 # so helicopter hover-approach tracks reach compute_headings.
                 self.landing_tracks.append((ts, float(point.track), gs))
-            if len(self.landing_tracks) > 240:
-                # Keep the most recent 240 points only
-                self.landing_tracks = self.landing_tracks[-240:]
 
     def flush_open_squawk(self) -> None:
         """Close the currently-open squawk run by crediting the remaining
@@ -782,22 +784,6 @@ def _resolve_thresholds(config: _ConfigLike | None) -> _RecordPointThresholds:
         if hasattr(config, name):
             kwargs[name] = getattr(config, name)
     return _RecordPointThresholds(**kwargs)
-
-
-# ----------------------------------------------------------------------
-# Geographic helpers
-# ----------------------------------------------------------------------
-
-
-def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Great-circle distance in meters between two lat/lon points."""
-    r = 6_371_000.0  # earth radius in meters
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    return 2 * r * math.asin(math.sqrt(a))
 
 
 # ----------------------------------------------------------------------
@@ -1144,11 +1130,11 @@ def score_confidence(
         takeoff_conf = sum(f * w for f, w in takeoff_factors) / t_total if t_total > 0 else 0.5
 
     # ---- Landing confidence ----
-    if not has_landing or landing_type in ("signal_lost", "dropped_on_approach"):
+    if not has_landing or landing_type in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
         landing_conf = 0.0
-    elif landing_type == "altitude_error":
+    elif landing_type == LandingType.ALTITUDE_ERROR:
         landing_conf = 0.1
-    elif landing_type == "uncertain":
+    elif landing_type == LandingType.UNCERTAIN:
         # Duration artifact or ambiguous: show as low confidence but non-zero
         landing_conf = 0.15
     else:
@@ -1216,7 +1202,7 @@ def score_confidence(
         landing_conf = math.exp(log_sum / w_total) if w_total > 0 else 0.5
 
     # Penalty for altitude errors
-    if landing_type == "altitude_error":
+    if landing_type == LandingType.ALTITUDE_ERROR:
         takeoff_conf *= 0.3
 
     return round(takeoff_conf, 2), round(landing_conf, 2)

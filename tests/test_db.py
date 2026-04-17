@@ -1,7 +1,7 @@
 """Tests for adsbtrack.db -- database layer."""
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from sqlite3 import ProgrammingError
 
 import pytest
@@ -529,6 +529,145 @@ def test_refresh_aircraft_stats_ignores_negative_duration_flights(db):
     assert row["total_hours"] >= 0, f"total_hours went negative: {row['total_hours']}"
     assert row["avg_flight_minutes"] is not None
     assert row["avg_flight_minutes"] >= 0, f"avg_flight_minutes went negative: {row['avg_flight_minutes']}"
+
+
+def test_refresh_aircraft_stats_multi_aircraft_shapes(db):
+    """Fixture: three aircraft with different origin-base distributions plus
+    various callsigns and busiest-day patterns. Pins every output column
+    produced by refresh_aircraft_stats so a perf refactor that consolidates
+    the N+1 query pattern cannot silently drift the rollup numbers.
+
+    Aircraft A (aaa111): dominant base. 8 KSFO + 2 KJFK takeoffs.
+    Aircraft B (bbb222): nomadic. 3/2/1/1/1/1/1 spread across seven origins.
+    Aircraft C (ccc333): no origin/destination data on any flight.
+    """
+
+    def _mk(icao, date, hour, *, origin=None, destination=None, callsign=None, dur=60.0, landing_type="confirmed"):
+        takeoff = datetime.fromisoformat(f"{date}T{hour:02d}:00:00+00:00")
+        return Flight(
+            icao=icao,
+            takeoff_time=takeoff,
+            takeoff_lat=40.0,
+            takeoff_lon=-74.0,
+            takeoff_date=date,
+            landing_time=takeoff + timedelta(minutes=dur) if dur > 0 else None,
+            landing_lat=41.0,
+            landing_lon=-75.0,
+            landing_date=date,
+            origin_icao=origin,
+            destination_icao=destination,
+            callsign=callsign,
+            duration_minutes=dur,
+            landing_type=landing_type,
+        )
+
+    # Aircraft A: 10 flights, 8 from KSFO (dominant at 0.80), 2 from KJFK.
+    # Destinations flip so distinct_airports = {KSFO, KJFK} = 2.
+    # Dates: 4 on 2024-01-01 (busiest), 6 on other days.
+    # Callsigns: "AAL100" x 6, "AAL101" x 4 = 2 distinct.
+    # All confirmed; durations 60 min.
+    for i in range(8):
+        d = "2024-01-01" if i < 4 else f"2024-01-{i - 2:02d}"
+        cs = "AAL100" if i < 6 else "AAL101"
+        # Use distinct hours for flights on the same date so each gets its own row.
+        db.insert_flight(_mk("aaa111", d, 8 + i, origin="KSFO", destination="KJFK", callsign=cs))
+    for i in range(2):
+        d = f"2024-01-{10 + i:02d}"
+        db.insert_flight(_mk("aaa111", d, 12, origin="KJFK", destination="KSFO", callsign="AAL101"))
+
+    # Aircraft B: 10 flights with nomadic origin distribution.
+    # 3 KSFO, 2 KJFK, 1 KORD, 1 KLAX, 1 KDEN, 1 KBOS, 1 KMIA.
+    # Destinations all = KATL so distinct_airports = 8 (7 origins + KATL).
+    # Callsigns: all "BBB200" = 1 distinct.
+    # 6 confirmed, 4 signal_lost. Busiest day: 2024-02-03 with 3 flights.
+    b_origins = ["KSFO", "KSFO", "KSFO", "KJFK", "KJFK", "KORD", "KLAX", "KDEN", "KBOS", "KMIA"]
+    b_dates = [
+        "2024-02-01",
+        "2024-02-02",
+        "2024-02-03",
+        "2024-02-03",
+        "2024-02-03",
+        "2024-02-04",
+        "2024-02-05",
+        "2024-02-06",
+        "2024-02-07",
+        "2024-02-08",
+    ]
+    for i, (o, d) in enumerate(zip(b_origins, b_dates, strict=True)):
+        lt = "confirmed" if i < 6 else "signal_lost"
+        db.insert_flight(_mk("bbb222", d, 8 + i, origin=o, destination="KATL", callsign="BBB200", landing_type=lt))
+
+    # Aircraft C: 3 flights, all with NULL origin/destination. No callsign.
+    for i in range(3):
+        d = f"2024-03-{i + 1:02d}"
+        db.insert_flight(_mk("ccc333", d, 10))
+
+    db.commit()
+
+    assert db.refresh_aircraft_stats() == 3
+    db.commit()
+
+    rows = {r["icao"]: r for r in db.conn.execute("SELECT * FROM aircraft_stats").fetchall()}
+    assert set(rows) == {"aaa111", "bbb222", "ccc333"}
+
+    # --- Aircraft A: dominant base ---
+    a = rows["aaa111"]
+    assert a["first_seen"] == "2024-01-01"
+    assert a["last_seen"] == "2024-01-11"
+    assert a["total_flights"] == 10
+    assert a["confirmed_flights"] == 10
+    assert a["total_hours"] == 10.0
+    assert a["total_cycles"] == 10
+    assert a["distinct_airports"] == 2
+    assert a["distinct_callsigns"] == 2
+    assert a["avg_flight_minutes"] == 60.0
+    assert a["busiest_day_date"] == "2024-01-01"
+    assert a["busiest_day_count"] == 4
+    assert a["home_base_icao"] == "KSFO"
+    assert a["home_base_share"] == 0.8
+    assert a["home_base_uncertain"] == 0
+    assert a["second_base_icao"] == "KJFK"
+    assert a["second_base_share"] == 0.2
+
+    # --- Aircraft B: nomadic ---
+    b = rows["bbb222"]
+    assert b["first_seen"] == "2024-02-01"
+    assert b["last_seen"] == "2024-02-08"
+    assert b["total_flights"] == 10
+    assert b["confirmed_flights"] == 6
+    assert b["total_hours"] == 10.0
+    assert b["total_cycles"] == 6
+    # 7 distinct origins + KATL destination = 8 distinct airports
+    assert b["distinct_airports"] == 8
+    assert b["distinct_callsigns"] == 1
+    assert b["avg_flight_minutes"] == 60.0
+    assert b["busiest_day_date"] == "2024-02-03"
+    assert b["busiest_day_count"] == 3
+    assert b["home_base_icao"] == "KSFO"
+    assert b["home_base_share"] == 0.3
+    assert b["home_base_uncertain"] == 1  # 0.30 < 0.40
+    assert b["second_base_icao"] == "KJFK"
+    assert b["second_base_share"] == 0.2
+
+    # --- Aircraft C: no origin/destination ---
+    c = rows["ccc333"]
+    assert c["first_seen"] == "2024-03-01"
+    assert c["last_seen"] == "2024-03-03"
+    assert c["total_flights"] == 3
+    assert c["confirmed_flights"] == 3
+    assert c["total_hours"] == 3.0
+    assert c["total_cycles"] == 3
+    assert c["distinct_airports"] == 0
+    assert c["distinct_callsigns"] == 0
+    assert c["avg_flight_minutes"] == 60.0
+    # All three days tie at count=1; busiest_row query tie-breaks on takeoff_date DESC.
+    assert c["busiest_day_date"] == "2024-03-03"
+    assert c["busiest_day_count"] == 1
+    assert c["home_base_icao"] is None
+    assert c["home_base_share"] is None
+    assert c["home_base_uncertain"] == 0
+    assert c["second_base_icao"] is None
+    assert c["second_base_share"] is None
 
 
 def test_faa_registry_tables_exist(tmp_path):

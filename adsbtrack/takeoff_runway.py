@@ -25,6 +25,8 @@ from dataclasses import dataclass
 from shapely.geometry import Point, Polygon  # type: ignore[import-untyped]
 
 from .classifier import FlightMetrics, _PointSample
+from .geo import destination_point
+from .geo import destination_point as _destination_point  # noqa: F401  (kept for tests)
 
 
 @dataclass(frozen=True)
@@ -32,33 +34,6 @@ class TakeoffRunwayResult:
     runway_name: str
     duration_secs: float
     max_gs_kt: float
-
-
-_EARTH_RADIUS_M = 6_371_000.0
-
-
-def _destination_point(lat_deg: float, lon_deg: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
-    """Destination (lat, lon) given a start point, bearing (degrees true), and distance (meters).
-
-    Spherical earth model. Accuracy at runway scale (<10 km) is within a
-    meter or two, well under the polygon's least-sensitive dimension.
-    """
-    br = math.radians(bearing_deg)
-    ang = distance_m / _EARTH_RADIUS_M
-    phi1 = math.radians(lat_deg)
-    lam1 = math.radians(lon_deg)
-    sin_phi2 = math.sin(phi1) * math.cos(ang) + math.cos(phi1) * math.sin(ang) * math.cos(br)
-    phi2 = math.asin(sin_phi2)
-    y = math.sin(br) * math.sin(ang) * math.cos(phi1)
-    x = math.cos(ang) - math.sin(phi1) * sin_phi2
-    lam2 = lam1 + math.atan2(y, x)
-    return math.degrees(phi2), ((math.degrees(lam2) + 540.0) % 360.0) - 180.0
-
-
-def _sample_alt(s: _PointSample) -> int | None:
-    if s.baro_alt is not None:
-        return s.baro_alt
-    return s.geom_alt
 
 
 def _build_polygon(
@@ -78,11 +53,11 @@ def _build_polygon(
     # the same direction.
     departure_heading = heading_deg % 360.0
 
-    near_left = _destination_point(threshold_lat, threshold_lon, (heading_deg + 90.0) % 360.0, half_near)
-    near_right = _destination_point(threshold_lat, threshold_lon, (heading_deg - 90.0) % 360.0, half_near)
-    far_center = _destination_point(threshold_lat, threshold_lon, departure_heading, zone_length_m)
-    far_left = _destination_point(far_center[0], far_center[1], (heading_deg + 90.0) % 360.0, wide_half)
-    far_right = _destination_point(far_center[0], far_center[1], (heading_deg - 90.0) % 360.0, wide_half)
+    near_left = destination_point(threshold_lat, threshold_lon, (heading_deg + 90.0) % 360.0, half_near)
+    near_right = destination_point(threshold_lat, threshold_lon, (heading_deg - 90.0) % 360.0, half_near)
+    far_center = destination_point(threshold_lat, threshold_lon, departure_heading, zone_length_m)
+    far_left = destination_point(far_center[0], far_center[1], (heading_deg + 90.0) % 360.0, wide_half)
+    far_right = destination_point(far_center[0], far_center[1], (heading_deg - 90.0) % 360.0, wide_half)
 
     # Shapely uses (x, y) = (lon, lat).
     return Polygon(
@@ -108,7 +83,7 @@ def _filter_takeoff_samples(
     for s in samples:
         if s.lat is None or s.lon is None or s.track is None:
             continue
-        alt = _sample_alt(s)
+        alt = s.altitude()
         if alt is None or alt > alt_cap:
             continue
         climbing = s.baro_rate is not None and s.baro_rate > min_vert_rate_fpm

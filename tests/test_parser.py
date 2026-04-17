@@ -2410,3 +2410,196 @@ def test_parser_navaid_track_none_when_no_points(tmp_path):
     cfg = Config(db_path=tmp_path / "p.db")
     m = FlightMetrics(first_point_ts=1000.0)
     assert _compute_navaid_track_json(m, db=MagicMock(), config=cfg, navaid_cache={}) is None
+
+
+# ---------------------------------------------------------------------------
+# Fast-path equivalence: _extract_point_fields must produce identical
+# PointData on the slow and fast paths for every input shape we see in
+# practice. The reference implementation inlined here mirrors the pre-
+# fast-path slow code exactly so a future refactor that drifts slow/fast
+# apart fails this test.
+# ---------------------------------------------------------------------------
+
+
+def _reference_extract(point: list, ts: float, lat: float, lon: float):
+    """Slow-path-only reference implementation. Mirrors the pre-fast-path
+    logic verbatim. Used by the equivalence test to pin behavior."""
+    from adsbtrack.classifier import PointData
+
+    baro_alt = point[3]
+    gs = point[4] if len(point) > 4 else None
+    track = None
+    if len(point) > 5 and isinstance(point[5], (int, float)):
+        track = float(point[5])
+
+    detail: dict | None = None
+    if len(point) > 8 and isinstance(point[8], dict):
+        detail = point[8]
+
+    baro_rate = None
+    if len(point) > 7 and isinstance(point[7], (int, float)):
+        baro_rate = float(point[7])
+
+    geom_alt: int | None = None
+    if len(point) > 10 and isinstance(point[10], (int, float)):
+        geom_alt = int(point[10])
+
+    geom_rate: float | None = None
+    if len(point) > 11 and isinstance(point[11], (int, float)):
+        geom_rate = float(point[11])
+
+    position_source: str | None = None
+    if len(point) > 9 and isinstance(point[9], str):
+        position_source = point[9]
+
+    squawk: str | None = None
+    category: str | None = None
+    nav_altitude_mcp: int | None = None
+    nav_qnh: float | None = None
+    emergency_field: str | None = None
+    true_heading: float | None = None
+    callsign: str | None = None
+    if detail:
+        sq = detail.get("squawk")
+        if sq:
+            squawk = str(sq)
+        cat = detail.get("category")
+        if cat:
+            category = str(cat)
+        mcp = detail.get("nav_altitude_mcp")
+        if isinstance(mcp, (int, float)):
+            nav_altitude_mcp = int(mcp)
+        qnh = detail.get("nav_qnh")
+        if isinstance(qnh, (int, float)):
+            nav_qnh = float(qnh)
+        em = detail.get("emergency")
+        if em:
+            emergency_field = str(em)
+        th = detail.get("true_heading")
+        if isinstance(th, (int, float)):
+            true_heading = float(th)
+        fl = detail.get("flight", "")
+        if fl:
+            fl = fl.strip()
+            if fl:
+                callsign = fl
+        if geom_alt is None:
+            alt_geom = detail.get("alt_geom")
+            if isinstance(alt_geom, (int, float)):
+                geom_alt = int(alt_geom)
+        if geom_rate is None:
+            gr = detail.get("geom_rate")
+            if isinstance(gr, (int, float)):
+                geom_rate = float(gr)
+        if position_source is None:
+            det_type = detail.get("type")
+            if isinstance(det_type, str):
+                position_source = det_type
+
+    return PointData(
+        ts=ts,
+        lat=lat,
+        lon=lon,
+        baro_alt=baro_alt,
+        gs=gs,
+        track=track,
+        geom_alt=geom_alt,
+        baro_rate=baro_rate,
+        geom_rate=geom_rate,
+        squawk=squawk,
+        category=category,
+        nav_altitude_mcp=nav_altitude_mcp,
+        nav_qnh=nav_qnh,
+        emergency_field=emergency_field,
+        true_heading=true_heading,
+        callsign=callsign,
+        position_source=position_source,
+    )
+
+
+def _gen_random_point(rng):
+    """Generate a syntactically-valid readsb trace point with random shape.
+
+    Mixes: minimal (7 elements), typical 9-element (with/without dict detail),
+    full 14-element (with/without dict detail), occasional None/non-numeric
+    stand-ins at field positions so the isinstance gates get exercised.
+    """
+    shape = rng.choice(["len7", "len8", "len9_nodetail", "len9_detail", "len14_nodetail", "len14_detail"])
+
+    def _maybe_num(p=0.8):
+        if rng.random() < p:
+            return rng.uniform(-10000, 50000)
+        return rng.choice([None, "junk", [], {}])
+
+    baro = rng.choice([rng.randint(-1000, 45000), "ground", None, "bogus"])
+    base = [
+        rng.uniform(0, 86400),  # time_offset
+        rng.uniform(-89, 89),  # lat
+        rng.uniform(-179, 179),  # lon
+        baro,  # baro_alt
+        _maybe_num() if rng.random() < 0.95 else None,  # gs
+        _maybe_num() if rng.random() < 0.9 else None,  # track
+        rng.randint(0, 7),  # flags
+        _maybe_num() if rng.random() < 0.8 else None,  # baro_rate
+    ]
+
+    if shape == "len7":
+        return base[:7]
+    if shape == "len8":
+        return base[:8]
+
+    # Build detail dict variants.
+    def _maybe_detail():
+        d = {}
+        if rng.random() < 0.4:
+            d["squawk"] = rng.choice(["1200", "7500", "7700", 1200, ""])
+        if rng.random() < 0.3:
+            d["category"] = rng.choice(["A1", "A7", "B0", "", None])
+        if rng.random() < 0.3:
+            d["nav_altitude_mcp"] = rng.choice([rng.randint(0, 45000), "junk", None])
+        if rng.random() < 0.2:
+            d["nav_qnh"] = rng.choice([rng.uniform(900, 1050), "junk"])
+        if rng.random() < 0.1:
+            d["emergency"] = rng.choice(["none", "general", "lifeguard", ""])
+        if rng.random() < 0.3:
+            d["true_heading"] = rng.choice([rng.uniform(0, 360), None])
+        if rng.random() < 0.3:
+            d["flight"] = rng.choice(["AAL100 ", "  ", "BAW456", "", None])
+        if rng.random() < 0.3:
+            d["alt_geom"] = rng.choice([rng.randint(-500, 45000), "junk", None])
+        if rng.random() < 0.3:
+            d["geom_rate"] = rng.choice([rng.uniform(-5000, 5000), None])
+        if rng.random() < 0.4:
+            d["type"] = rng.choice(["adsb_icao", "mlat", "tisb_icao", None, 42])
+        return d
+
+    detail_slot = _maybe_detail() if shape in ("len9_detail", "len14_detail") else rng.choice([None, "not_a_dict", 0])
+
+    if shape in ("len9_nodetail", "len9_detail"):
+        return base + [detail_slot]
+
+    # len14: +5 trailing fields.
+    source_tag = rng.choice(["adsb_icao", "mlat", "tisb_icao", None, 42])
+    geom_alt = rng.choice([rng.randint(-500, 45000), None, "junk"])
+    geom_rate = rng.choice([rng.uniform(-5000, 5000), None, "junk"])
+    return base + [detail_slot, source_tag, geom_alt, geom_rate, None, None]
+
+
+def test_extract_point_fields_equivalence_across_shapes():
+    """Stress test: 5000 randomized trace points, every shape the wild data
+    produces. _extract_point_fields must agree with the reference slow-path
+    implementation on every one. Covers the fast-path vs slow-path split
+    as well as isinstance gate behavior at each field slot."""
+    import random
+
+    rng = random.Random(20260417)
+    for i in range(5000):
+        point = _gen_random_point(rng)
+        ts = 1000.0 + i
+        lat = point[1]
+        lon = point[2]
+        expected = _reference_extract(point, ts, lat, lon)
+        actual = _extract_point_fields(point, ts, lat, lon)
+        assert actual == expected, (
+            f"mismatch on point shape len={len(point)}: {point!r}\n actual={actual}\n expected={expected}"
+        )

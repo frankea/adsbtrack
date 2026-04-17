@@ -26,7 +26,10 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from .classifier import FlightMetrics, _haversine_m, _PointSample
+from .classifier import FlightMetrics, _PointSample
+from .geo import bearing_deg as _bearing_deg
+from .geo import haversine_m as _haversine_m
+from .geo import smallest_angle_deg as _smallest_angle
 
 
 @dataclass(frozen=True)
@@ -40,27 +43,6 @@ class IlsAlignmentResult:
     first_ts: float
     last_ts: float
     end_alt_ft: int | None
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Initial bearing from (lat1, lon1) to (lat2, lon2) in degrees [0, 360)."""
-    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(rlat2)
-    y = math.cos(rlat1) * math.sin(rlat2) - math.sin(rlat1) * math.cos(rlat2) * math.cos(dlon)
-    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
-
-
-def _smallest_angle(a_deg: float, b_deg: float) -> float:
-    """Smallest unsigned angle (degrees) between two bearings, in [0, 180]."""
-    d = (a_deg - b_deg) % 360.0
-    return d if d <= 180.0 else 360.0 - d
-
-
-def _sample_alt(s: _PointSample) -> int | None:
-    if s.baro_alt is not None:
-        return s.baro_alt
-    return s.geom_alt
 
 
 def _alignment_for_runway(
@@ -97,7 +79,7 @@ def _alignment_for_runway(
     for s in samples:
         if s.lat is None or s.lon is None or s.track is None:
             continue
-        alt = _sample_alt(s)
+        alt = s.altitude()
         if alt is None or alt > alt_cap:
             continue
 
@@ -145,7 +127,7 @@ def _alignment_for_runway(
                 min_offset_m=round(min(o for _, o, _ in seg), 1),
                 first_ts=seg[0][0],
                 last_ts=seg[-1][0],
-                end_alt_ft=_sample_alt(seg[-1][2]),
+                end_alt_ft=seg[-1][2].altitude(),
             )
         )
     return results

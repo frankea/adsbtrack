@@ -31,16 +31,6 @@ class LandingAnchor:
     method: Literal["alt_min", "last_point"]
 
 
-def _sample_altitude(sample: _PointSample) -> int | None:
-    """Prefer baro altitude; fall back to geometric. Returns None when
-    neither is present (sample contributes nothing to alt_min selection)."""
-    if sample.baro_alt is not None:
-        return sample.baro_alt
-    if sample.geom_alt is not None:
-        return sample.geom_alt
-    return None
-
-
 def compute_landing_anchor(
     metrics: FlightMetrics,
     *,
@@ -74,13 +64,13 @@ def compute_landing_anchor(
         for sample in reversed(metrics.recent_points):
             if sample.ts < cutoff:
                 break
-            alt = _sample_altitude(sample)
+            alt = sample.altitude()
             if alt is None or sample.lat is None or sample.lon is None:
                 continue
             if best is None:
                 best = sample
                 continue
-            best_alt = _sample_altitude(best)
+            best_alt = best.altitude()
             # best_alt is non-None because we only set best when alt was non-None.
             assert best_alt is not None
             # Newest-first iteration means ties are naturally won by the first

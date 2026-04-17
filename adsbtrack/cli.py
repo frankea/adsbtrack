@@ -14,6 +14,7 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
 from .fetcher import fetch_traces, fetch_traces_opensky
+from .gaps import detect_gaps
 from .models import LandingType
 from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
@@ -1198,6 +1199,90 @@ def mil_scan_cmd(db_path):
     for icao, country, branch, notes in matches:
         table.add_row(icao, country or "-", branch or "-", notes or "-")
     console.print(table)
+
+
+@cli.command()
+@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--db", "db_path", default="adsbtrack.db")
+@click.option(
+    "--min-gap-secs",
+    type=int,
+    default=300,
+    show_default=True,
+    help="Minimum gap duration in seconds (below this is normal data sparseness).",
+)
+@click.option(
+    "--classification",
+    type=click.Choice(["all", "likely_transponder_off", "coverage_hole", "unknown"]),
+    default="all",
+    show_default=True,
+    help="Filter output by classification bucket.",
+)
+def gaps(hex_code, db_path, min_gap_secs, classification):
+    """Find within-flight ADS-B signal gaps and classify each.
+
+    A gap is only tagged as likely_transponder_off when all of:
+    altitude >= FL150, ADS-B coverage strong on both sides, and gap
+    position is within 200 nm of a known airport. Ambiguous gaps
+    default to "unknown" rather than a confident mislabel.
+    """
+    hex_code = hex_code.lower()
+    with Database(Path(db_path)) as db:
+        all_gaps = detect_gaps(db, hex_code, min_gap_secs=float(min_gap_secs))
+
+    filtered = [g for g in all_gaps if g.classification == classification] if classification != "all" else all_gaps
+
+    if not filtered:
+        console.print(f"[green]No gaps found for {hex_code} (min_gap_secs={min_gap_secs}, filter={classification}).[/]")
+        return
+
+    from datetime import UTC, datetime
+
+    color_by_class = {
+        "likely_transponder_off": "red",
+        "coverage_hole": "dim",
+        "unknown": "yellow",
+    }
+    table = Table(title=f"ADS-B gaps for {hex_code} (>= {min_gap_secs}s, {len(filtered)} of {len(all_gaps)} shown)")
+    table.add_column("Start (UTC)", style="cyan")
+    table.add_column("Dur", justify="right")
+    table.add_column("Alt", justify="right")
+    table.add_column("Position")
+    table.add_column("Nearest apt")
+    table.add_column("Pre→Post source")
+    table.add_column("Classification")
+
+    for g in filtered:
+        started = datetime.fromtimestamp(g.gap_start_ts, UTC).strftime("%Y-%m-%d %H:%M")
+        dur = f"{g.duration_secs / 60:.1f}m"
+        alt = f"{g.start_alt_ft} ft" if g.start_alt_ft is not None else "-"
+        pos = f"{g.start_lat:.2f},{g.start_lon:.2f}"
+        apt = f"{g.nearest_airport_nm:.0f} nm" if g.nearest_airport_nm is not None else "-"
+        pre_pct = _pct(g.pre_source_mix, "adsb")
+        post_pct = _pct(g.post_source_mix, "adsb")
+        sources = f"{pre_pct}→{post_pct} ADS-B"
+        cls_color = color_by_class.get(g.classification, "white")
+        cls_cell = f"[{cls_color}]{g.classification}[/]"
+        table.add_row(started, dur, alt, pos, apt, sources, cls_cell)
+
+    console.print(table)
+
+    summary = {"likely_transponder_off": 0, "coverage_hole": 0, "unknown": 0}
+    for g in all_gaps:
+        summary[g.classification] = summary.get(g.classification, 0) + 1
+    console.print(
+        f"\n[bold]Summary:[/] {len(all_gaps)} gaps total -- "
+        f"[red]{summary['likely_transponder_off']} likely_transponder_off[/], "
+        f"[dim]{summary['coverage_hole']} coverage_hole[/], "
+        f"[yellow]{summary['unknown']} unknown[/]"
+    )
+
+
+def _pct(mix: dict, key: str) -> str:
+    total = sum(mix.values()) if mix else 0
+    if total == 0:
+        return "-"
+    return f"{100 * mix.get(key, 0) // total}%"
 
 
 if __name__ == "__main__":

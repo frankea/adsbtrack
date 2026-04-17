@@ -1,6 +1,7 @@
 """Tests for adsbtrack.cli -- Click command surface."""
 
 import io
+import re
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -836,3 +837,55 @@ def test_trips_from_column_plain_when_takeoff_runway_null(tmp_path, monkeypatch)
     assert result.exit_code == 0, result.output
     assert "KSPG" in result.output
     assert "KSPG/" not in result.output
+
+
+def test_status_shows_go_around_and_pattern_counts(tmp_path, monkeypatch) -> None:
+    """status output includes go-around count and pattern-work count."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        # Two go-around flights; five pattern-work flights; one normal.
+        for i, had_ga, pcycles in [
+            (0, 1, 2),
+            (1, 1, 3),
+            (2, 0, 4),
+            (3, 0, 5),
+            (4, 0, 2),
+            (5, 0, 1),
+        ]:
+            f = Flight(
+                icao="abc999",
+                takeoff_time=datetime(2024, 6, 1, 10 + i, 0),
+                takeoff_lat=27.76,
+                takeoff_lon=-82.63,
+                takeoff_date=f"2024-06-{1 + i:02d}",
+                landing_time=datetime(2024, 6, 1, 11 + i, 0),
+                landing_lat=27.76,
+                landing_lon=-82.63,
+                landing_date=f"2024-06-{1 + i:02d}",
+                origin_icao="KSPG",
+                origin_name="Albert Whitted",
+                origin_distance_km=0.3,
+                destination_icao="KSPG",
+                destination_name="Albert Whitted",
+                destination_distance_km=0.3,
+                duration_minutes=60.0,
+                landing_type="confirmed",
+                landing_confidence=0.9,
+                had_go_around=had_ga,
+                pattern_cycles=pcycles,
+            )
+            db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["status", "--hex", "abc999", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Go-arounds:" in result.output
+    assert "Pattern work:" in result.output
+    go_arounds = re.search(r"Go-arounds:\s+(\d+)", result.output)
+    assert go_arounds is not None
+    assert go_arounds.group(1) == "2"
+
+    pattern_flights = re.search(r"Pattern work:\s+(\d+)", result.output)
+    assert pattern_flights is not None
+    assert pattern_flights.group(1) == "5"

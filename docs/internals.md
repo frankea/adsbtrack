@@ -89,3 +89,11 @@ Each import validates the file's header line against a required-columns list bef
 3. **hexdb.io REST API** -- live fallback, per-minute throttled, treats both HTTP 404 and 200-with-`{status: "404"}` bodies as misses.
 
 Conflicts (differing registrations or type codes between sources) are reported in the return value but don't block the write. An independent check against `mil_hex_ranges` runs on every hex and stamps `is_military` / `mil_country` / `mil_branch` regardless of which civilian source supplied the row, so e.g. a hex with a Mictronics registration can still be flagged as military when it sits in a DoD allocation block.
+
+## SQL in docs
+
+Any committed document containing SQL that queries the adsbtrack schema must execute cleanly against the current schema at commit time. "Renders as markdown" is not enough; "parses as SQL" is not enough. The query has to run.
+
+The canonical case today is `docs/datasette-metadata.json`, which ships five pre-canned queries that Datasette loads into its web UI. These queries use specific column names (`emergency_flag`, `signal_gap_secs`, `destination_helipad_id`, etc.) and specific enum values (`mission_type = 'offshore'`, `landing_type = 'confirmed'`). Hallucinated column names or enum values are invisible at review time and only surface the first time a reader actually clicks the canned query, where they produce SQL errors that look like the project is broken.
+
+The check is simple: before merging any doc change that adds or modifies SQL against the schema, run it against a real `adsbtrack.db` with representative data. If there's no convenient way to do that, write a pytest that parses the SQL out of the doc, runs it against a fixture DB, and asserts no error. Either works. Silent drift of column names between `adsbtrack/db.py` and docs is the failure mode we're ruling out.

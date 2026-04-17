@@ -4,19 +4,16 @@ For each candidate navaid (pre-filtered by bbox to keep cost bounded) the
 algorithm walks the flight's point stream and keeps every point whose
 bearing-to-navaid lies within a degree or so of the ground track, subject to
 a maximum range. Kept points are split into segments on long gaps, then
-filtered by minimum duration and minimum closest-approach distance. The
-surviving list is this flight's navaid track fingerprint.
+filtered by minimum duration and minimum closest-approach distance.
 
 Callers pass points directly rather than a ``FlightMetrics``: navaid
 alignment is enroute by nature, so it needs the full per-flight trajectory
-rather than ``FlightMetrics.recent_points`` (a 240-sample tail deque that
-only covers the last ~20 minutes).
+rather than the 240-sample tail deque in ``FlightMetrics.recent_points``.
 
 Attribution: the geometric idea (|bearing-to-beacon - track| under a
 threshold, split-on-gap, duration + close-pass filter) mirrors xoolive/
 traffic's ``BeaconTrackBearingAlignment`` (MIT-licensed). No code is copied
-from traffic; this module reimplements the algorithm in our style against
-the ``_PointSample`` layer already present in this codebase.
+from traffic.
 """
 
 from __future__ import annotations
@@ -25,10 +22,11 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
+from .airports import haversine_km
 from .classifier import _PointSample
+from .ils_alignment import _bearing_deg, _smallest_angle
 
 _KM_PER_NM = 1.852
-_EARTH_R_KM = 6371.0
 
 
 @dataclass(frozen=True)
@@ -39,27 +37,6 @@ class NavaidAlignmentSegment:
     start_ts: float
     end_ts: float
     min_distance_km: float
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(rlat2)
-    y = math.cos(rlat1) * math.sin(rlat2) - math.sin(rlat1) * math.cos(rlat2) * math.cos(dlon)
-    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
-
-
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
-    dlat = rlat2 - rlat1
-    dlon = math.radians(lon2 - lon1)
-    a = math.sin(dlat / 2) ** 2 + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlon / 2) ** 2
-    return _EARTH_R_KM * 2 * math.asin(math.sqrt(a))
-
-
-def _smallest_angle(a_deg: float, b_deg: float) -> float:
-    d = (a_deg - b_deg) % 360.0
-    return d if d <= 180.0 else 360.0 - d
 
 
 def _alignments_for_navaid(
@@ -82,11 +59,24 @@ def _alignments_for_navaid(
     n_lat_f = float(n_lat)  # type: ignore[arg-type]
     n_lon_f = float(n_lon)  # type: ignore[arg-type]
 
+    # Cheap degree-delta gate: reject obvious out-of-range points before the
+    # haversine/bearing trig. 1 deg lat ~ 111 km; lon scales with cos(lat).
+    # The inner loop runs for every (point, navaid) pair in the bbox, so
+    # shaving the 99% not-close cases is the difference between a 29% and
+    # 138% extract overhead on wide-bbox aircraft.
+    max_dlat_deg = max_distance_km / 111.0
+    cos_nav_lat = max(0.01, math.cos(math.radians(n_lat_f)))
+    max_dlon_deg = max_dlat_deg / cos_nav_lat
+
     kept: list[tuple[float, float]] = []  # (ts, distance_km)
     for s in samples:
         if s.lat is None or s.lon is None or s.track is None:
             continue
-        dist_km = _haversine_km(s.lat, s.lon, n_lat_f, n_lon_f)
+        if abs(s.lat - n_lat_f) > max_dlat_deg:
+            continue
+        if abs(s.lon - n_lon_f) > max_dlon_deg:
+            continue
+        dist_km = haversine_km(s.lat, s.lon, n_lat_f, n_lon_f)
         if dist_km > max_distance_km:
             continue
         bearing = _bearing_deg(s.lat, s.lon, n_lat_f, n_lon_f)

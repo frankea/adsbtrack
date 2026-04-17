@@ -445,14 +445,14 @@ def _compute_navaid_track_json(
         int(math.floor(max_lon * 2)),
     )
     if key not in navaid_cache:
-        navaid_cache[key] = query_navaids_in_bbox(db.conn, *bbox)
+        navaid_cache[key] = [dict(r) for r in query_navaids_in_bbox(db.conn, *bbox)]
     navaids = navaid_cache[key]
     if not navaids:
         return None
 
     segments = detect_navaid_alignments(
         metrics.all_points,
-        navaids=[dict(r) for r in navaids],
+        navaids=navaids,
         tolerance_deg=config.navaid_alignment_tolerance_deg,
         max_distance_nm=config.navaid_max_distance_nm,
         split_gap_secs=config.navaid_split_gap_secs,
@@ -1211,18 +1211,14 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         ):
             flight.mission_type = "pattern"
 
-        # --- Navaid alignment (adsbtrack/navaid_alignment.py) ---
-        # Emits a JSON route fingerprint of navaids the aircraft's ground
-        # track pointed directly toward for long enough to be meaningful.
         flight.navaid_track = _compute_navaid_track_json(
             metrics,
             db=db,
             config=config,
             navaid_cache=navaid_cache,
         )
-        # all_points is only consumed by the navaid alignment pass above.
-        # Drop it eagerly so the per-flight buffer doesn't keep every point
-        # pinned until extract returns (matters on multi-hundred-flight hexes).
+        # Drop all_points after the navaid pass so per-flight buffers don't
+        # stay pinned until extract returns on multi-hundred-flight hexes.
         metrics.all_points.clear()
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.

@@ -239,6 +239,11 @@ class Config:
     rate_limit: float = 0.5  # seconds between requests
     rate_limit_max: float = 30.0  # max backoff after 429s
     rate_limit_recovery: int = 10  # successes before reducing delay
+    # Async fetcher concurrency (applies to fetch_traces; other fetchers stay serial).
+    # The per-source rate-limit lock still serializes request STARTS to >=
+    # rate_limit seconds apart, so concurrency only helps when request
+    # latency exceeds rate_limit and in-flight overlap is possible.
+    fetch_concurrency: int = 4
     airport_match_threshold_km: float = 10.0
     airport_types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")
     landing_speed_threshold_kts: float = 80.0  # ground speed above which a "ground" alt reading is ignored

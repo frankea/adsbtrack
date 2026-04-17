@@ -14,6 +14,7 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
 from .fetcher import fetch_traces, fetch_traces_opensky
+from .models import LandingType
 from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
@@ -84,14 +85,23 @@ def cli():
 @click.option("--start", "start_date", default="2025-01-01", help="Start date (YYYY-MM-DD)")
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
 @click.option("--rate", default=0.5, help="Seconds between requests")
+@click.option(
+    "--concurrency",
+    default=4,
+    type=int,
+    help="Parallel in-flight requests per source (default: 4). Rate limit still "
+    "caps request-start spacing; concurrency only helps when request latency "
+    "exceeds --rate. Set to 1 for byte-identical serial behavior.",
+)
 @click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
-def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate, db_path):
+def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate, concurrency, db_path):
     """Download trace data from ADS-B data sources."""
     hex_code = _resolve_hex(hex_code, tail_number)
 
     with Database(Path(db_path)) as db:
         config = Config(db_path=Path(db_path))
         config.rate_limit = rate
+        config.fetch_concurrency = concurrency
 
         ensure_airports(db, config)
 
@@ -147,6 +157,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
                 with Database(Path(db_path)) as thread_db:
                     thread_config = Config(db_path=Path(db_path))
                     thread_config.rate_limit = rate
+                    thread_config.fetch_concurrency = concurrency
                     if src == "opensky":
                         stats = fetch_traces_opensky(thread_db, thread_config, hex_code, start, end)
                     else:
@@ -370,9 +381,9 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, show_squawk, db
 
             if f["destination_icao"]:
                 dest = f"{f['destination_icao']} ({f['destination_name']})"
-            elif landing_type == "dropped_on_approach" and _col(f, "probable_destination_icao"):
+            elif landing_type == LandingType.DROPPED_ON_APPROACH and _col(f, "probable_destination_icao"):
                 dest = f"[yellow]~{_col(f, 'probable_destination_icao')}[/]"
-            elif landing_type == "signal_lost":
+            elif landing_type == LandingType.SIGNAL_LOST:
                 dest = "[red]signal lost[/]"
             elif f["landing_lat"] is not None:
                 dest = f"({f['landing_lat']:.2f}, {f['landing_lon']:.2f})"

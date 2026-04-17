@@ -124,6 +124,7 @@ CREATE TABLE IF NOT EXISTS flights (
     mlat_pct REAL,
     tisb_pct REAL,
     adsb_pct REAL,
+    landing_anchor_method TEXT,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -555,6 +556,9 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("acars_off", "TEXT"),
         ("acars_on", "TEXT"),
         ("acars_in", "TEXT"),
+        # Landing airport-matching anchor: "alt_min" or "last_point".
+        # Populated by parser.py using adsbtrack.landing_anchor.compute_landing_anchor.
+        ("landing_anchor_method", "TEXT"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -738,7 +742,7 @@ class Database:
                 type_override,
                 turnaround_category, is_first_observed_flight, is_last_observed_flight,
                 mlat_pct, tisb_pct, adsb_pct,
-                acars_out, acars_off, acars_on, acars_in)
+                acars_out, acars_off, acars_on, acars_in, landing_anchor_method)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -757,7 +761,7 @@ class Database:
                        ?, ?, ?, ?, ?,
                        ?, ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -850,6 +854,7 @@ class Database:
                 flight.acars_off,
                 flight.acars_on,
                 flight.acars_in,
+                flight.landing_anchor_method,
             ),
         )
 

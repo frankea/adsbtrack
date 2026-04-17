@@ -310,3 +310,34 @@ def test_metrics_counts_apply_for_ground_points_too():
     )
     assert m.data_points == 2
     assert m.adsb_points == 2
+
+
+def test_record_point_populates_lat_lon_on_recent_points():
+    """After record_point, the last sample in recent_points should carry lat/lon."""
+    from adsbtrack.classifier import FlightMetrics, PointData
+
+    m = FlightMetrics()
+    pt = PointData(
+        ts=1_700_000_000.0,
+        lat=33.63,
+        lon=-84.43,
+        baro_alt=1200,
+        gs=130.0,
+        track=90.0,
+        geom_alt=1250,
+        baro_rate=-400.0,
+        geom_rate=None,
+        squawk="1200",
+        category=None,
+        nav_altitude_mcp=None,
+        nav_qnh=None,
+        emergency_field=None,
+        true_heading=None,
+        callsign="TEST1",
+    )
+    m.record_point(pt, ground_state="airborne", ground_reason="")
+    assert len(m.recent_points) == 1
+    sample = m.recent_points[-1]
+    assert sample.lat == 33.63
+    assert sample.lon == -84.43
+    assert sample.baro_alt == 1200

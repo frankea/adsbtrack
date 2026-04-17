@@ -165,6 +165,13 @@ class Flight:
     acars_on: str | None = None
     acars_in: str | None = None
 
+    # --- Landing airport-matching anchor method ---
+    # "alt_min" when compute_landing_anchor found a valid altitude-minimum point
+    # in the final window; "last_point" when we fell back to the last observed
+    # position (missing altitude in the tail). NULL on flights where the anchor
+    # was not computed (e.g. legacy rows before the migration).
+    landing_anchor_method: str | None = None
+
 
 @dataclass
 class AirportMatch:

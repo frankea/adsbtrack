@@ -17,10 +17,24 @@ from adsbtrack.features import (
     compute_phase_budget,
     compute_squawk_summary,
 )
+from adsbtrack.models import Flight
 
 
 def _cfg() -> Config:
     return Config()
+
+
+def _make_sample_for_descent(ts: float, baro_alt: int | None, baro_rate: float | None):
+    """Minimal _PointSample for descent scoring tests."""
+    from adsbtrack.classifier import _PointSample
+
+    return _PointSample(
+        ts=ts,
+        baro_alt=baro_alt,
+        geom_alt=None,
+        gs=None,
+        baro_rate=baro_rate,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -555,3 +569,48 @@ def test_compute_signal_budget_with_gap():
     assert r["active_minutes"] == 90.0
     assert r["signal_gap_secs"] == 1800
     assert r["signal_gap_count"] == 1
+
+
+def test_infer_destination_uses_supplied_anchor():
+    """When anchor_lat / anchor_lon are supplied, proximity is measured
+    from the anchor, not from flight.last_seen_*. Pick the airport that
+    is closer to the anchor."""
+    from datetime import UTC, datetime
+
+    from adsbtrack.config import Config
+    from adsbtrack.features import infer_destination
+
+    # Airports: KA at (30.0, -90.0), KB at (31.0, -90.0)
+    candidates = [
+        {"ident": "KA", "latitude_deg": 30.0, "longitude_deg": -90.0, "elevation_ft": 10},
+        {"ident": "KB", "latitude_deg": 31.0, "longitude_deg": -90.0, "elevation_ft": 10},
+    ]
+    m = FlightMetrics()
+    m.recent_points.append(_make_sample_for_descent(ts=1_700_000_000.0, baro_alt=2000, baro_rate=-500))
+    flight = Flight(
+        icao="aaaaaa",
+        takeoff_time=datetime(2026, 4, 16, 12, 0, tzinfo=UTC),
+        takeoff_lat=30.0,
+        takeoff_lon=-90.0,
+        takeoff_date="2026-04-16",
+        landing_type="dropped_on_approach",
+        last_seen_lat=31.0,  # close to KB
+        last_seen_lon=-90.0,
+        last_seen_alt_ft=2000,
+    )
+    cfg = Config()
+
+    # Without anchor kwargs -> KB (closest to last_seen_*)
+    result_default = infer_destination(flight=flight, metrics=m, candidates=candidates, config=cfg)
+    assert result_default["probable_destination_icao"] == "KB"
+
+    # With anchor kwargs pointing near KA -> KA
+    result_anchor = infer_destination(
+        flight=flight,
+        metrics=m,
+        candidates=candidates,
+        config=cfg,
+        anchor_lat=30.0,
+        anchor_lon=-90.0,
+    )
+    assert result_anchor["probable_destination_icao"] == "KA"

@@ -14,6 +14,7 @@ from .classifier import (
 )
 from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database
+from .ils_alignment import IlsAlignmentResult, detect_ils_alignment
 from .landing_anchor import compute_landing_anchor
 from .models import Flight
 
@@ -977,6 +978,60 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 flight.probable_destination_icao = infer["probable_destination_icao"]
                 flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
                 flight.probable_destination_confidence = infer["probable_destination_confidence"]
+
+        # --- ILS alignment (geometric landing signal) ---
+        # Resolve the candidate airport in priority order: on-field match
+        # first, else the nearest hit, else the probable destination inferred
+        # for signal_lost / dropped flights.
+        alignment_icao = flight.destination_icao or flight.nearest_destination_icao or flight.probable_destination_icao
+        alignment: IlsAlignmentResult | None = None
+        airport_elev_ft = 0.0
+        if alignment_icao:
+            elev = db.get_airport_elevation(alignment_icao)
+            if elev is not None:
+                airport_elev_ft = float(elev)
+            runway_rows = db.get_runways_for_airport(alignment_icao)
+            if runway_rows:
+                alignment = detect_ils_alignment(
+                    metrics,
+                    airport_elev_ft=airport_elev_ft,
+                    runway_ends=[dict(r) for r in runway_rows],
+                    max_offset_m=config.ils_alignment_max_offset_m,
+                    max_ft_above_airport=config.ils_alignment_max_ft_above_airport,
+                    split_gap_secs=config.ils_alignment_split_gap_secs,
+                    min_duration_secs=config.ils_alignment_min_duration_secs,
+                )
+
+        if alignment is not None:
+            flight.aligned_runway = alignment.runway_name
+            flight.aligned_seconds = alignment.duration_secs
+            flight.aligned_min_offset_m = alignment.min_offset_m
+
+            # Additive confidence bonus (clamped to 1.0). Applied only when
+            # score_confidence already set a non-None value; don't revive a
+            # NULL landing_confidence on types that deliberately have none.
+            if flight.landing_confidence is not None:
+                if alignment.duration_secs >= config.ils_alignment_bonus_long_secs:
+                    bonus = config.ils_alignment_bonus_long
+                elif alignment.duration_secs >= config.ils_alignment_bonus_short_secs:
+                    bonus = config.ils_alignment_bonus_short
+                else:
+                    bonus = 0.0
+                if bonus > 0.0:
+                    flight.landing_confidence = round(min(1.0, flight.landing_confidence + bonus), 2)
+
+            # Classification upgrade: a signal_lost flight with a 60s+
+            # alignment segment at low altitude is indistinguishable from
+            # dropped_on_approach. Promote so downstream sees the stronger
+            # type. Altitude gate uses last_airborne_alt vs airport_elev +
+            # max_ft_above_airport to match the detector's AGL cap.
+            if (
+                flight.landing_type == "signal_lost"
+                and alignment.duration_secs >= config.ils_alignment_bonus_long_secs
+                and metrics.last_airborne_alt is not None
+                and metrics.last_airborne_alt < airport_elev_ft + config.ils_alignment_max_ft_above_airport
+            ):
+                flight.landing_type = "dropped_on_approach"
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
         # v8 N8: cap at 72 hours (4320 min). Anything longer reflects a

@@ -1017,6 +1017,16 @@ class Database:
             (airport_ident,),
         ).fetchall()
 
+    def get_airport_elevation(self, airport_ident: str) -> int | None:
+        """Return elevation_ft for the given airport, or None if not found."""
+        row = self.conn.execute(
+            "SELECT elevation_ft FROM airports WHERE ident = ?",
+            (airport_ident,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["elevation_ft"]
+
     # -- aircraft_registry (authoritative per-ICAO identity, v3) --
 
     def upsert_aircraft_registry(self, icao: str, trace_rows: list[sqlite3.Row]) -> dict | None:

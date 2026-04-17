@@ -1387,3 +1387,347 @@ def test_reprocess_recomputes_landing_anchor_method():
             assert any(m in ("alt_min", "last_point") for m in methods), f"got {methods}"
     finally:
         tmp.cleanup()
+
+
+# ---------------------------------------------------------------------------
+# ILS alignment integration
+# ---------------------------------------------------------------------------
+
+
+def _walk_approach(
+    base_ts: float,
+    n: int,
+    spacing_secs: float,
+    runway_lat: float,
+    runway_lon: float,
+    runway_heading_deg: float,
+    start_alt_ft: int,
+    alt_step_ft: int,
+) -> list[list]:
+    """Generate n trace points approaching a runway threshold along its extended
+    centerline. Points start ~n*0.3 km out and march toward the threshold,
+    descending by alt_step_ft per sample.
+
+    Each row is a 9-element trace point with track populated in position 5
+    (position 5 is the field the parser reads via _extract_point_fields for
+    _PointSample.track). Hand-built to avoid _make_trace_point's None-at-5.
+    """
+    import math
+
+    approach_bearing_rad = math.radians((runway_heading_deg + 180.0) % 360.0)
+    points: list[list] = []
+    for i in range(n):
+        km_out = (n - i) * 0.3
+        dlat = (km_out / 111.0) * math.cos(approach_bearing_rad)
+        dlon = (km_out / (111.0 * math.cos(math.radians(runway_lat)))) * math.sin(approach_bearing_rad)
+        lat = runway_lat + dlat
+        lon = runway_lon + dlon
+        alt: int | str = max(0, start_alt_ft - i * alt_step_ft)
+        time_offset = base_ts + i * spacing_secs
+        points.append(
+            [
+                time_offset,
+                lat,
+                lon,
+                alt,
+                150.0,
+                float(runway_heading_deg),
+                None,
+                -700.0,
+                {"track": float(runway_heading_deg)},
+            ]
+        )
+    return points
+
+
+def test_aligned_confirmed_landing_bumps_confidence():
+    """A confirmed landing whose final approach hugs a runway centerline
+    should populate the alignment columns and get a landing_confidence
+    bonus."""
+    from adsbtrack.airports import AirportMatch
+
+    config = _make_config()
+    # Force the detector's min to 30s so the tier is reachable.
+    config.ils_alignment_min_duration_secs = 30.0
+
+    runway_lat = 33.64
+    runway_lon = -84.43
+    base_ts = _ts("2024-06-15")
+
+    origin = [
+        _make_trace_point(0, 33.64, -86.5, "ground", gs=0),
+        _make_trace_point(60, 33.64, -86.5, "ground", gs=5),
+        _make_trace_point(120, 33.64, -86.49, 1000, gs=120),
+    ]
+    cruise = [
+        _make_trace_point(600, 33.64, -85.5, 5000, gs=200),
+        _make_trace_point(1800, 33.64, -85.0, 5000, gs=200),
+    ]
+    # 30-sample centerline approach, 3s spacing, starting 9km out at 3000ft.
+    approach = _walk_approach(
+        base_ts=3000.0,
+        n=30,
+        spacing_secs=3.0,
+        runway_lat=runway_lat,
+        runway_lon=runway_lon,
+        runway_heading_deg=90.0,
+        start_alt_ft=3000,
+        alt_step_ft=100,
+    )
+    # Touchdown/rollout
+    rollout_start = 3000.0 + 30 * 3.0
+    rollout = [
+        _make_trace_point(rollout_start + 2, runway_lat, runway_lon + 0.0005, "ground", gs=60),
+        _make_trace_point(rollout_start + 4, runway_lat, runway_lon + 0.001, "ground", gs=30),
+        _make_trace_point(rollout_start + 6, runway_lat, runway_lon + 0.0015, "ground", gs=10),
+    ]
+
+    trace = origin + cruise + approach + rollout
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KORIG", name="Origin", distance_km=1.0)
+    dest_match = AirportMatch(ident="KFAKE", name="Fake Intl", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 1026
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "09",
+            "latitude_deg": runway_lat,
+            "longitude_deg": runway_lon,
+            "heading_deg_true": 90.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, dest_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.landing_type == "confirmed"
+    assert flight.aligned_runway == "09"
+    assert flight.aligned_seconds is not None and flight.aligned_seconds >= 60.0
+    assert flight.aligned_min_offset_m is not None and flight.aligned_min_offset_m < 100.0
+    assert flight.landing_confidence is not None
+
+
+def test_overflight_no_alignment_no_bonus():
+    """An overflight ~2 km off the runway should never satisfy the offset
+    gate; the alignment columns remain NULL."""
+    from adsbtrack.airports import AirportMatch
+
+    config = _make_config()
+    config.ils_alignment_min_duration_secs = 30.0
+
+    runway_lat = 33.64
+    runway_lon = -84.43
+    # 2 km north-offset overflight: centerline runs east-west along
+    # latitude 33.64, so shift every sample to lat 33.658.
+    base_ts = _ts("2024-06-15")
+
+    origin = [
+        _make_trace_point(0, 33.0, -86.5, "ground", gs=0),
+        _make_trace_point(120, 33.0, -86.49, 1000, gs=120),
+    ]
+    # Overflight points 2 km north of centerline. We use the same helper
+    # but then override latitudes.
+    import math
+
+    approach_bearing_rad = math.radians(270.0)  # heading 90 -> approach bearing 270
+    flyover: list[list] = []
+    off_lat = runway_lat + 0.018  # ~2 km north
+    for i in range(30):
+        km_out = (30 - i) * 0.3
+        dlon = (km_out / (111.0 * math.cos(math.radians(off_lat)))) * math.sin(approach_bearing_rad)
+        lon = runway_lon + dlon
+        flyover.append(
+            [
+                3000.0 + i * 3.0,
+                off_lat,
+                lon,
+                4000,
+                200.0,
+                90.0,
+                None,
+                0.0,
+                {"track": 90.0},
+            ]
+        )
+    # Landing back at origin area (to make this a confirmed flight).
+    rollout_start = 3000.0 + 30 * 3.0 + 30.0
+    rollout = [
+        _make_trace_point(rollout_start, 33.0, -86.5, "ground", gs=30),
+        _make_trace_point(rollout_start + 4, 33.0, -86.5, "ground", gs=10),
+    ]
+
+    trace = origin + flyover + rollout
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KORIG", name="Origin", distance_km=1.0)
+    # The parser matches the landing airport -- since rollout is back near
+    # origin, the dest match is still the same airport. Runway lookup on
+    # KORIG returns the "09" runway (the detector still runs but no
+    # alignment should be detected because offset is too large).
+    db.get_airport_elevation.return_value = 1026
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "09",
+            "latitude_deg": runway_lat,
+            "longitude_deg": runway_lon,
+            "heading_deg_true": 90.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, origin_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.aligned_runway is None
+    assert flight.aligned_seconds is None
+    assert flight.aligned_min_offset_m is None
+
+
+def test_signal_lost_with_alignment_upgrades_to_drop():
+    """A signal_lost flight whose trace ends on a 60s+ alignment segment at
+    low altitude upgrades to dropped_on_approach."""
+    from adsbtrack.airports import AirportMatch
+
+    config = _make_config()
+    config.ils_alignment_min_duration_secs = 30.0
+
+    runway_lat = 33.64
+    runway_lon = -84.43
+    base_ts = _ts("2024-06-15")
+
+    origin = [
+        _make_trace_point(0, 33.64, -86.5, "ground", gs=0),
+        _make_trace_point(120, 33.64, -86.49, 1000, gs=120),
+    ]
+    climb_cruise = [
+        _make_trace_point(600, 33.64, -85.5, 10000, gs=300),
+        _make_trace_point(1800, 33.64, -85.0, 10000, gs=300),
+    ]
+    # Descend along centerline from 3000 ft MSL down to ~150 ft MSL (airport
+    # elev 1026, so last airborne is below airport_elev + 5000 AGL cap).
+    # 30 samples * 3s spacing = ~90s alignment duration.
+    approach = _walk_approach(
+        base_ts=3000.0,
+        n=30,
+        spacing_secs=3.0,
+        runway_lat=runway_lat,
+        runway_lon=runway_lon,
+        runway_heading_deg=90.0,
+        start_alt_ft=3000,
+        alt_step_ft=95,  # ends at 3000 - 29*95 = 245 ft MSL
+    )
+    # NO ground points -> trace ends airborne -> signal_lost/dropped
+    trace = origin + climb_cruise + approach
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KORIG", name="Origin", distance_km=1.0)
+
+    # infer_destination needs at least one nearby-airport candidate.
+    db.find_nearby_airports.return_value = [
+        {
+            "ident": "KFAKE",
+            "name": "Fake",
+            "iata_code": None,
+            "municipality": None,
+            "latitude_deg": runway_lat,
+            "longitude_deg": runway_lon,
+            "type": "medium_airport",
+            "elevation_ft": 1026,
+        }
+    ]
+    db.get_airport_elevation.return_value = 1026
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "09",
+            "latitude_deg": runway_lat,
+            "longitude_deg": runway_lon,
+            "heading_deg_true": 90.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.aligned_seconds is not None and flight.aligned_seconds >= 60.0
+    assert flight.landing_type == "dropped_on_approach"
+
+
+def test_candidate_airport_without_runways_leaves_alignment_null():
+    """Airport matched but no runway rows -> all alignment columns stay NULL,
+    flight is NOT rejected, landing_type still 'confirmed'."""
+    from adsbtrack.airports import AirportMatch
+
+    config = _make_config()
+    config.ils_alignment_min_duration_secs = 30.0
+
+    runway_lat = 33.64
+    runway_lon = -84.43
+    base_ts = _ts("2024-06-15")
+
+    origin = [
+        _make_trace_point(0, 33.64, -86.5, "ground", gs=0),
+        _make_trace_point(60, 33.64, -86.5, "ground", gs=5),
+        _make_trace_point(120, 33.64, -86.49, 1000, gs=120),
+    ]
+    cruise = [
+        _make_trace_point(600, 33.64, -85.5, 5000, gs=200),
+        _make_trace_point(1800, 33.64, -85.0, 5000, gs=200),
+    ]
+    approach = _walk_approach(
+        base_ts=3000.0,
+        n=30,
+        spacing_secs=3.0,
+        runway_lat=runway_lat,
+        runway_lon=runway_lon,
+        runway_heading_deg=90.0,
+        start_alt_ft=3000,
+        alt_step_ft=100,
+    )
+    rollout_start = 3000.0 + 30 * 3.0
+    rollout = [
+        _make_trace_point(rollout_start + 2, runway_lat, runway_lon + 0.0005, "ground", gs=60),
+        _make_trace_point(rollout_start + 4, runway_lat, runway_lon + 0.001, "ground", gs=30),
+        _make_trace_point(rollout_start + 6, runway_lat, runway_lon + 0.0015, "ground", gs=10),
+    ]
+
+    trace = origin + cruise + approach + rollout
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KORIG", name="Origin", distance_km=1.0)
+    dest_match = AirportMatch(ident="KFAKE", name="Fake Intl", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 1026
+    # Intentionally no runway rows.
+    db.get_runways_for_airport.return_value = []
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, dest_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.landing_type == "confirmed"
+    assert flight.aligned_runway is None
+    assert flight.aligned_seconds is None
+    assert flight.aligned_min_offset_m is None

@@ -77,6 +77,11 @@ class _PointSample:
     # recent_points only read ts / alt / gs / baro_rate).
     lat: float | None = None
     lon: float | None = None
+    # Ground track in degrees true. Used by adsbtrack.ils_alignment. None
+    # when the point's trace didn't carry track (older readsb builds, or
+    # ground samples). Placed last so every existing construction call site
+    # continues to compile unchanged.
+    track: float | None = None
 
 
 @dataclass
@@ -287,6 +292,7 @@ class FlightMetrics:
                 baro_rate=baro_rate,
                 lat=lat,
                 lon=lon,
+                track=point.track,
             )
         )
 

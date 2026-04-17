@@ -125,6 +125,9 @@ CREATE TABLE IF NOT EXISTS flights (
     tisb_pct REAL,
     adsb_pct REAL,
     landing_anchor_method TEXT,
+    aligned_runway TEXT,
+    aligned_seconds REAL,
+    aligned_min_offset_m REAL,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -559,6 +562,10 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         # Landing airport-matching anchor: "alt_min" or "last_point".
         # Populated by parser.py using adsbtrack.landing_anchor.compute_landing_anchor.
         ("landing_anchor_method", "TEXT"),
+        # ILS / runway alignment fields, populated by adsbtrack.ils_alignment.
+        ("aligned_runway", "TEXT"),
+        ("aligned_seconds", "REAL"),
+        ("aligned_min_offset_m", "REAL"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -742,7 +749,8 @@ class Database:
                 type_override,
                 turnaround_category, is_first_observed_flight, is_last_observed_flight,
                 mlat_pct, tisb_pct, adsb_pct,
-                acars_out, acars_off, acars_on, acars_in, landing_anchor_method)
+                acars_out, acars_off, acars_on, acars_in, landing_anchor_method,
+                aligned_runway, aligned_seconds, aligned_min_offset_m)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -761,7 +769,8 @@ class Database:
                        ?, ?, ?, ?, ?,
                        ?, ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?,
+                       ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -855,6 +864,9 @@ class Database:
                 flight.acars_on,
                 flight.acars_in,
                 flight.landing_anchor_method,
+                flight.aligned_runway,
+                flight.aligned_seconds,
+                flight.aligned_min_offset_m,
             ),
         )
 
@@ -997,6 +1009,23 @@ class Database:
     def runway_count(self) -> int:
         row = self.conn.execute("SELECT COUNT(*) AS cnt FROM runways").fetchone()
         return int(row["cnt"])
+
+    def get_runways_for_airport(self, airport_ident: str) -> list[sqlite3.Row]:
+        """Return all runway ends for `airport_ident`, ordered by `runway_name`."""
+        return self.conn.execute(
+            "SELECT * FROM runways WHERE airport_ident = ? ORDER BY runway_name",
+            (airport_ident,),
+        ).fetchall()
+
+    def get_airport_elevation(self, airport_ident: str) -> int | None:
+        """Return elevation_ft for the given airport, or None if not found."""
+        row = self.conn.execute(
+            "SELECT elevation_ft FROM airports WHERE ident = ?",
+            (airport_ident,),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["elevation_ft"]
 
     # -- aircraft_registry (authoritative per-ICAO identity, v3) --
 

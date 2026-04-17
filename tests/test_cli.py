@@ -693,3 +693,78 @@ def test_mil_scan_finds_military_aircraft(tmp_path):
     assert result.exit_code == 0, result.output
     assert "ae1234" in result.output
     assert "United States" in result.output
+
+
+def test_trips_renders_alignment_column_when_flag_set(tmp_path, monkeypatch):
+    """`trips --alignment` must add the RWY column and render a row when
+    alignment data exists."""
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="abc123",
+            takeoff_time=datetime(2023, 11, 14, 10, 0),
+            takeoff_lat=33.0,
+            takeoff_lon=-84.0,
+            takeoff_date="2023-11-14",
+            landing_time=datetime(2023, 11, 14, 11, 0),
+            landing_lat=33.64,
+            landing_lon=-84.43,
+            landing_date="2023-11-14",
+            destination_icao="KFAKE",
+            destination_name="Fake Intl",
+            destination_distance_km=0.5,
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.85,
+            aligned_runway="09",
+            aligned_seconds=85.0,
+            aligned_min_offset_m=42.3,
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    monkeypatch.setenv("COLUMNS", "200")
+    result = runner.invoke(
+        cli,
+        ["trips", "--hex", "abc123", "--db", str(db_path), "--alignment"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Aligned" in result.output
+    assert "RWY 09" in result.output and "85s" in result.output
+
+
+def test_trips_auto_shows_alignment_column_when_any_row_has_data(tmp_path, monkeypatch):
+    """If any row has aligned_runway, the column shows up even without the flag."""
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="abc456",
+            takeoff_time=datetime(2023, 11, 14, 10, 0),
+            takeoff_lat=33.0,
+            takeoff_lon=-84.0,
+            takeoff_date="2023-11-14",
+            landing_time=datetime(2023, 11, 14, 11, 0),
+            landing_lat=33.64,
+            landing_lon=-84.43,
+            landing_date="2023-11-14",
+            destination_icao="KFAKE",
+            destination_name="Fake Intl",
+            destination_distance_km=0.5,
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.85,
+            aligned_runway="27",
+            aligned_seconds=62.7,
+            aligned_min_offset_m=18.0,
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    monkeypatch.setenv("COLUMNS", "200")
+    result = runner.invoke(
+        cli,
+        ["trips", "--hex", "abc456", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Aligned" in result.output
+    assert "RWY 27" in result.output and "63s" in result.output  # 62.7 rounds to 63

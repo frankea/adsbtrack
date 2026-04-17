@@ -93,6 +93,9 @@ Extracted flights with airport matching, quality classification, confidence scor
 | probable_destination_icao | TEXT | Inferred destination for dropped/signal-lost flights |
 | probable_destination_distance_km | REAL | Distance from last_seen to inferred destination |
 | probable_destination_confidence | REAL | [0.0, 1.0] confidence in the inference |
+| aligned_runway | TEXT | Runway end the aircraft was geometrically aligned with on short final, e.g. `"09"` / `"26L"`. NULL when no segment qualified. |
+| aligned_seconds | REAL | Duration in seconds of the longest qualifying alignment segment. NULL when no segment qualified. |
+| aligned_min_offset_m | REAL | Minimum perpendicular offset in meters from the extended centerline over the winning segment. NULL when no segment qualified. |
 | turnaround_minutes | REAL | Minutes from the previous flight's landing to this takeoff (same ICAO; NULL if > 72 h) |
 | turnaround_category | TEXT | `quick` (<30 min) / `medium` (30-240 min) / `overnight` (4-18 h) / `multi_day` (>18 h) / `extended_gap` (>72 h) / `first_observed` / `last_observed` (never NULL) |
 | is_first_observed_flight | INTEGER | 1 if no prior flight exists for this ICAO |

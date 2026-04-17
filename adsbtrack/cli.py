@@ -282,8 +282,17 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
 @click.option("--from", "from_date", default=None, help="Filter from date (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="Filter to date (YYYY-MM-DD)")
 @click.option("--airport", default=None, help="Filter by airport ICAO code")
+@click.option(
+    "--alignment/--no-alignment",
+    "show_alignment",
+    default=False,
+    help=(
+        "Force-show the ILS alignment column even when no flight in the result set has "
+        "alignment data (column auto-shows when data is present)."
+    ),
+)
 @click.option("--db", "db_path", default="adsbtrack.db")
-def trips(hex_code, from_date, to_date, airport, db_path):
+def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
     """Show flight history."""
     hex_code = hex_code.lower()
     with Database(Path(db_path)) as db:
@@ -293,10 +302,21 @@ def trips(hex_code, from_date, to_date, airport, db_path):
             console.print("[yellow]No flights found[/]")
             return
 
+        def _col(row, name, default=None):
+            try:
+                return row[name]
+            except (KeyError, IndexError):
+                return default
+
         # Only render the ACARS column when the aircraft has any ACARS data
         # at all, so users who haven't run `acars` don't see an empty column.
         acars_row = db.conn.execute("SELECT COUNT(*) AS c FROM acars_messages WHERE icao = ?", (hex_code,)).fetchone()
         has_acars = acars_row and acars_row["c"] > 0
+
+        # Auto-show the alignment column when any row has alignment data,
+        # mirroring the ACARS auto-detect behavior.
+        has_alignment_data = any(_col(f, "aligned_runway") is not None for f in flights)
+        show_alignment_col = show_alignment or has_alignment_data
 
         table = Table(title=f"Flights for {hex_code}")
         table.add_column("Date", style="cyan")
@@ -309,6 +329,8 @@ def trips(hex_code, from_date, to_date, airport, db_path):
         table.add_column("Type", style="dim")
         if has_acars:
             table.add_column("ACARS", justify="right", style="cyan")
+        if show_alignment_col:
+            table.add_column("Aligned", justify="right", style="cyan")
 
         mission_display = {
             "ems_hems": "EMS",
@@ -320,12 +342,6 @@ def trips(hex_code, from_date, to_date, airport, db_path):
             "transport": "XFER",
             "unknown": "",
         }
-
-        def _col(row, name, default=None):
-            try:
-                return row[name]
-            except (KeyError, IndexError):
-                return default
 
         for f in flights:
             takeoff = f["takeoff_time"][:10] if f["takeoff_time"] else "?"
@@ -403,6 +419,17 @@ def trips(hex_code, from_date, to_date, airport, db_path):
                 else:
                     acars_cell = "[dim]--[/]"
                 row_cells.append(acars_cell)
+            if show_alignment_col:
+                runway = _col(f, "aligned_runway")
+                seconds = _col(f, "aligned_seconds")
+                # int(round(...)) uses banker's rounding (round-half-to-even); sub-second
+                # precision isn't meaningful for ADS-B samples (~1s cadence) so this is
+                # display-only and the minor round-half-to-even quirk is intentional.
+                if runway and seconds is not None:
+                    alignment_cell = f"[green]RWY {runway} / {int(round(seconds))}s[/]"
+                else:
+                    alignment_cell = "[dim]--[/]"
+                row_cells.append(alignment_cell)
             table.add_row(*row_cells)
 
         console.print(table)

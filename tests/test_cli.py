@@ -889,3 +889,113 @@ def test_status_shows_go_around_and_pattern_counts(tmp_path, monkeypatch) -> Non
     pattern_flights = re.search(r"Pattern work:\s+(\d+)", result.output)
     assert pattern_flights is not None
     assert pattern_flights.group(1) == "5"
+
+
+def test_status_shows_emergency_breakdown_and_avg_squawk_changes(tmp_path, monkeypatch) -> None:
+    """status output includes per-code emergency breakdown + avg squawk changes."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        # Two 7700 flights, one 7600 flight, two normal with changes
+        seed = [
+            ("7700", 3),
+            ("7700", 1),
+            ("7600", 0),
+            (None, 5),
+            (None, 2),
+        ]
+        for i, (em, changes) in enumerate(seed):
+            f = Flight(
+                icao="aaaeme",
+                takeoff_time=datetime(2024, 6, 1, 10 + i, 0),
+                takeoff_lat=27.76,
+                takeoff_lon=-82.63,
+                takeoff_date=f"2024-06-{1 + i:02d}",
+                landing_time=datetime(2024, 6, 1, 11 + i, 0),
+                landing_lat=27.76,
+                landing_lon=-82.63,
+                landing_date=f"2024-06-{1 + i:02d}",
+                origin_icao="KSPG",
+                destination_icao="KSPG",
+                duration_minutes=60.0,
+                landing_type="confirmed",
+                landing_confidence=0.9,
+                emergency_squawk=em,
+                had_emergency=1 if em else 0,
+                squawk_changes=changes,
+            )
+            db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["status", "--hex", "aaaeme", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Emergencies:" in result.output
+    # Use regex: "2 (7700)" for the two 7700 flights
+    assert re.search(r"2\s*\(7700\)", result.output) is not None
+    assert re.search(r"1\s*\(7600\)", result.output) is not None
+    # Avg squawk changes should be (3+1+0+5+2)/5 = 2.2
+    assert re.search(r"Squawk changes.*2\.2", result.output) is not None
+
+
+def test_trips_show_squawk_renders_primary_column(tmp_path, monkeypatch) -> None:
+    """trips --show-squawk adds a Squawk column and renders primary_squawk."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="sqwk01",
+            takeoff_time=datetime(2024, 6, 1, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2024-06-01",
+            landing_time=datetime(2024, 6, 1, 11, 0),
+            landing_lat=28.0,
+            landing_lon=-82.5,
+            landing_date="2024-06-01",
+            origin_icao="KSPG",
+            destination_icao="KPIE",
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+            primary_squawk="1200",
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["trips", "--hex", "sqwk01", "--db", str(db_path), "--show-squawk"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Squawk" in result.output
+    assert "1200" in result.output
+
+
+def test_trips_no_squawk_column_by_default(tmp_path, monkeypatch) -> None:
+    """Without --show-squawk the Squawk column is hidden."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="sqwk02",
+            takeoff_time=datetime(2024, 6, 1, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2024-06-01",
+            landing_time=datetime(2024, 6, 1, 11, 0),
+            landing_lat=28.0,
+            landing_lon=-82.5,
+            landing_date="2024-06-01",
+            origin_icao="KSPG",
+            destination_icao="KPIE",
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+            primary_squawk="1200",
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "sqwk02", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Squawk" not in result.output  # column hidden by default

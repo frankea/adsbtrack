@@ -592,6 +592,10 @@ def classify_category_do260(metrics: FlightMetrics) -> str | None:
 
 
 def compute_squawk_summary(metrics: FlightMetrics, *, config: Config) -> dict:
+    # Flush the final open squawk run before reading durations. Idempotent:
+    # safe to call multiple times.
+    metrics.flush_open_squawk()
+
     emergency = None
     if metrics.emergency_squawks_seen:
         # Pick most severe by priority
@@ -602,12 +606,25 @@ def compute_squawk_summary(metrics: FlightMetrics, *, config: Config) -> dict:
     if metrics.squawk_total_count > 0:
         vfr = 1 if metrics.squawk_1200_count / metrics.squawk_total_count >= 0.8 else 0
 
+    had_emergency = 1 if metrics.emergency_squawks_seen else 0
+    observed = sorted(metrics.squawk_durations.keys())
+    squawks_observed = json.dumps(observed, ensure_ascii=True) if observed else None
+    primary_squawk: str | None = None
+    if metrics.squawk_durations:
+        # sorted() for deterministic tie-break: longest duration first,
+        # alphabetically smallest code breaks ties.
+        sorted_items = sorted(metrics.squawk_durations.items(), key=lambda kv: (-kv[1], kv[0]))
+        primary_squawk = sorted_items[0][0]
+
     return {
         "squawk_first": metrics.squawk_first,
         "squawk_last": metrics.squawk_last,
         "squawk_changes": metrics.squawk_changes if metrics.squawk_total_count > 0 else None,
         "emergency_squawk": emergency,
         "vfr_flight": vfr,
+        "squawks_observed": squawks_observed,
+        "had_emergency": had_emergency,
+        "primary_squawk": primary_squawk,
     }
 
 
@@ -961,6 +978,9 @@ def derive_all(
     flight.squawk_changes = sq["squawk_changes"]
     flight.emergency_squawk = sq["emergency_squawk"]
     flight.vfr_flight = sq["vfr_flight"]
+    flight.squawks_observed = sq["squawks_observed"]
+    flight.had_emergency = sq["had_emergency"]
+    flight.primary_squawk = sq["primary_squawk"]
 
     # Callsigns
     cs = compute_callsigns_summary(metrics)

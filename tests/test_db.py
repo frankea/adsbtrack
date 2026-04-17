@@ -1290,3 +1290,49 @@ def test_insert_flight_go_around_pattern_cycles_default_null(db) -> None:
     ).fetchone()
     assert row["had_go_around"] is None
     assert row["pattern_cycles"] is None
+
+
+def test_flights_table_has_squawk_signal_columns(db) -> None:
+    cols = {row[1] for row in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert {"squawks_observed", "had_emergency", "primary_squawk"}.issubset(cols)
+
+
+def test_insert_flight_persists_squawk_signals(db) -> None:
+    f = Flight(
+        icao="777777",
+        takeoff_time=datetime(2024, 8, 1, 10, 0),
+        takeoff_lat=27.77,
+        takeoff_lon=-82.67,
+        takeoff_date="2024-08-01",
+        squawks_observed='["1200","5201","7700"]',
+        had_emergency=1,
+        primary_squawk="1200",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT squawks_observed, had_emergency, primary_squawk FROM flights WHERE icao = ?",
+        ("777777",),
+    ).fetchone()
+    assert row["squawks_observed"] == '["1200","5201","7700"]'
+    assert row["had_emergency"] == 1
+    assert row["primary_squawk"] == "1200"
+
+
+def test_insert_flight_squawk_signals_default_to_null(db) -> None:
+    f = Flight(
+        icao="888888",
+        takeoff_time=datetime(2024, 8, 1, 10, 0),
+        takeoff_lat=27.77,
+        takeoff_lon=-82.67,
+        takeoff_date="2024-08-01",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT squawks_observed, had_emergency, primary_squawk FROM flights WHERE icao = ?",
+        ("888888",),
+    ).fetchone()
+    assert row["squawks_observed"] is None
+    assert row["had_emergency"] is None
+    assert row["primary_squawk"] is None

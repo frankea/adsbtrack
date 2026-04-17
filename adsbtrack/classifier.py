@@ -165,6 +165,14 @@ class FlightMetrics:
     squawk_total_count: int = 0
     emergency_squawks_seen: set[str] = field(default_factory=set)
 
+    # --- Squawk duration attribution (for primary_squawk + squawks_observed) ---
+    # Per-squawk cumulative seconds. record_point credits each inter-point
+    # interval to the then-held squawk. flush_open_squawk() closes the final
+    # run using the last observed ts (called from compute_squawk_summary).
+    squawk_durations: dict[str, float] = field(default_factory=dict)
+    _current_squawk: str | None = None
+    _current_squawk_started_ts: float | None = None
+
     # Callsign history (observed callsigns across the flight in order of
     # first appearance; distinct only)
     callsigns_seen: list[str] = field(default_factory=list)
@@ -458,6 +466,30 @@ class FlightMetrics:
         # Squawk tracking
         sq = point.squawk
         if sq:
+            # Squawk-duration attribution. On each point carrying a squawk:
+            #   - If no run is open, start one with the current squawk.
+            #   - If open run has the same squawk, keep it open.
+            #   - If open run has a different squawk, close it (credit the
+            #     elapsed time) and start a new run with the current squawk.
+            if self._current_squawk is None:
+                self._current_squawk = sq
+                self._current_squawk_started_ts = ts
+            elif self._current_squawk != sq:
+                if self._current_squawk_started_ts is not None:
+                    dt = ts - self._current_squawk_started_ts
+                    if dt > 0:
+                        self.squawk_durations[self._current_squawk] = (
+                            self.squawk_durations.get(self._current_squawk, 0.0) + dt
+                        )
+                self._current_squawk = sq
+                self._current_squawk_started_ts = ts
+            # else: same squawk, run stays open with no transition
+
+            # Ensure every observed squawk is represented in the durations
+            # dict (value may stay 0.0 for single-point squawks) so
+            # squawks_observed reflects the full set of squawks seen.
+            self.squawk_durations.setdefault(sq, 0.0)
+
             self.squawk_total_count += 1
             if self.squawk_first is None:
                 self.squawk_first = sq
@@ -672,6 +704,22 @@ class FlightMetrics:
             if len(self.landing_tracks) > 240:
                 # Keep the most recent 240 points only
                 self.landing_tracks = self.landing_tracks[-240:]
+
+    def flush_open_squawk(self) -> None:
+        """Close the currently-open squawk run by crediting the remaining
+        time to its duration total. Called at end of flight before reading
+        squawk_durations for primary_squawk / squawks_observed. Safe to
+        call multiple times."""
+        if (
+            self._current_squawk is not None
+            and self._current_squawk_started_ts is not None
+            and self.last_point_ts is not None
+        ):
+            dt = self.last_point_ts - self._current_squawk_started_ts
+            if dt > 0:
+                self.squawk_durations[self._current_squawk] = self.squawk_durations.get(self._current_squawk, 0.0) + dt
+        self._current_squawk = None
+        self._current_squawk_started_ts = None
 
     def record_landing_ground_point(self, lat: float, lon: float) -> None:
         self.ground_points_at_landing += 1

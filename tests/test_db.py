@@ -1213,3 +1213,37 @@ def test_insert_flight_alignment_columns_default_to_null(db):
     assert row["aligned_runway"] is None
     assert row["aligned_seconds"] is None
     assert row["aligned_min_offset_m"] is None
+
+
+def test_flights_table_has_takeoff_runway_column(db) -> None:
+    cols = {row[1] for row in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert "takeoff_runway" in cols
+
+
+def test_insert_flight_persists_takeoff_runway(db) -> None:
+    f = Flight(
+        icao="ffffff",
+        takeoff_time=datetime(2024, 6, 1, 10, 0),
+        takeoff_lat=27.77,
+        takeoff_lon=-82.67,
+        takeoff_date="2024-06-01",
+        takeoff_runway="24",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute("SELECT takeoff_runway FROM flights WHERE icao = ?", ("ffffff",)).fetchone()
+    assert row["takeoff_runway"] == "24"
+
+
+def test_insert_flight_takeoff_runway_defaults_to_null(db) -> None:
+    f = Flight(
+        icao="eeeeee",
+        takeoff_time=datetime(2024, 6, 1, 10, 0),
+        takeoff_lat=27.77,
+        takeoff_lon=-82.67,
+        takeoff_date="2024-06-01",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute("SELECT takeoff_runway FROM flights WHERE icao = ?", ("eeeeee",)).fetchone()
+    assert row["takeoff_runway"] is None

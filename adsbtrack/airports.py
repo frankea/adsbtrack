@@ -1,22 +1,33 @@
 import contextlib
 import csv
 import io
-from math import asin, cos, radians, sin, sqrt
 
 import httpx
 from rich.progress import Progress
 
+from .classifier import _haversine_m
 from .config import Config
 from .db import Database
 from .models import AirportMatch
 
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    return R * 2 * asin(sqrt(a))
+    return _haversine_m(lat1, lon1, lat2, lon2) / 1000.0
+
+
+def fetch_ourairports_csv(url: str, *, label: str, timeout: float = 60.0) -> str:
+    """Download an OurAirports CSV, return its body text.
+
+    Shared by every OurAirports importer (airports / runways / navaids) so
+    the httpx + rich-Progress boilerplate has one home. Raises
+    httpx.HTTPError variants unchanged; callers wrap as ClickException.
+    """
+    with Progress() as progress:
+        task = progress.add_task(f"Downloading {label}...", total=None)
+        resp = httpx.get(url, follow_redirects=True, timeout=timeout)
+        resp.raise_for_status()
+        progress.update(task, completed=100)
+        return resp.text
 
 
 def download_airports(db: Database, config: Config):

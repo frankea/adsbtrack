@@ -22,9 +22,6 @@ import csv
 import io
 from pathlib import Path
 
-import httpx
-from rich.progress import Progress
-
 from .config import Config
 from .db import Database
 
@@ -191,13 +188,7 @@ def refresh_runways(
     if local_csv is not None:
         return import_runways_from_path(db, local_csv)
 
-    with Progress() as progress:
-        task = progress.add_task("Downloading OurAirports runways.csv...", total=None)
-        resp = httpx.get(cfg.runways_csv_url, follow_redirects=True, timeout=timeout)
-        resp.raise_for_status()
-        progress.update(task, completed=50)
+    from .airports import fetch_ourairports_csv
 
-        reader = csv.DictReader(io.StringIO(resp.text))
-        count = _import_runways_from_reader(db, reader)
-        progress.update(task, completed=100)
-    return count
+    text = fetch_ourairports_csv(cfg.runways_csv_url, label="OurAirports runways.csv", timeout=timeout)
+    return _import_runways_from_reader(db, csv.DictReader(io.StringIO(text)))

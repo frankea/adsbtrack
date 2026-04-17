@@ -86,3 +86,15 @@ def is_military_hex(db: Database, hex_code: str) -> tuple[bool, str | None, str 
     if row is None:
         return False, None, None
     return True, row["country"], row["branch"]
+
+
+def match_in_ranges(hex_code: str, ranges):
+    """Return the mil_hex_ranges row whose range contains ``hex_code``, or
+    None. In-memory variant of ``is_military_hex``: callers preload the
+    ranges list once (see ``Database.all_mil_hex_ranges``) and avoid one
+    SQL round-trip per hex for bulk scans like ``enrich_all`` / ``mil scan``."""
+    hl = hex_code.lower()
+    for row in ranges:
+        if row["range_start"] <= hl <= row["range_end"]:
+            return row
+    return None

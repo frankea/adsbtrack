@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from .classifier import _haversine_m, descent_score
+from .ils_alignment import _bearing_deg
 from .solar import is_night_at
 
 if TYPE_CHECKING:
@@ -474,15 +475,6 @@ def compute_go_around(metrics: FlightMetrics, *, landing_type: str, config: Conf
 # ----------------------------------------------------------------------
 # Takeoff / landing heading (§6)
 # ----------------------------------------------------------------------
-
-
-def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Initial bearing from (lat1, lon1) to (lat2, lon2) in degrees [0, 360)."""
-    rlat1, rlat2 = math.radians(lat1), math.radians(lat2)
-    dlon = math.radians(lon2 - lon1)
-    x = math.sin(dlon) * math.cos(rlat2)
-    y = math.cos(rlat1) * math.sin(rlat2) - math.sin(rlat1) * math.cos(rlat2) * math.cos(dlon)
-    return (math.degrees(math.atan2(x, y)) + 360.0) % 360.0
 
 
 def _circular_mean_deg(headings: list[float]) -> float | None:

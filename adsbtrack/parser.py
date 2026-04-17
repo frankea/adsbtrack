@@ -16,7 +16,7 @@ from .classifier import (
 )
 from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database
-from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments, detect_ils_alignment
+from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments
 from .landing_anchor import compute_landing_anchor
 from .models import Flight
 from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
@@ -1125,6 +1125,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # without another DB round-trip when the alignment ran against the
         # same airport.
         runway_rows: list = []
+        all_segments: list[IlsAlignmentResult] = []
         if alignment_icao:
             if alignment_icao not in airport_elev_cache:
                 airport_elev_cache[alignment_icao] = db.get_airport_elevation(alignment_icao)
@@ -1135,7 +1136,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 runway_cache[alignment_icao] = db.get_runways_for_airport(alignment_icao)
             runway_rows = runway_cache[alignment_icao]
             if runway_rows:
-                alignment = detect_ils_alignment(
+                # Single pass: all-segments feeds both the longest-wins
+                # ILS signal and the pattern_cycles/go-around block below.
+                all_segments = detect_all_ils_alignments(
                     metrics,
                     airport_elev_ft=airport_elev_ft,
                     runway_ends=[dict(r) for r in runway_rows],
@@ -1144,6 +1147,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                     split_gap_secs=config.ils_alignment_split_gap_secs,
                     min_duration_secs=config.ils_alignment_min_duration_secs,
                 )
+                if all_segments:
+                    # Longest wins; tie-break on earliest first_ts for determinism.
+                    alignment = max(all_segments, key=lambda s: (s.duration_secs, -s.first_ts))
 
         if alignment is not None:
             flight.aligned_runway = alignment.runway_name
@@ -1178,20 +1184,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 flight.landing_type = "dropped_on_approach"
 
         # --- Go-around + pattern_cycles (adsbtrack/ils_alignment.py) ---
-        # Reuses alignment_icao, airport_elev_ft, runway_rows from the
-        # alignment block above. When no candidate airport or no runway data
-        # is available, pattern_cycles stays 0 and had_go_around stays 0.
-        all_segments: list[IlsAlignmentResult] = []
-        if alignment_icao and runway_rows:
-            all_segments = detect_all_ils_alignments(
-                metrics,
-                airport_elev_ft=airport_elev_ft,
-                runway_ends=[dict(r) for r in runway_rows],
-                max_offset_m=config.ils_alignment_max_offset_m,
-                max_ft_above_airport=config.ils_alignment_max_ft_above_airport,
-                split_gap_secs=config.ils_alignment_split_gap_secs,
-                min_duration_secs=config.ils_alignment_min_duration_secs,
-            )
+        # all_segments was already computed above and feeds both ILS and
+        # pattern/go-around. Empty list means no candidate airport, no
+        # runway data, or no qualifying alignment.
         flight.pattern_cycles = len(all_segments)
         flight.had_go_around = 1 if _any_climb_between(all_segments, metrics.recent_points, threshold_ft=500.0) else 0
 

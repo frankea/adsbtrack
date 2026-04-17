@@ -1369,24 +1369,24 @@ class Database:
             fid = f["id"]
             to_lat, to_lon = f["takeoff_lat"], f["takeoff_lon"]
             ld_lat, ld_lon = f["landing_lat"], f["landing_lon"]
+            has_landing = ld_lat is not None and ld_lon is not None
 
-            # Origin helipad: nearest centroid within eps_km of takeoff
+            # Single-pass over helipads: compute origin + destination
+            # candidates together so we only hit each centroid once per flight.
             best_origin_id = None
             best_origin_dist = eps_km
-            for h in helipads:
-                d = haversine_km(to_lat, to_lon, h["centroid_lat"], h["centroid_lon"])
-                if d <= best_origin_dist:
-                    best_origin_dist = d
-                    best_origin_id = h["helipad_id"]
-
-            # Destination helipad: nearest centroid within eps_km of landing
             best_dest_id = None
-            if ld_lat is not None and ld_lon is not None:
-                best_dest_dist = eps_km
-                for h in helipads:
-                    d = haversine_km(ld_lat, ld_lon, h["centroid_lat"], h["centroid_lon"])
-                    if d <= best_dest_dist:
-                        best_dest_dist = d
+            best_dest_dist = eps_km
+            for h in helipads:
+                h_lat, h_lon = h["centroid_lat"], h["centroid_lon"]
+                d_origin = haversine_km(to_lat, to_lon, h_lat, h_lon)
+                if d_origin <= best_origin_dist:
+                    best_origin_dist = d_origin
+                    best_origin_id = h["helipad_id"]
+                if has_landing:
+                    d_dest = haversine_km(ld_lat, ld_lon, h_lat, h_lon)
+                    if d_dest <= best_dest_dist:
+                        best_dest_dist = d_dest
                         best_dest_id = h["helipad_id"]
 
             if best_origin_id is not None or best_dest_id is not None:

@@ -1164,11 +1164,14 @@ def mil_scan_cmd(db_path):
     """
     from rich.table import Table
 
+    from .mil_hex import match_in_ranges
+
     with Database(Path(db_path)) as db:
         icaos = db.get_all_icaos()
+        ranges = db.all_mil_hex_ranges()
         matches = []
         for icao in icaos:
-            row = db.lookup_mil_hex_range(icao)
+            row = match_in_ranges(icao, ranges)
             if row is not None:
                 matches.append((icao, row["country"], row["branch"], row["notes"]))
 

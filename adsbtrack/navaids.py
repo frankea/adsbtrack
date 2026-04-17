@@ -16,9 +16,6 @@ import sqlite3
 from collections.abc import Iterable
 from pathlib import Path
 
-import httpx
-from rich.progress import Progress
-
 from .classifier import _PointSample
 from .config import Config
 from .db import Database
@@ -79,12 +76,9 @@ def refresh_navaids(
     if local_csv is not None:
         text = Path(local_csv).read_text(encoding="utf-8")
     else:
-        with Progress() as progress:
-            task = progress.add_task("Downloading navaids...", total=None)
-            resp = httpx.get(config.navaids_csv_url, follow_redirects=True, timeout=60)
-            resp.raise_for_status()
-            progress.update(task, completed=100)
-            text = resp.text
+        from .airports import fetch_ourairports_csv
+
+        text = fetch_ourairports_csv(config.navaids_csv_url, label="navaids")
 
     rows = _read_csv(text)
     db.conn.executemany(

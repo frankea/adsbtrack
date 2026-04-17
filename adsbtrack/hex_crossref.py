@@ -291,6 +291,7 @@ def enrich_hex(
     *,
     hexdb_client: HexdbClient | None = None,
     mictronics_cache: tuple[dict, dict, dict] | None = None,
+    mil_ranges=None,
 ) -> tuple[dict | None, list[str]]:
     """Resolve identity for a single hex with source preference FAA -> Mictronics -> hexdb.io.
 
@@ -307,8 +308,12 @@ def enrich_hex(
     `mictronics_cache`, when given, is (aircrafts, types, operators) from
     :func:`_load_mictronics_files` -- passing it in avoids repeat disk
     reads when enriching many hexes in a loop.
+
+    `mil_ranges`, when given, is the preloaded `mil_hex_ranges` list (see
+    `Database.all_mil_hex_ranges`). Bulk callers like `enrich_all` load it
+    once to avoid one SQL round-trip per hex.
     """
-    from .mil_hex import is_military_hex
+    from .mil_hex import is_military_hex, match_in_ranges
 
     hex_lower = hex_code.lower()
     conflicts: list[str] = []
@@ -339,7 +344,13 @@ def enrich_hex(
             chosen = _hexdb_payload_to_crossref(hex_lower, payload)
 
     # Military range check (always on, independent of civilian identity source)
-    is_mil, country, branch = is_military_hex(db, hex_lower)
+    if mil_ranges is not None:
+        mil_row = match_in_ranges(hex_lower, mil_ranges)
+        is_mil = mil_row is not None
+        country = mil_row["country"] if is_mil else None
+        branch = mil_row["branch"] if is_mil else None
+    else:
+        is_mil, country, branch = is_military_hex(db, hex_lower)
     if is_mil:
         if chosen is None:
             chosen = {
@@ -414,6 +425,8 @@ def enrich_all(
             rate_limit_per_min=cfg.hexdb_rate_limit_per_min,
         )
 
+    mil_ranges = db.all_mil_hex_ranges()
+
     try:
         total = len(missing)
         for idx, hex_code in enumerate(missing, start=1):
@@ -422,6 +435,7 @@ def enrich_all(
                 hex_code,
                 hexdb_client=hexdb_client,
                 mictronics_cache=mictronics_cache,
+                mil_ranges=mil_ranges,
             )
             stats["processed"] += 1
             if row is not None:

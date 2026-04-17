@@ -187,6 +187,7 @@ Detailed reference docs for contributors and analysts:
 - **[Database schema](docs/schema.md)** - full column reference for every table (traces / flights / registry / stats / airports / helipads / FAA registry / ACARS / hex crossref / mil ranges)
 - **[Features and scoring](docs/features.md)** - landing types, confidence scoring algorithm, all derived per-flight columns, mission classification rules, signal budget, ACARS OOOI, position-source breakdown
 - **[Internals](docs/internals.md)** - how the extractor works: trace merging, flight extraction state machine, fragment stitching, airport matching, FAA registry parser, hex crossref merge
+- **[Datasette pairing](docs/datasette.md)** - explore `adsbtrack.db` through a web UI with five starter canned queries (emergencies, military activity, signal gaps, off-airport landings, top-aircraft-by-flights)
 
 ## Development
 

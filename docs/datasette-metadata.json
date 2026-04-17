@@ -1,0 +1,35 @@
+{
+  "title": "adsbtrack",
+  "description_html": "Historical ADS-B trace extraction. Browse tables directly or use the canned queries below to explore analytical signal surfaced by the extractor.",
+  "databases": {
+    "adsbtrack": {
+      "queries": {
+        "emergency_flights": {
+          "title": "Emergency-flagged flights",
+          "description": "Flights that tripped an emergency signal: a 7500 / 7600 / 7700 squawk recorded in emergency_squawk, or a non-null emergency_flag (e.g. nordo). These are rare per aircraft; the query lists individual events rather than monthly aggregates.",
+          "sql": "SELECT\n  icao,\n  takeoff_time,\n  landing_time,\n  callsign,\n  emergency_squawk,\n  emergency_flag,\n  round(duration_minutes, 1) AS duration_min,\n  mission_type\nFROM flights\nWHERE emergency_flag IS NOT NULL\n   OR emergency_squawk IS NOT NULL\nORDER BY takeoff_time DESC\nLIMIT 100"
+        },
+        "top_aircraft_this_year": {
+          "title": "Top 10 aircraft by flight count this year",
+          "description": "Most active hexes in the current calendar year, with registration / type / operator joined from aircraft_registry when available.",
+          "sql": "SELECT\n  f.icao,\n  r.registration,\n  r.type_code,\n  r.owner_operator,\n  COUNT(*) AS flights,\n  MIN(f.takeoff_date) AS first_seen,\n  MAX(f.takeoff_date) AS last_seen\nFROM flights f\nLEFT JOIN aircraft_registry r USING (icao)\nWHERE substr(f.takeoff_time, 1, 4) = strftime('%Y', 'now')\nGROUP BY f.icao\nORDER BY flights DESC\nLIMIT 10"
+        },
+        "military_activity_last_week": {
+          "title": "Military-registered aircraft activity in the last 7 days",
+          "description": "Flights whose ICAO hex falls inside a curated military allocation range (see mil_hex_ranges) within the last week. This uses the authoritative hex ranges rather than the mission_type classifier, which does not currently emit a 'military' value.",
+          "sql": "SELECT\n  f.icao,\n  r.registration,\n  r.type_code,\n  r.owner_operator,\n  COUNT(*) AS flights,\n  MAX(f.takeoff_time) AS last_flight,\n  m.country,\n  m.branch\nFROM flights f\nJOIN mil_hex_ranges m\n  ON f.icao >= m.range_start\n  AND f.icao <= m.range_end\nLEFT JOIN aircraft_registry r USING (icao)\nWHERE f.takeoff_time >= datetime('now', '-7 days')\nGROUP BY f.icao\nORDER BY flights DESC"
+        },
+        "flights_with_long_signal_gaps": {
+          "title": "Flights with signal gaps longer than 10 minutes",
+          "description": "Within-flight coverage holes exceeding 10 minutes. Some of these are genuine receiver-coverage gaps (oceans, remote areas); others may indicate the transponder was turned off. A dedicated 'adsbtrack gaps' CLI (planned) will classify these.",
+          "sql": "SELECT\n  icao,\n  takeoff_time,\n  landing_time,\n  round(duration_minutes, 1) AS duration_min,\n  signal_gap_count,\n  round(signal_gap_secs / 60.0, 1) AS gap_minutes,\n  signal_gap_secs\nFROM flights\nWHERE signal_gap_secs > 600\nORDER BY signal_gap_secs DESC\nLIMIT 50"
+        },
+        "off_airport_landings": {
+          "title": "Aircraft with the most off-airport landings",
+          "description": "Confirmed landings where no nearby airport AND no helipad matched. Common for helicopters landing at private pads that aren't in the helipads table, and for fixed-wing aircraft landing on unregistered strips.",
+          "sql": "SELECT\n  f.icao,\n  r.registration,\n  r.type_code,\n  r.owner_operator,\n  COUNT(*) AS off_airport_landings,\n  MAX(f.landing_time) AS last_event\nFROM flights f\nLEFT JOIN aircraft_registry r USING (icao)\nWHERE f.landing_type = 'confirmed'\n  AND f.destination_icao IS NULL\n  AND f.destination_helipad_id IS NULL\nGROUP BY f.icao\nHAVING off_airport_landings > 0\nORDER BY off_airport_landings DESC\nLIMIT 20"
+        }
+      }
+    }
+  }
+}

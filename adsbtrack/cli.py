@@ -514,6 +514,24 @@ def status(hex_code, db_path):
                     pct = q["count"] / flight_count * 100 if flight_count > 0 else 0
                     console.print(f"  [{color}]{label}:{' ' * (22 - len(label))}{q['count']:>4} ({pct:.0f}%)[/]")
 
+        # Go-around + pattern-work counters. Wrapped in try/except so a
+        # pre-migration DB without the new columns degrades gracefully
+        # (the whole section simply doesn't render).
+        try:
+            counts_row = db.conn.execute(
+                """SELECT
+                       SUM(CASE WHEN had_go_around = 1 THEN 1 ELSE 0 END) AS go_arounds,
+                       SUM(CASE WHEN pattern_cycles >= 2 THEN 1 ELSE 0 END) AS pattern_flights
+                   FROM flights WHERE icao = ?""",
+                (hex_code,),
+            ).fetchone()
+        except Exception:
+            counts_row = None
+        if counts_row and (counts_row["go_arounds"] or counts_row["pattern_flights"]):
+            console.print("\n[bold]Approach behaviour:[/]\n")
+            console.print(f"  Go-arounds:     {counts_row['go_arounds'] or 0}")
+            console.print(f"  Pattern work:   {counts_row['pattern_flights'] or 0} flights")
+
         # v3: mission type breakdown
         mission_rows = db.conn.execute(
             "SELECT mission_type, COUNT(*) as cnt FROM flights WHERE icao = ? GROUP BY mission_type ORDER BY cnt DESC",

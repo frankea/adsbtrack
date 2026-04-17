@@ -96,6 +96,8 @@ Extracted flights with airport matching, quality classification, confidence scor
 | aligned_runway | TEXT | Runway end the aircraft was geometrically aligned with on short final, e.g. `"09"` / `"26L"`. NULL when no segment qualified. |
 | aligned_seconds | REAL | Duration in seconds of the longest qualifying alignment segment. NULL when no segment qualified. |
 | aligned_min_offset_m | REAL | Minimum perpendicular offset in meters from the extended centerline over the winning segment. NULL when no segment qualified. |
+| had_go_around | INTEGER | 1 when two or more ILS-aligned segments at the landing airport were separated by a climb of more than 500 ft; 0 otherwise. NULL for legacy rows. |
+| pattern_cycles | INTEGER | Count of qualifying ILS-aligned segments at the candidate landing airport during the flight. 1 is a normal approach, 2+ signals go-around / touch-and-go / pattern practice. NULL for legacy rows. |
 | takeoff_runway | TEXT | Runway name (e.g. "24", "08R") the aircraft departed from. NULL when detection failed or runway data is unavailable. |
 | turnaround_minutes | REAL | Minutes from the previous flight's landing to this takeoff (same ICAO; NULL if > 72 h) |
 | turnaround_category | TEXT | `quick` (<30 min) / `medium` (30-240 min) / `overnight` (4-18 h) / `multi_day` (>18 h) / `extended_gap` (>72 h) / `first_observed` / `last_observed` (never NULL) |

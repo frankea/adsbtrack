@@ -1729,3 +1729,291 @@ def test_candidate_airport_without_runways_leaves_alignment_null():
     assert flight.aligned_runway is None
     assert flight.aligned_seconds is None
     assert flight.aligned_min_offset_m is None
+
+
+# ---------------------------------------------------------------------------
+# Takeoff runway integration
+# ---------------------------------------------------------------------------
+
+
+def _walk_takeoff(
+    base_ts: float,
+    n: int,
+    spacing_secs: float,
+    threshold_lat: float,
+    threshold_lon: float,
+    heading_deg: float,
+    start_alt_ft: int,
+    alt_step_ft: int,
+    start_gs_kt: float,
+    gs_step_kt: float,
+) -> list[list]:
+    """Generate n trace points climbing out along a runway heading.
+
+    Walks along the departure bearing starting at the threshold, climbing by
+    alt_step_ft and accelerating by gs_step_kt per sample. Each row is a
+    9-element trace point with track populated in position 5 (the field
+    _extract_point_fields reads into _PointSample.track).
+    """
+    departure_bearing_rad = math.radians(heading_deg)
+    points: list[list] = []
+    for i in range(n):
+        km_out = i * 0.05  # 50 m per step
+        dlat = (km_out / 111.0) * math.cos(departure_bearing_rad)
+        dlon = (km_out / (111.0 * math.cos(math.radians(threshold_lat)))) * math.sin(departure_bearing_rad)
+        lat = threshold_lat + dlat
+        lon = threshold_lon + dlon
+        alt = start_alt_ft + i * alt_step_ft
+        gs = start_gs_kt + i * gs_step_kt
+        points.append(
+            [
+                base_ts + i * spacing_secs,
+                lat,
+                lon,
+                alt,
+                gs,
+                float(heading_deg),
+                None,
+                1500.0,
+                {"track": float(heading_deg)},
+            ]
+        )
+    return points
+
+
+def test_takeoff_runway_commercial_jet_identified():
+    """A jet ground-rolling + climbing along runway 24 at KSPG should have
+    takeoff_runway populated."""
+    config = _make_config()
+
+    threshold_lat = 27.76
+    threshold_lon = -82.63
+    base_ts = _ts("2024-06-15")
+
+    # A few ground samples at the threshold (taxi/hold-short/ground roll).
+    ground_roll = [
+        _make_trace_point(0, threshold_lat, threshold_lon, "ground", gs=0),
+        _make_trace_point(30, threshold_lat, threshold_lon, "ground", gs=15),
+        _make_trace_point(45, threshold_lat, threshold_lon, "ground", gs=30),
+    ]
+    # 30-sample departure climb along 240 deg; gs goes 30 -> 30+29*6 = 204 kt.
+    climbout = _walk_takeoff(
+        base_ts=60.0,
+        n=30,
+        spacing_secs=3.0,
+        threshold_lat=threshold_lat,
+        threshold_lon=threshold_lon,
+        heading_deg=240.0,
+        start_alt_ft=10,
+        alt_step_ft=100,
+        start_gs_kt=30.0,
+        gs_step_kt=6.0,
+    )
+    # Brief cruise then a ground landing elsewhere so the flight closes.
+    cruise = [
+        _make_trace_point(600, 27.5, -83.0, 5000, gs=210),
+        _make_trace_point(1800, 27.0, -83.5, 5000, gs=210),
+    ]
+    landing = [
+        _make_trace_point(3600, 27.0, -83.6, "ground", gs=20),
+        _make_trace_point(3660, 27.0, -83.6, "ground", gs=5),
+    ]
+
+    trace = ground_roll + climbout + cruise + landing
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KSPG", name="KSPG", distance_km=0.3)
+    dest_match = AirportMatch(ident="KDEST", name="Dest", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 7
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "24",
+            "latitude_deg": threshold_lat,
+            "longitude_deg": threshold_lon,
+            "heading_deg_true": 240.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, dest_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.takeoff_runway == "24"
+
+
+def test_takeoff_runway_helicopter_threshold_scaled():
+    """A rotorcraft (H60) peaking at only ~80 kt should still be identified
+    because the H-prefix triggers low-gs scaling to 60 kt."""
+    config = _make_config()
+
+    threshold_lat = 27.76
+    threshold_lon = -82.63
+    base_ts = _ts("2024-06-15")
+
+    ground_roll = [
+        _make_trace_point(0, threshold_lat, threshold_lon, "ground", gs=0),
+        _make_trace_point(30, threshold_lat, threshold_lon, "ground", gs=15),
+    ]
+    # gs 30 -> 30+29*2 = 88 kt (below 140 default, above 60 scaled).
+    climbout = _walk_takeoff(
+        base_ts=60.0,
+        n=30,
+        spacing_secs=3.0,
+        threshold_lat=threshold_lat,
+        threshold_lon=threshold_lon,
+        heading_deg=240.0,
+        start_alt_ft=10,
+        alt_step_ft=100,
+        start_gs_kt=30.0,
+        gs_step_kt=2.0,
+    )
+    cruise = [
+        _make_trace_point(600, 27.5, -83.0, 3000, gs=85),
+        _make_trace_point(1800, 27.0, -83.5, 3000, gs=85),
+    ]
+    landing = [
+        _make_trace_point(3600, 27.0, -83.6, "ground", gs=10),
+        _make_trace_point(3660, 27.0, -83.6, "ground", gs=0),
+    ]
+
+    trace = ground_roll + climbout + cruise + landing
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    # Force the effective type_code to H60 via the registry upsert return.
+    db.upsert_aircraft_registry.return_value = {
+        "type_code": "H60",
+        "owner_operator": None,
+    }
+
+    origin_match = AirportMatch(ident="KSPG", name="KSPG", distance_km=0.3)
+    dest_match = AirportMatch(ident="KDEST", name="Dest", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 7
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "24",
+            "latitude_deg": threshold_lat,
+            "longitude_deg": threshold_lon,
+            "heading_deg_true": 240.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, dest_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.takeoff_runway == "24"
+
+
+def test_takeoff_runway_sparse_data_fails_gracefully():
+    """A flight whose takeoff samples lack track data (or exceed the AGL cap)
+    should leave takeoff_runway NULL. _make_trace_point sets track=None, which
+    _filter_takeoff_samples rejects; this exercises the detector's graceful-
+    fail path rather than skipping the detector entirely."""
+    config = _make_config()
+
+    threshold_lat = 27.76
+    threshold_lon = -82.63
+    base_ts = _ts("2024-06-15")
+
+    # Minimal trace: ground -> a couple of airborne samples (with track=None
+    # so the detector's filter rejects them) -> ground. State machine sees a
+    # valid takeoff/landing pair but the polygon detector has nothing to do.
+    trace = [
+        _make_trace_point(0, threshold_lat, threshold_lon, "ground", gs=0),
+        _make_trace_point(60, threshold_lat + 0.01, threshold_lon - 0.01, 1500, gs=150),
+        _make_trace_point(120, threshold_lat + 0.05, threshold_lon - 0.05, 2500, gs=180),
+        _make_trace_point(3600, 27.0, -83.6, "ground", gs=10),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KSPG", name="KSPG", distance_km=0.3)
+    dest_match = AirportMatch(ident="KDEST", name="Dest", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 7
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "24",
+            "latitude_deg": threshold_lat,
+            "longitude_deg": threshold_lon,
+            "heading_deg_true": 240.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, dest_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count >= 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.takeoff_runway is None
+
+
+def test_takeoff_runway_no_runway_data_leaves_null():
+    """When the origin airport has no runway rows, takeoff_runway stays NULL
+    and the flight is still saved."""
+    config = _make_config()
+
+    threshold_lat = 27.76
+    threshold_lon = -82.63
+    base_ts = _ts("2024-06-15")
+
+    ground_roll = [
+        _make_trace_point(0, threshold_lat, threshold_lon, "ground", gs=0),
+        _make_trace_point(30, threshold_lat, threshold_lon, "ground", gs=15),
+        _make_trace_point(45, threshold_lat, threshold_lon, "ground", gs=30),
+    ]
+    climbout = _walk_takeoff(
+        base_ts=60.0,
+        n=30,
+        spacing_secs=3.0,
+        threshold_lat=threshold_lat,
+        threshold_lon=threshold_lon,
+        heading_deg=240.0,
+        start_alt_ft=10,
+        alt_step_ft=100,
+        start_gs_kt=30.0,
+        gs_step_kt=6.0,
+    )
+    cruise = [
+        _make_trace_point(600, 27.5, -83.0, 5000, gs=210),
+        _make_trace_point(1800, 27.0, -83.5, 5000, gs=210),
+    ]
+    landing = [
+        _make_trace_point(3600, 27.0, -83.6, "ground", gs=20),
+        _make_trace_point(3660, 27.0, -83.6, "ground", gs=5),
+    ]
+
+    trace = ground_roll + climbout + cruise + landing
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    origin_match = AirportMatch(ident="KSPG", name="KSPG", distance_km=0.3)
+    dest_match = AirportMatch(ident="KDEST", name="Dest", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 7
+    db.get_runways_for_airport.return_value = []
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[origin_match, dest_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.takeoff_runway is None

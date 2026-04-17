@@ -345,9 +345,15 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, db_path):
 
         for f in flights:
             takeoff = f["takeoff_time"][:10] if f["takeoff_time"] else "?"
-            origin = f["origin_icao"] or f"({f['takeoff_lat']:.2f}, {f['takeoff_lon']:.2f})"
-            if f["origin_name"]:
-                origin = f"{f['origin_icao']} ({f['origin_name']})"
+            rwy = _col(f, "takeoff_runway")
+            origin_icao = f["origin_icao"]
+            origin_suffix = f"/{rwy}" if rwy else ""
+            if origin_icao and f["origin_name"]:
+                origin = f"{origin_icao}{origin_suffix} ({f['origin_name']})"
+            elif origin_icao:
+                origin = f"{origin_icao}{origin_suffix}"
+            else:
+                origin = f"({f['takeoff_lat']:.2f}, {f['takeoff_lon']:.2f})"
 
             landing_type = f["landing_type"] or "unknown"
 

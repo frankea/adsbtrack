@@ -17,6 +17,7 @@ from .db import Database
 from .ils_alignment import IlsAlignmentResult, detect_ils_alignment
 from .landing_anchor import compute_landing_anchor
 from .models import Flight
+from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
 
 
 def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> PointData:
@@ -848,6 +849,46 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             else:
                 flight.nearest_origin_icao = origin.ident
                 flight.nearest_origin_distance_km = origin.distance_km
+
+        # --- Takeoff runway identification (adsbtrack/takeoff_runway.py) ---
+        # Reuses the per-extract-run runway_cache / airport_elev_cache added
+        # for the ILS alignment milestone. Scales the GS floor down to
+        # takeoff_runway_min_gs_kt_low (60 kt) when the effective type is a
+        # rotorcraft (H-prefix or in config.helicopter_types) or a light
+        # piston single listed in config.takeoff_low_gs_types.
+        takeoff_origin_icao = flight.origin_icao or flight.nearest_origin_icao
+        if takeoff_origin_icao:
+            if takeoff_origin_icao not in airport_elev_cache:
+                airport_elev_cache[takeoff_origin_icao] = db.get_airport_elevation(takeoff_origin_icao)
+            origin_elev = airport_elev_cache[takeoff_origin_icao]
+            if takeoff_origin_icao not in runway_cache:
+                runway_cache[takeoff_origin_icao] = db.get_runways_for_airport(takeoff_origin_icao)
+            origin_runways = runway_cache[takeoff_origin_icao]
+            if origin_runways:
+                effective_type = type_code or ""
+                is_low_gs = (
+                    effective_type.startswith("H")
+                    or effective_type in config.takeoff_low_gs_types
+                    or effective_type in config.helicopter_types
+                )
+                min_gs = config.takeoff_runway_min_gs_kt_low if is_low_gs else config.takeoff_runway_min_gs_kt_default
+                to_result: TakeoffRunwayResult | None = detect_takeoff_runway(
+                    metrics,
+                    # Fallback 0.0 is safe because the `if origin_runways:`
+                    # guard above only fires when the airport is in our DB
+                    # (runways and elevations come from the same OurAirports
+                    # load, so both are present or both are absent).
+                    airport_elev_ft=float(origin_elev) if origin_elev is not None else 0.0,
+                    runway_ends=[dict(r) for r in origin_runways],
+                    max_ft_above_airport=config.takeoff_runway_max_ft_above_airport,
+                    zone_length_m=config.takeoff_runway_zone_length_m,
+                    little_base_m=config.takeoff_runway_little_base_m,
+                    opening_deg=config.takeoff_runway_opening_deg,
+                    min_gs_kt=min_gs,
+                    min_vert_rate_fpm=config.takeoff_runway_min_vert_rate_fpm,
+                )
+                if to_result is not None:
+                    flight.takeoff_runway = to_result.runway_name
 
         if has_landing and flight.landing_type not in ("signal_lost", "dropped_on_approach"):
             # Use anchor (alt-min in final window) when available; fall back

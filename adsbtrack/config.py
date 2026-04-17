@@ -299,6 +299,41 @@ class Config:
     ils_alignment_bonus_short: float = 0.15
     ils_alignment_bonus_long: float = 0.25
 
+    # --- Takeoff runway detector (see adsbtrack/takeoff_runway.py) ---
+    # A trapezoid polygon is built per runway end: narrow `little_base_m`
+    # base at the threshold, extending `zone_length_m` outward along the
+    # departure heading, opening symmetrically by `opening_deg`. A flight's
+    # first 600 s of low-altitude climb (below airport_elev +
+    # `max_ft_above_airport`) is tested for intersection with each polygon;
+    # the runway whose polygon the flight was inside longest wins, subject
+    # to a minimum ground-speed peak (`min_gs_kt_default` for commercial,
+    # scaled to `min_gs_kt_low` for rotorcraft and type codes listed in
+    # `takeoff_low_gs_types`) and a minimum vertical rate.
+    takeoff_runway_zone_length_m: float = 6000.0
+    takeoff_runway_little_base_m: float = 50.0
+    takeoff_runway_opening_deg: float = 5.0
+    takeoff_runway_max_ft_above_airport: float = 2000.0
+    takeoff_runway_min_gs_kt_default: float = 140.0
+    takeoff_runway_min_gs_kt_low: float = 60.0
+    takeoff_runway_min_vert_rate_fpm: float = 256.0
+    takeoff_low_gs_types: tuple[str, ...] = (
+        "C150",
+        "C152",
+        "C162",
+        "C172",
+        "C177",
+        "C182",
+        "DA20",
+        "DA40",
+        "PA28",
+        "PA32",
+        "SR20",
+        "SR22",
+        "BE33",
+        "BE35",
+        "BE36",
+    )
+
     # Endurance
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown
     type_endurance_minutes: dict[str, float] = field(default_factory=lambda: dict(TYPE_ENDURANCE_MINUTES))

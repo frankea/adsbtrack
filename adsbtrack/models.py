@@ -184,6 +184,14 @@ class Flight:
     aligned_seconds: float | None = None
     aligned_min_offset_m: float | None = None
 
+    # --- Takeoff runway identification (adsbtrack/takeoff_runway.py) ---
+    # Runway name (e.g., "24", "08R") the aircraft departed from, inferred
+    # by testing which runway's trapezoid polygon the low-altitude climb
+    # trajectory passed through longest. NULL when the origin airport has
+    # no runway data, no polygon matched, or the ground-speed / vertical-
+    # rate thresholds weren't met.
+    takeoff_runway: str | None = None
+
 
 @dataclass
 class AirportMatch:

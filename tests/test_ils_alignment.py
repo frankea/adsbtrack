@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections import deque
 
 from adsbtrack.classifier import _PointSample
@@ -37,8 +38,6 @@ def _walk_toward(
     spacing_secs: float,
 ) -> list[_PointSample]:
     """Generate `n` samples approaching a runway threshold along its extended centerline."""
-    import math
-
     approach_bearing = (runway_heading + 180.0) % 360.0
     samples: list[_PointSample] = []
     for i in range(n):
@@ -133,6 +132,11 @@ def test_split_on_gap_picks_longest_segment() -> None:
     result = detect_ils_alignment(metrics, airport_elev_ft=1026, runway_ends=[runway])
     assert result is not None
     assert result.duration_secs >= 70.0  # the longer segment wins
+    # Upper bound proves the split actually happened. The second segment is
+    # 24 spacings * 3s = 72s. Without a split, s1+s2 would merge into a run
+    # whose duration spans s1[0].ts -> s2[-1].ts = 192s. A value between
+    # these two (e.g. < 100s) can only come from the split-on-gap branch.
+    assert result.duration_secs < 100.0
 
 
 def test_short_segment_below_min_duration_returns_none() -> None:
@@ -168,8 +172,6 @@ def test_samples_moving_away_from_threshold_are_excluded() -> None:
         "longitude_deg": -84.43,
         "heading_deg_true": 90.0,
     }
-    import math
-
     samples = []
     for i in range(30):
         km_out = 0.5 + i * 0.3
@@ -181,3 +183,16 @@ def test_samples_moving_away_from_threshold_are_excluded() -> None:
     # Aircraft is east of threshold, heading east, so bearing from point to
     # threshold is west (270) but track is 90: cos(bearing - track) = cos(180) = -1
     assert detect_ils_alignment(metrics, airport_elev_ft=1026, runway_ends=[runway]) is None
+
+
+def test_multi_runway_picks_longest_segment() -> None:
+    # Two runways at same airport - aircraft aligns briefly with 27 then
+    # commits to 09 for a longer segment. The result must pick 09.
+    runway_09 = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
+    runway_27 = {"runway_name": "27", "latitude_deg": 33.64, "longitude_deg": -84.40, "heading_deg_true": 270.0}
+    samples = _walk_toward(33.64, -84.43, 90.0, start_ts=0.0, n=30, spacing_secs=3.0)
+    metrics = _Metrics(samples)
+    result = detect_ils_alignment(metrics, airport_elev_ft=1026, runway_ends=[runway_27, runway_09])
+    assert result is not None
+    assert result.runway_name == "09"
+    assert result.duration_secs >= 60.0

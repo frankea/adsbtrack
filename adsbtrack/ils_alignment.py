@@ -150,6 +150,10 @@ def detect_ils_alignment(
 
     Returns the longest qualifying segment, or None if no runway end
     produces a segment meeting ``min_duration_secs``.
+
+    Assumes ``metrics.recent_points`` is in chronological order; gap-split
+    logic depends on it (which is how ``FlightMetrics.record_point``
+    appends them).
     """
     samples = list(metrics.recent_points)
     if not samples:

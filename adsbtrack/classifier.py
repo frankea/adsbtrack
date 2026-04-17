@@ -218,6 +218,12 @@ class FlightMetrics:
     # (ts, track_deg, gs) tuples for later filtering in features.compute_headings.
     takeoff_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
     landing_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
+    # First-N-window samples captured for takeoff-runway detection. Unlike
+    # recent_points (which is a tail-only deque), takeoff_points is a
+    # monotonically-growing list bounded by a time window and a sample cap.
+    # Capped at 240 samples OR 600 seconds from first_point_ts, whichever
+    # first. Consumed by adsbtrack.takeoff_runway.
+    takeoff_points: list[_PointSample] = field(default_factory=list)
     # v9 N7: recent airborne positions for bearing-based heading fallback
     # when track data is unavailable (helicopter hover approaches).
     _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
@@ -295,6 +301,11 @@ class FlightMetrics:
                 track=point.track,
             )
         )
+        # Takeoff window: first 600 s or 240 samples, whichever comes first.
+        # first_point_ts was assigned earlier in this method when it was None,
+        # so it's guaranteed non-None by here.
+        if len(self.takeoff_points) < 240 and self.first_point_ts is not None and (ts - self.first_point_ts) <= 600.0:
+            self.takeoff_points.append(self.recent_points[-1])
 
         # Approach altitudes deque for go-around detection, phase budget
         # level_buf, and cruise altitude. v6 N1 fix: prefer baro_alt to

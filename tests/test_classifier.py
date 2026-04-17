@@ -373,3 +373,67 @@ def test_record_point_captures_track_on_recent_points() -> None:
     assert len(metrics.recent_points) == 1
     sample = metrics.recent_points[-1]
     assert sample.track == 87.0
+
+
+def test_record_point_populates_takeoff_points_for_first_window() -> None:
+    """takeoff_points collects samples in the first 600s or first 240 samples,
+    whichever comes first, and never evicts."""
+    metrics = FlightMetrics()
+
+    def _pt(ts: float, alt: int = 0) -> PointData:
+        return PointData(
+            ts=ts,
+            lat=27.77,
+            lon=-82.67,
+            baro_alt=alt,
+            gs=50.0,
+            track=90.0,
+            geom_alt=alt,
+            baro_rate=0.0,
+            geom_rate=None,
+            squawk=None,
+            category=None,
+            nav_altitude_mcp=None,
+            nav_qnh=None,
+            emergency_field=None,
+            true_heading=None,
+            callsign=None,
+        )
+
+    # 100 samples spanning 500 seconds (within 600s window)
+    for i in range(100):
+        metrics.record_point(_pt(i * 5.0), ground_state="airborne", ground_reason="ok")
+    assert len(metrics.takeoff_points) == 100
+
+    # Push past the 600s window; new samples should NOT be appended
+    metrics.record_point(_pt(700.0), ground_state="airborne", ground_reason="ok")
+    assert len(metrics.takeoff_points) == 100  # still only 100
+
+
+def test_takeoff_points_capped_at_240_samples() -> None:
+    metrics = FlightMetrics()
+
+    def _pt(ts: float) -> PointData:
+        return PointData(
+            ts=ts,
+            lat=27.77,
+            lon=-82.67,
+            baro_alt=1000,
+            gs=150.0,
+            track=90.0,
+            geom_alt=1000,
+            baro_rate=500.0,
+            geom_rate=None,
+            squawk=None,
+            category=None,
+            nav_altitude_mcp=None,
+            nav_qnh=None,
+            emergency_field=None,
+            true_heading=None,
+            callsign=None,
+        )
+
+    # 300 samples within 600s: 240 cap kicks in before the time window closes
+    for i in range(300):
+        metrics.record_point(_pt(i * 1.0), ground_state="airborne", ground_reason="ok")
+    assert len(metrics.takeoff_points) == 240

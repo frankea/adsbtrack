@@ -219,11 +219,13 @@ class Flight:
     primary_squawk: str | None = None
 
     # --- Navaid alignment (populated by adsbtrack.navaid_alignment) ---
-    # JSON-encoded list of alignment segments where the flight passed
-    # close to an FAA navaid (VOR/VORTAC/VOR-DME/NDB). Each element:
-    # {"navaid_ident": str, "start_ts": float, "end_ts": float,
-    #  "min_distance_nm": float}. NULL when no alignments were detected
-    # or for legacy rows extracted before navaid alignment existed.
+    # JSON-encoded list of alignment segments where the flight's ground
+    # track pointed directly at an OurAirports navaid row (any type:
+    # VOR, VOR-DME, VORTAC, NDB, TACAN, FIX, etc.) for long enough to
+    # count as intentional. Each element: {"navaid_ident": str,
+    # "start_ts": float, "end_ts": float, "min_distance_nm": float}.
+    # NULL when no alignments were detected or for legacy rows extracted
+    # before navaid alignment existed.
     navaid_track: str | None = None
 
 

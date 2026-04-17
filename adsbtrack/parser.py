@@ -1220,6 +1220,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             config=config,
             navaid_cache=navaid_cache,
         )
+        # all_points is only consumed by the navaid alignment pass above.
+        # Drop it eagerly so the per-flight buffer doesn't keep every point
+        # pinned until extract returns (matters on multi-hundred-flight hexes).
+        metrics.all_points.clear()
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
         # v8 N8: cap at 72 hours (4320 min). Anything longer reflects a

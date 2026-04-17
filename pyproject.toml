@@ -46,6 +46,12 @@ dev = [
 faa = [
     "curl_cffi>=0.7",
 ]
+# Read-only MCP server surface for LLM assistants (Claude Desktop /
+# Claude Code). Install with `uv sync --extra mcp`; the server is then
+# launched via `adsbtrack mcp-serve --db <path>`.
+mcp = [
+    "mcp>=1.0",
+]
 
 [tool.ruff]
 target-version = "py312"

@@ -1428,5 +1428,22 @@ def events(hex_code, db_path, since_str, severity):
     )
 
 
+@cli.command("mcp-serve")
+@click.option("--db", "db_path", default="adsbtrack.db", help="SQLite database path the server reads from.")
+def mcp_serve(db_path):
+    """Run the read-only MCP server over stdio.
+
+    Exposes adsbtrack query tools (aircraft stats, flights, events,
+    gaps, registry lookup) to MCP-compatible LLM clients such as
+    Claude Desktop and Claude Code. Requires the 'mcp' extra:
+    `uv sync --extra mcp`.
+
+    All tools are read-only; no fetch or write path is exposed.
+    """
+    from .mcp import serve
+
+    serve(Path(db_path))
+
+
 if __name__ == "__main__":
     cli()

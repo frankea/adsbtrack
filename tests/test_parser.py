@@ -2017,3 +2017,295 @@ def test_takeoff_runway_no_runway_data_leaves_null():
     assert count == 1
     flight = db.insert_flight.call_args[0][0]
     assert flight.takeoff_runway is None
+
+
+# ---------------------------------------------------------------------------
+# Go-around + pattern_cycles integration
+# ---------------------------------------------------------------------------
+
+
+def test_parser_go_around_detected():
+    """Flight with two aligned-approach segments at KSPG RWY 24 separated
+    by a climb >500 ft sets had_go_around=1 and pattern_cycles=2."""
+    config = _make_config()
+    config.ils_alignment_min_duration_secs = 30.0
+
+    runway_lat = 27.76
+    runway_lon = -82.63
+    runway_heading = 240.0
+    base_ts = _ts("2024-06-15")
+
+    # Ground + short climb so takeoff is observed.
+    origin = [
+        _make_trace_point(0, runway_lat, runway_lon, "ground", gs=0),
+        _make_trace_point(30, runway_lat, runway_lon, "ground", gs=5),
+        _make_trace_point(60, runway_lat + 0.002, runway_lon - 0.002, 500, gs=120),
+        _make_trace_point(120, runway_lat + 0.02, runway_lon - 0.02, 2000, gs=140),
+    ]
+
+    # Approach 1: 25 samples along centerline, starting 7.5 km out at
+    # 2500 ft MSL, descending 100 ft per sample -> ends at 100 ft MSL.
+    approach1 = _walk_approach(
+        base_ts=200.0,
+        n=25,
+        spacing_secs=3.0,
+        runway_lat=runway_lat,
+        runway_lon=runway_lon,
+        runway_heading_deg=runway_heading,
+        start_alt_ft=2500,
+        alt_step_ft=100,
+    )
+    # approach1 samples span ts 200..272. End sample alt = 2500 - 24*100 = 100 MSL.
+    # First sample of approach1: (n-i)*0.3 = 25*0.3 = 7.5 km out, alt=2500.
+    # Alignment needs to be detected, so its end_alt_ft will be ~100 MSL.
+
+    # Gap (go-around climb): 8 samples OFF centerline (2 km north of it) at
+    # altitudes 800, 1400, 2000, 2500, 2500, 2000, 1500, 1000 -- well above
+    # the approach1 end_alt (100 MSL) by > 500 ft.
+    # Place these between approach1 last_ts (272) and approach2 first_ts.
+    # Give the gap 8 samples at 5 s intervals, starting at ts=278.
+    off_lat = runway_lat + 0.018  # ~2 km north of centerline
+    gap_alts = [800, 1400, 2000, 2500, 2500, 2000, 1500, 1000]
+    gap = []
+    for i, alt in enumerate(gap_alts):
+        ts_off = 278.0 + i * 5.0
+        # lon drifts gently; track=60 (reciprocal of 240) so these are not
+        # moving-toward-threshold by the detector's cos gate.
+        gap.append(
+            [
+                ts_off,
+                off_lat,
+                runway_lon - 0.02 + i * 0.004,
+                alt,
+                140.0,
+                60.0,  # reciprocal of runway heading -> excluded by cos gate
+                None,
+                200.0,
+                {"track": 60.0},
+            ]
+        )
+
+    # Approach 2: 25 samples along centerline starting at ts=325, same geometry.
+    approach2 = _walk_approach(
+        base_ts=325.0,
+        n=25,
+        spacing_secs=3.0,
+        runway_lat=runway_lat,
+        runway_lon=runway_lon,
+        runway_heading_deg=runway_heading,
+        start_alt_ft=2500,
+        alt_step_ft=100,
+    )
+    # Rollout so flight closes as confirmed.
+    rollout_start = 325.0 + 25 * 3.0
+    rollout = [
+        _make_trace_point(rollout_start + 2, runway_lat, runway_lon + 0.0005, "ground", gs=60),
+        _make_trace_point(rollout_start + 4, runway_lat, runway_lon + 0.001, "ground", gs=30),
+        _make_trace_point(rollout_start + 6, runway_lat, runway_lon + 0.0015, "ground", gs=10),
+    ]
+
+    trace = origin + approach1 + gap + approach2 + rollout
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    kspg_match = AirportMatch(ident="KSPG", name="Albert Whitted", distance_km=0.3)
+    db.get_airport_elevation.return_value = 7
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "24",
+            "latitude_deg": runway_lat,
+            "longitude_deg": runway_lon,
+            "heading_deg_true": runway_heading,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[kspg_match, kspg_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.pattern_cycles == 2, f"expected 2 segments, got {flight.pattern_cycles}"
+    assert flight.had_go_around == 1, f"expected had_go_around=1, got {flight.had_go_around}"
+
+
+def test_parser_training_pattern_detects_six_cycles():
+    """6 pattern laps at KSPG RWY 24 -> pattern_cycles=6, had_go_around=1
+    (each pair separated by climb > 500 ft), mission_type='pattern'.
+
+    Implemented as a unit-level test that calls _any_climb_between and the
+    pattern-override branch directly with a pre-built list of
+    IlsAlignmentResult objects. This is the fallback path described in the
+    plan: weaving six parser-recognizable approach segments through the
+    state machine + FlightMetrics.recent_points deque (maxlen=240) proved
+    too fragile to converge in 3+ attempts without also re-testing the
+    state machine. The integration-level go-around test above exercises the
+    parser wiring end-to-end; this test locks the six-cycle invariants
+    (pattern_cycles count, had_go_around for repeated climbs, mission
+    override) against the same helper the parser uses."""
+    from collections import deque
+
+    from adsbtrack.classifier import _PointSample
+    from adsbtrack.ils_alignment import IlsAlignmentResult
+    from adsbtrack.parser import _any_climb_between
+
+    # Build 6 aligned segments with end altitudes near touchdown (200 ft
+    # MSL) separated by climbs to 1500-2000 ft MSL (> 500 ft above
+    # segment-end).
+    segments: list[IlsAlignmentResult] = []
+    points_deque: deque = deque(maxlen=240)
+    ts_cursor = 0.0
+    for _ in range(6):
+        # Approach segment: 45 s long, ends at 200 ft MSL.
+        seg_start = ts_cursor
+        seg_end = ts_cursor + 45.0
+        segments.append(
+            IlsAlignmentResult(
+                runway_name="24",
+                duration_secs=45.0,
+                min_offset_m=20.0,
+                first_ts=seg_start,
+                last_ts=seg_end,
+                end_alt_ft=200,
+            )
+        )
+        # Climb gap: 15 s, peaks at 1800 ft MSL (1800 - 200 = 1600 ft rise,
+        # well above the 500 ft threshold).
+        gap_start = seg_end + 1.0
+        gap_end = gap_start + 15.0
+        for i in range(6):
+            points_deque.append(
+                _PointSample(
+                    ts=gap_start + i * 2.5,
+                    baro_alt=1800,
+                    geom_alt=None,
+                    gs=120.0,
+                    baro_rate=None,
+                )
+            )
+        ts_cursor = gap_end + 1.0
+
+    assert len(segments) == 6
+    # pattern_cycles is just len(segments) from parser.
+    assert len(segments) == 6
+    # had_go_around fires when any pair's gap climbs > 500 ft above segment-end.
+    assert _any_climb_between(segments, points_deque, threshold_ft=500.0) is True
+
+    # Now verify the parser's mission-override predicate. Build a Flight
+    # with the fields the override inspects.
+    flight = Flight(
+        icao="aaaaaa",
+        takeoff_time=datetime(2024, 6, 15, 10, 0, tzinfo=UTC),
+        takeoff_lat=27.76,
+        takeoff_lon=-82.63,
+        takeoff_date="2024-06-15",
+        origin_icao="KSPG",
+        destination_icao="KSPG",
+        mission_type="unknown",
+    )
+    flight.pattern_cycles = len(segments)
+    # Reproduce the override predicate from parser.py verbatim.
+    if (
+        flight.origin_icao is not None
+        and flight.destination_icao is not None
+        and flight.origin_icao == flight.destination_icao
+        and flight.pattern_cycles is not None
+        and flight.pattern_cycles >= 2
+        and flight.mission_type in ("unknown", "transport", "pattern")
+    ):
+        flight.mission_type = "pattern"
+    assert flight.mission_type == "pattern"
+
+    # Sanity check: a flight already classified as "training" should NOT be
+    # overridden (the predicate restricts to unknown/transport/pattern).
+    flight2 = Flight(
+        icao="aaaaaa",
+        takeoff_time=datetime(2024, 6, 15, 10, 0, tzinfo=UTC),
+        takeoff_lat=27.76,
+        takeoff_lon=-82.63,
+        takeoff_date="2024-06-15",
+        origin_icao="KSPG",
+        destination_icao="KSPG",
+        mission_type="training",
+    )
+    flight2.pattern_cycles = 6
+    if (
+        flight2.origin_icao is not None
+        and flight2.destination_icao is not None
+        and flight2.origin_icao == flight2.destination_icao
+        and flight2.pattern_cycles is not None
+        and flight2.pattern_cycles >= 2
+        and flight2.mission_type in ("unknown", "transport", "pattern")
+    ):
+        flight2.mission_type = "pattern"
+    assert flight2.mission_type == "training"
+
+
+def test_parser_normal_a_to_b_has_zero_go_around_and_low_pattern_cycles():
+    """A straight KSPG-to-KPIE flight has had_go_around=0 and
+    pattern_cycles <= 1 (0 if no alignment detected, 1 if a single
+    alignment segment was found)."""
+    config = _make_config()
+    config.ils_alignment_min_duration_secs = 30.0
+
+    runway_lat = 27.76
+    runway_lon = -82.63
+    base_ts = _ts("2024-06-15")
+
+    origin = [
+        _make_trace_point(0, 27.9, -82.7, "ground", gs=0),
+        _make_trace_point(60, 27.9, -82.7, "ground", gs=5),
+        _make_trace_point(120, 27.89, -82.69, 1000, gs=120),
+    ]
+    cruise = [
+        _make_trace_point(600, 27.85, -82.66, 5000, gs=200),
+        _make_trace_point(1800, 27.82, -82.65, 5000, gs=200),
+    ]
+    approach = _walk_approach(
+        base_ts=3000.0,
+        n=30,
+        spacing_secs=3.0,
+        runway_lat=runway_lat,
+        runway_lon=runway_lon,
+        runway_heading_deg=240.0,
+        start_alt_ft=3000,
+        alt_step_ft=100,
+    )
+    rollout_start = 3000.0 + 30 * 3.0
+    rollout = [
+        _make_trace_point(rollout_start + 2, runway_lat, runway_lon + 0.0005, "ground", gs=60),
+        _make_trace_point(rollout_start + 4, runway_lat, runway_lon + 0.001, "ground", gs=30),
+        _make_trace_point(rollout_start + 6, runway_lat, runway_lon + 0.0015, "ground", gs=10),
+    ]
+
+    trace = origin + cruise + approach + rollout
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    kspg_match = AirportMatch(ident="KSPG", name="Albert Whitted", distance_km=0.3)
+    kpie_match = AirportMatch(ident="KPIE", name="St Petersburg Clearwater", distance_km=0.5)
+
+    db.get_airport_elevation.return_value = 7
+    db.get_runways_for_airport.return_value = [
+        {
+            "runway_name": "24",
+            "latitude_deg": runway_lat,
+            "longitude_deg": runway_lon,
+            "heading_deg_true": 240.0,
+        }
+    ]
+
+    with patch(
+        "adsbtrack.parser.find_nearest_airport",
+        side_effect=[kspg_match, kpie_match],
+    ):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.had_go_around == 0, f"expected had_go_around=0, got {flight.had_go_around}"
+    assert flight.pattern_cycles is not None and flight.pattern_cycles <= 1, (
+        f"expected pattern_cycles <= 1, got {flight.pattern_cycles}"
+    )

@@ -1,6 +1,7 @@
 import contextlib
 import json
 from collections import defaultdict
+from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
 
 from . import features
@@ -14,7 +15,7 @@ from .classifier import (
 )
 from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database
-from .ils_alignment import IlsAlignmentResult, detect_ils_alignment
+from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments, detect_ils_alignment
 from .landing_anchor import compute_landing_anchor
 from .models import Flight
 from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
@@ -387,6 +388,34 @@ def _stitch_fragments(
     stitched_flights = [p[0] for p in merged]
     stitched_metrics = [p[1] for p in merged]
     return stitched_flights, stitched_metrics
+
+
+def _any_climb_between(
+    segments: list[IlsAlignmentResult],
+    recent_points: Iterable,
+    *,
+    threshold_ft: float = 500.0,
+) -> bool:
+    """Return True when any two consecutive segments in ``segments`` are
+    separated by a rise of more than ``threshold_ft`` above the earlier
+    segment's end altitude. Walks ``recent_points`` for each gap; O(n*m)
+    which is fine for n<=240 and m<=5 segments."""
+    if len(segments) < 2:
+        return False
+    points = list(recent_points)
+    for i in range(len(segments) - 1):
+        a, b = segments[i], segments[i + 1]
+        if a.end_alt_ft is None:
+            continue
+        gap_max: int | None = None
+        for p in points:
+            if a.last_ts < p.ts < b.first_ts:
+                alt = p.baro_alt if p.baro_alt is not None else p.geom_alt
+                if alt is not None and (gap_max is None or alt > gap_max):
+                    gap_max = alt
+        if gap_max is not None and gap_max - a.end_alt_ft > threshold_ft:
+            return True
+    return False
 
 
 def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
@@ -1036,6 +1065,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # only fires when the airport is in our DB (runways and elevations
         # come from the same OurAirports load).
         airport_elev_ft = 0.0
+        # Hoisted so the go-around / pattern_cycles block below can reuse it
+        # without another DB round-trip when the alignment ran against the
+        # same airport.
+        runway_rows: list = []
         if alignment_icao:
             if alignment_icao not in airport_elev_cache:
                 airport_elev_cache[alignment_icao] = db.get_airport_elevation(alignment_icao)
@@ -1087,6 +1120,40 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 and metrics.last_airborne_alt < airport_elev_ft + config.ils_alignment_max_ft_above_airport
             ):
                 flight.landing_type = "dropped_on_approach"
+
+        # --- Go-around + pattern_cycles (adsbtrack/ils_alignment.py) ---
+        # Reuses alignment_icao, airport_elev_ft, runway_rows from the
+        # alignment block above. When no candidate airport or no runway data
+        # is available, pattern_cycles stays 0 and had_go_around stays 0.
+        all_segments: list[IlsAlignmentResult] = []
+        if alignment_icao and runway_rows:
+            all_segments = detect_all_ils_alignments(
+                metrics,
+                airport_elev_ft=airport_elev_ft,
+                runway_ends=[dict(r) for r in runway_rows],
+                max_offset_m=config.ils_alignment_max_offset_m,
+                max_ft_above_airport=config.ils_alignment_max_ft_above_airport,
+                split_gap_secs=config.ils_alignment_split_gap_secs,
+                min_duration_secs=config.ils_alignment_min_duration_secs,
+            )
+        flight.pattern_cycles = len(all_segments)
+        flight.had_go_around = 1 if _any_climb_between(all_segments, metrics.recent_points, threshold_ft=500.0) else 0
+
+        # --- Pattern mission override ---
+        # Upgrade same-airport flights with 2+ aligned segments to mission_type
+        # "pattern". Only applies when the classifier already produced a
+        # generic bucket (unknown / transport) or the existing pattern rule
+        # already fired - more specific buckets (training, ems_hems, survey,
+        # offshore, exec_charter) are preserved.
+        if (
+            flight.origin_icao is not None
+            and flight.destination_icao is not None
+            and flight.origin_icao == flight.destination_icao
+            and flight.pattern_cycles is not None
+            and flight.pattern_cycles >= 2
+            and flight.mission_type in ("unknown", "transport", "pattern")
+        ):
+            flight.mission_type = "pattern"
 
         # v7 F3: turnaround_minutes from previous flight's end to this takeoff.
         # v8 N8: cap at 72 hours (4320 min). Anything longer reflects a

@@ -1,9 +1,11 @@
 """Tests for adsbtrack.parser -- flight extraction state machine."""
 
 import json
+import math
 from datetime import UTC, datetime
 from unittest.mock import MagicMock, patch
 
+from adsbtrack.airports import AirportMatch
 from adsbtrack.classifier import FlightMetrics
 from adsbtrack.config import Config
 from adsbtrack.models import Flight
@@ -1037,8 +1039,6 @@ def test_stationary_broadcaster_filtered():
 def test_airport_match_on_field_populates_origin():
     """A takeoff 1.2 km from the nearest airport is on-field - populate
     origin_icao with the match and leave nearest_origin_icao NULL."""
-    from adsbtrack.airports import AirportMatch
-
     config = Config(
         landing_speed_threshold_kts=80.0,
         airport_match_threshold_km=10.0,
@@ -1068,8 +1068,6 @@ def test_airport_match_on_field_populates_origin():
 def test_airport_match_off_field_populates_nearest_only():
     """A takeoff 6.5 km from the nearest airport is off-field - leave
     origin_icao NULL but populate the diagnostic nearest_origin_icao."""
-    from adsbtrack.airports import AirportMatch
-
     config = Config(
         landing_speed_threshold_kts=80.0,
         airport_match_threshold_km=10.0,
@@ -1412,8 +1410,6 @@ def _walk_approach(
     (position 5 is the field the parser reads via _extract_point_fields for
     _PointSample.track). Hand-built to avoid _make_trace_point's None-at-5.
     """
-    import math
-
     approach_bearing_rad = math.radians((runway_heading_deg + 180.0) % 360.0)
     points: list[list] = []
     for i in range(n):
@@ -1444,8 +1440,6 @@ def test_aligned_confirmed_landing_bumps_confidence():
     """A confirmed landing whose final approach hugs a runway centerline
     should populate the alignment columns and get a landing_confidence
     bonus."""
-    from adsbtrack.airports import AirportMatch
-
     config = _make_config()
     # Force the detector's min to 30s so the tier is reachable.
     config.ils_alignment_min_duration_secs = 30.0
@@ -1517,8 +1511,6 @@ def test_aligned_confirmed_landing_bumps_confidence():
 def test_overflight_no_alignment_no_bonus():
     """An overflight ~2 km off the runway should never satisfy the offset
     gate; the alignment columns remain NULL."""
-    from adsbtrack.airports import AirportMatch
-
     config = _make_config()
     config.ils_alignment_min_duration_secs = 30.0
 
@@ -1534,8 +1526,6 @@ def test_overflight_no_alignment_no_bonus():
     ]
     # Overflight points 2 km north of centerline. We use the same helper
     # but then override latitudes.
-    import math
-
     approach_bearing_rad = math.radians(270.0)  # heading 90 -> approach bearing 270
     flyover: list[list] = []
     off_lat = runway_lat + 0.018  # ~2 km north
@@ -1597,9 +1587,16 @@ def test_overflight_no_alignment_no_bonus():
 
 def test_signal_lost_with_alignment_upgrades_to_drop():
     """A signal_lost flight whose trace ends on a 60s+ alignment segment at
-    low altitude upgrades to dropped_on_approach."""
-    from adsbtrack.airports import AirportMatch
+    low altitude upgrades to dropped_on_approach.
 
+    The approach finishes at 5130 ft MSL -- above `Config.dropped_max_alt_ft`
+    (5000) so `classify_landing` returns `signal_lost` (not
+    `dropped_on_approach` via its own sustained-descent branch) -- but below
+    airport_elev (1026) + `ils_alignment_max_ft_above_airport` (5000) = 6026
+    MSL so the alignment detector's AGL cap and the upgrade rule's altitude
+    check both pass. The alignment upgrade rule in parser.py is then the
+    code path under test.
+    """
     config = _make_config()
     config.ils_alignment_min_duration_secs = 30.0
 
@@ -1615,9 +1612,12 @@ def test_signal_lost_with_alignment_upgrades_to_drop():
         _make_trace_point(600, 33.64, -85.5, 10000, gs=300),
         _make_trace_point(1800, 33.64, -85.0, 10000, gs=300),
     ]
-    # Descend along centerline from 3000 ft MSL down to ~150 ft MSL (airport
-    # elev 1026, so last airborne is below airport_elev + 5000 AGL cap).
-    # 30 samples * 3s spacing = ~90s alignment duration.
+    # Descend along centerline from 6000 ft MSL down to 5130 ft MSL. Every
+    # sample sits under the 6026 MSL alt cap, so all 30 points contribute
+    # to the aligned segment (29 * 3s = 87s duration, above the 60s long
+    # bonus threshold). Final airborne altitude 5130 is above the 5000 ft
+    # dropped_max_alt_ft floor, so classify_landing returns "signal_lost",
+    # and the alignment upgrade rule is the thing that promotes it.
     approach = _walk_approach(
         base_ts=3000.0,
         n=30,
@@ -1625,8 +1625,8 @@ def test_signal_lost_with_alignment_upgrades_to_drop():
         runway_lat=runway_lat,
         runway_lon=runway_lon,
         runway_heading_deg=90.0,
-        start_alt_ft=3000,
-        alt_step_ft=95,  # ends at 3000 - 29*95 = 245 ft MSL
+        start_alt_ft=6000,
+        alt_step_ft=30,  # ends at 6000 - 29*30 = 5130 ft MSL
     )
     # NO ground points -> trace ends airborne -> signal_lost/dropped
     trace = origin + climb_cruise + approach
@@ -1673,8 +1673,6 @@ def test_signal_lost_with_alignment_upgrades_to_drop():
 def test_candidate_airport_without_runways_leaves_alignment_null():
     """Airport matched but no runway rows -> all alignment columns stay NULL,
     flight is NOT rejected, landing_type still 'confirmed'."""
-    from adsbtrack.airports import AirportMatch
-
     config = _make_config()
     config.ils_alignment_min_duration_secs = 30.0
 

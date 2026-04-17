@@ -783,6 +783,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     final_flights: list[Flight] = []
     # v7 F3: track previous flight's end time for turnaround computation.
     prev_end_time: datetime | None = None
+    # Cache airport elevation + runway lookups by ICAO for this extract run.
+    # Every aircraft typically has 2-5 home airports that get hit repeatedly,
+    # so batch extracts on fleets of thousands of flights would otherwise
+    # issue 2N DB queries against the same ICAOs.
+    airport_elev_cache: dict[str, int | None] = {}
+    runway_cache: dict[str, list] = {}
     for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
         has_landing = flight.landing_lat is not None
 
@@ -985,12 +991,19 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # for signal_lost / dropped flights.
         alignment_icao = flight.destination_icao or flight.nearest_destination_icao or flight.probable_destination_icao
         alignment: IlsAlignmentResult | None = None
+        # Fallback 0.0 is safe because the subsequent `if runway_rows:` guard
+        # only fires when the airport is in our DB (runways and elevations
+        # come from the same OurAirports load).
         airport_elev_ft = 0.0
         if alignment_icao:
-            elev = db.get_airport_elevation(alignment_icao)
+            if alignment_icao not in airport_elev_cache:
+                airport_elev_cache[alignment_icao] = db.get_airport_elevation(alignment_icao)
+            elev = airport_elev_cache[alignment_icao]
             if elev is not None:
                 airport_elev_ft = float(elev)
-            runway_rows = db.get_runways_for_airport(alignment_icao)
+            if alignment_icao not in runway_cache:
+                runway_cache[alignment_icao] = db.get_runways_for_airport(alignment_icao)
+            runway_rows = runway_cache[alignment_icao]
             if runway_rows:
                 alignment = detect_ils_alignment(
                     metrics,
@@ -1008,8 +1021,9 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             flight.aligned_min_offset_m = alignment.min_offset_m
 
             # Additive confidence bonus (clamped to 1.0). Applied only when
-            # score_confidence already set a non-None value; don't revive a
-            # NULL landing_confidence on types that deliberately have none.
+            # `landing_confidence` was already set to a non-None value; don't
+            # revive a NULL landing_confidence on types that deliberately
+            # have none.
             if flight.landing_confidence is not None:
                 if alignment.duration_secs >= config.ils_alignment_bonus_long_secs:
                     bonus = config.ils_alignment_bonus_long

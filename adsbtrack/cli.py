@@ -13,6 +13,7 @@ from .airframes import AirframesClient
 from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
+from .events import collect_events
 from .fetcher import fetch_traces, fetch_traces_opensky
 from .gaps import detect_gaps
 from .models import LandingType
@@ -1283,6 +1284,79 @@ def _pct(mix: dict, key: str) -> str:
     if total == 0:
         return "-"
     return f"{100 * mix.get(key, 0) // total}%"
+
+
+@cli.command()
+@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--db", "db_path", default="adsbtrack.db")
+@click.option(
+    "--since",
+    "since_str",
+    default=None,
+    help="Only show events from takeoff_time on or after this date (YYYY-MM-DD).",
+)
+@click.option(
+    "--severity",
+    type=click.Choice(["all", "emergency", "unusual"]),
+    default="all",
+    show_default=True,
+    help="Filter by severity tier.",
+)
+def events(hex_code, db_path, since_str, severity):
+    """Show a chronological event log for an aircraft.
+
+    Surfaces: emergency squawks (7500/7600/7700), emergency flags,
+    off-airport landings, sustained hover (>= 5 min), and multiple
+    go-arounds (>= 2 per flight). All signals are read directly from
+    pre-computed columns on the flights table; no new heuristics.
+    """
+    from datetime import UTC
+    from datetime import datetime as dt_cls
+
+    hex_code = hex_code.lower()
+    since = None
+    if since_str:
+        try:
+            since = dt_cls.fromisoformat(since_str).replace(tzinfo=UTC)
+        except ValueError:
+            console.print(f"[red]Invalid --since '{since_str}'; use YYYY-MM-DD.[/]")
+            return
+
+    with Database(Path(db_path)) as db:
+        evts = collect_events(db, hex_code, since=since, severity=severity)
+
+    if not evts:
+        console.print(f"[green]No events for {hex_code} (filter={severity}).[/]")
+        return
+
+    color_by_severity = {"emergency": "red", "unusual": "yellow"}
+    title = f"Events for {hex_code} ({len(evts)} shown, filter={severity})"
+    if since:
+        title += f", since {since.date().isoformat()}"
+    table = Table(title=title)
+    table.add_column("Date (UTC)", style="cyan", no_wrap=True)
+    table.add_column("Callsign")
+    table.add_column("Severity")
+    table.add_column("Event")
+    table.add_column("Detail")
+
+    for e in evts:
+        sev_color = color_by_severity.get(e.severity, "white")
+        table.add_row(
+            e.ts.strftime("%Y-%m-%d %H:%M"),
+            e.callsign or "-",
+            f"[{sev_color}]{e.severity}[/]",
+            e.event_type,
+            e.summary,
+        )
+    console.print(table)
+
+    summary = {"emergency": 0, "unusual": 0}
+    for e in evts:
+        summary[e.severity] = summary.get(e.severity, 0) + 1
+    console.print(
+        f"\n[bold]Summary:[/] [red]{summary['emergency']} emergency[/], [yellow]{summary['unusual']} unusual[/]"
+    )
 
 
 if __name__ == "__main__":

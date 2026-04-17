@@ -228,6 +228,8 @@ class Config:
     airports_csv_url: str = "https://davidmegginson.github.io/ourairports-data/airports.csv"
     runways_csv_url: str = "https://davidmegginson.github.io/ourairports-data/runways.csv"
     navaids_csv_url: str = "https://davidmegginson.github.io/ourairports-data/navaids.csv"
+    ourairports_cache_dir: Path = Path(".cache/ourairports")
+    ourairports_cache_max_age_hours: float = 168.0  # 7 days
     faa_registry_url: str = "https://registry.faa.gov/database/ReleasableAircraft.zip"
     faa_registry_cache_path: Path = Path(".cache/ReleasableAircraft.zip")
     mictronics_base_url: str = "https://raw.githubusercontent.com/Mictronics/readsb-protobuf/dev/webapp/src/db"

@@ -1,6 +1,8 @@
 import contextlib
 import csv
 import io
+import time
+from pathlib import Path
 
 import httpx
 from rich.progress import Progress
@@ -15,59 +17,83 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return _haversine_m(lat1, lon1, lat2, lon2) / 1000.0
 
 
-def fetch_ourairports_csv(url: str, *, label: str, timeout: float = 60.0) -> str:
+def fetch_ourairports_csv(
+    url: str,
+    *,
+    label: str,
+    timeout: float = 60.0,
+    cache_dir: Path | None = None,
+    cache_max_age_hours: float = 168.0,
+) -> str:
     """Download an OurAirports CSV, return its body text.
 
     Shared by every OurAirports importer (airports / runways / navaids) so
     the httpx + rich-Progress boilerplate has one home. Raises
     httpx.HTTPError variants unchanged; callers wrap as ClickException.
+
+    When ``cache_dir`` is provided, a copy of the CSV is read from (or
+    written to) ``cache_dir / <basename-of-url>``. A cache file older than
+    ``cache_max_age_hours`` is ignored and re-fetched. Set ``cache_dir`` to
+    ``None`` to bypass the cache entirely.
     """
+    cache_path: Path | None = None
+    if cache_dir is not None:
+        cache_path = Path(cache_dir) / url.rsplit("/", 1)[-1]
+        if cache_path.exists():
+            age_hours = (time.time() - cache_path.stat().st_mtime) / 3600.0
+            if age_hours < cache_max_age_hours:
+                return cache_path.read_text(encoding="utf-8")
+
     with Progress() as progress:
         task = progress.add_task(f"Downloading {label}...", total=None)
         resp = httpx.get(url, follow_redirects=True, timeout=timeout)
         resp.raise_for_status()
         progress.update(task, completed=100)
-        return resp.text
+        text = resp.text
+
+    if cache_path is not None:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(text, encoding="utf-8")
+    return text
 
 
 def download_airports(db: Database, config: Config):
-    with Progress() as progress:
-        task = progress.add_task("Downloading airport database...", total=None)
-        resp = httpx.get(config.airports_csv_url, follow_redirects=True, timeout=60)
-        resp.raise_for_status()
-        progress.update(task, completed=50)
-
-        reader = csv.DictReader(io.StringIO(resp.text))
-        airports = []
-        for row in reader:
-            if row["type"] not in config.airport_types:
-                continue
-            try:
-                lat = float(row["latitude_deg"])
-                lon = float(row["longitude_deg"])
-            except (ValueError, KeyError):
-                continue
-            elev = None
-            if row.get("elevation_ft"):
-                with contextlib.suppress(ValueError):
-                    elev = int(row["elevation_ft"])
-            airports.append(
-                (
-                    row["ident"],
-                    row["type"],
-                    row["name"],
-                    lat,
-                    lon,
-                    elev,
-                    row.get("iso_country", ""),
-                    row.get("iso_region", ""),
-                    row.get("municipality", ""),
-                    row.get("iata_code", ""),
-                )
+    text = fetch_ourairports_csv(
+        config.airports_csv_url,
+        label="airport database",
+        cache_dir=config.ourairports_cache_dir,
+        cache_max_age_hours=config.ourairports_cache_max_age_hours,
+    )
+    reader = csv.DictReader(io.StringIO(text))
+    airports = []
+    for row in reader:
+        if row["type"] not in config.airport_types:
+            continue
+        try:
+            lat = float(row["latitude_deg"])
+            lon = float(row["longitude_deg"])
+        except (ValueError, KeyError):
+            continue
+        elev = None
+        if row.get("elevation_ft"):
+            with contextlib.suppress(ValueError):
+                elev = int(row["elevation_ft"])
+        airports.append(
+            (
+                row["ident"],
+                row["type"],
+                row["name"],
+                lat,
+                lon,
+                elev,
+                row.get("iso_country", ""),
+                row.get("iso_region", ""),
+                row.get("municipality", ""),
+                row.get("iata_code", ""),
             )
+        )
 
-        db.insert_airports(airports)
-        progress.update(task, completed=100)
+    db.insert_airports(airports)
     return len(airports)
 
 
@@ -85,10 +111,14 @@ def enrich_helipad_names(db: Database, config: Config, *, max_distance_km: float
     if not helipads:
         return 0
 
-    # Download heliport entries from OurAirports CSV
-    resp = httpx.get(config.airports_csv_url, follow_redirects=True, timeout=60)
-    resp.raise_for_status()
-    reader = csv.DictReader(io.StringIO(resp.text))
+    # Download heliport entries from OurAirports CSV (cached on disk)
+    text = fetch_ourairports_csv(
+        config.airports_csv_url,
+        label="airport database",
+        cache_dir=config.ourairports_cache_dir,
+        cache_max_age_hours=config.ourairports_cache_max_age_hours,
+    )
+    reader = csv.DictReader(io.StringIO(text))
     heliports: list[tuple[str, str, float, float]] = []  # (ident, name, lat, lon)
     for row in reader:
         if row.get("type") != "heliport":

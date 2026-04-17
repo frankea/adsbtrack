@@ -78,7 +78,12 @@ def refresh_navaids(
     else:
         from .airports import fetch_ourairports_csv
 
-        text = fetch_ourairports_csv(config.navaids_csv_url, label="navaids")
+        text = fetch_ourairports_csv(
+            config.navaids_csv_url,
+            label="navaids",
+            cache_dir=config.ourairports_cache_dir,
+            cache_max_age_hours=config.ourairports_cache_max_age_hours,
+        )
 
     rows = _read_csv(text)
     db.conn.executemany(

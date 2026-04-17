@@ -190,5 +190,11 @@ def refresh_runways(
 
     from .airports import fetch_ourairports_csv
 
-    text = fetch_ourairports_csv(cfg.runways_csv_url, label="OurAirports runways.csv", timeout=timeout)
+    text = fetch_ourairports_csv(
+        cfg.runways_csv_url,
+        label="OurAirports runways.csv",
+        timeout=timeout,
+        cache_dir=cfg.ourairports_cache_dir,
+        cache_max_age_hours=cfg.ourairports_cache_max_age_hours,
+    )
     return _import_runways_from_reader(db, csv.DictReader(io.StringIO(text)))

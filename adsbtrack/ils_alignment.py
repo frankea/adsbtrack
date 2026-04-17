@@ -31,7 +31,8 @@ from .classifier import FlightMetrics, _haversine_m, _PointSample
 
 @dataclass(frozen=True)
 class IlsAlignmentResult:
-    """Winning alignment segment for a flight."""
+    """One qualifying ILS-aligned segment. detect_ils_alignment returns the
+    longest; detect_all_ils_alignments returns the full chronological list."""
 
     runway_name: str
     duration_secs: float

@@ -217,6 +217,8 @@ def test_detect_all_ils_alignments_returns_multiple_segments() -> None:
     )
     assert len(results) == 2
     assert results[0].first_ts < results[1].first_ts
+    # Segments must not overlap - seg[0] ends before seg[1] begins.
+    assert results[0].last_ts < results[1].first_ts
 
 
 def test_detect_all_ils_alignments_empty_when_nothing_qualifies() -> None:
@@ -249,13 +251,22 @@ def test_detect_all_ils_alignments_single_segment_equals_longest() -> None:
 
 
 def test_ils_alignment_result_carries_first_last_ts_and_end_alt() -> None:
-    """New fields on IlsAlignmentResult: first_ts, last_ts, end_alt_ft."""
+    """New fields on IlsAlignmentResult: first_ts, last_ts, end_alt_ft.
+
+    first_ts and last_ts must bracket the kept samples' ts range so Task 2
+    go-around detection can scan the gap between consecutive segments.
+    """
     runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
     samples = _walk_toward(33.64, -84.43, 90.0, start_ts=100.0, n=30, spacing_secs=3.0)
     metrics = _Metrics(samples)
     results = detect_all_ils_alignments(metrics, airport_elev_ft=1026, runway_ends=[runway])
     assert len(results) == 1
     r = results[0]
-    assert 100.0 <= r.first_ts < r.last_ts
+    # Numeric bracketing: first_ts == earliest sample ts, last_ts == latest.
+    # _walk_toward emits samples at ts = start_ts + i*spacing for i in [0, n),
+    # so for start_ts=100.0, n=30, spacing=3.0 the range is [100.0, 187.0].
+    assert r.first_ts == pytest.approx(100.0)
+    assert r.last_ts == pytest.approx(187.0)
+    assert r.first_ts < r.last_ts
     assert r.end_alt_ft is not None
     assert r.end_alt_ft > 0

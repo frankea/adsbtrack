@@ -485,6 +485,11 @@ class FlightMetrics:
                 self._current_squawk_started_ts = ts
             # else: same squawk, run stays open with no transition
 
+            # Ensure every observed squawk is represented in the durations
+            # dict (value may stay 0.0 for single-point squawks) so
+            # squawks_observed reflects the full set of squawks seen.
+            self.squawk_durations.setdefault(sq, 0.0)
+
             self.squawk_total_count += 1
             if self.squawk_first is None:
                 self.squawk_first = sq

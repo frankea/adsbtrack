@@ -705,3 +705,39 @@ def test_compute_squawk_summary_no_squawk_data() -> None:
     assert out["squawks_observed"] is None
     assert out["had_emergency"] == 0
     assert out["primary_squawk"] is None
+
+
+def test_compute_squawk_summary_primary_squawk_tie_break() -> None:
+    """On equal cumulative duration, the alphabetically earliest squawk wins."""
+    m = _metrics_with_squawk_history(
+        [
+            (0.0, "5203"),
+            (60.0, "5203"),  # 60 s at 5203
+            (60.0, "5201"),
+            (120.0, "5201"),  # 60 s at 5201
+        ]
+    )
+    out = compute_squawk_summary(m, config=Config())
+    # Both squawks held for 60 s; 5201 < 5203 so 5201 wins
+    assert out["primary_squawk"] == "5201"
+
+
+def test_compute_squawk_summary_single_point_squawk_is_visible() -> None:
+    """A squawk seen on exactly one point (no time to accumulate) still
+    appears in squawks_observed."""
+    import json
+
+    m = _metrics_with_squawk_history(
+        [
+            (0.0, "1200"),
+            (60.0, "1200"),
+            (61.0, "7700"),  # single sample at 7700, no follow-up
+        ]
+    )
+    out = compute_squawk_summary(m, config=Config())
+    observed = json.loads(out["squawks_observed"])
+    assert "7700" in observed
+    assert "1200" in observed
+    assert out["had_emergency"] == 1
+    # 1200 held ~60+s; 7700 held effectively 0s; primary stays 1200
+    assert out["primary_squawk"] == "1200"

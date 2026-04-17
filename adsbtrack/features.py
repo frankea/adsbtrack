@@ -611,7 +611,10 @@ def compute_squawk_summary(metrics: FlightMetrics, *, config: Config) -> dict:
     squawks_observed = json.dumps(observed, ensure_ascii=True) if observed else None
     primary_squawk: str | None = None
     if metrics.squawk_durations:
-        primary_squawk = max(metrics.squawk_durations.items(), key=lambda kv: kv[1])[0]
+        # sorted() for deterministic tie-break: longest duration first,
+        # alphabetically smallest code breaks ties.
+        sorted_items = sorted(metrics.squawk_durations.items(), key=lambda kv: (-kv[1], kv[0]))
+        primary_squawk = sorted_items[0][0]
 
     return {
         "squawk_first": metrics.squawk_first,

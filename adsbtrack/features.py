@@ -426,28 +426,36 @@ def compute_go_around(metrics: FlightMetrics, *, landing_type: str, config: Conf
     # baro noise. A point P is a local min if there exists at least one point
     # within ±extremum_window seconds that is >= P.alt + extremum_sep; symmetric
     # for local max.
+    #
+    # Two-pointer sliding window: since ``window`` is sorted by ts, left and
+    # right both advance monotonically across the n iterations, so the total
+    # inner work is O(n * avg_neighbors) instead of O(n^2). At typical ADS-B
+    # cadences (~5 s) the 30 s extremum window holds ~6 points, so this
+    # reduces ~360 k comparisons to ~4 k on a full 600-point window.
     n = len(window)
     is_min = [False] * n
     is_max = [False] * n
+    left = 0
+    right = 0
     for i in range(n):
         ts_i, alt_i = window[i]
+        while left < n and window[left][0] < ts_i - extremum_window:
+            left += 1
+        while right < n and window[right][0] <= ts_i + extremum_window:
+            right += 1
         lower = None
         upper = None
-        for j in range(n):
-            if i == j:
+        for j in range(left, right):
+            if j == i:
                 continue
-            ts_j, alt_j = window[j]
-            if abs(ts_j - ts_i) > extremum_window:
-                continue
+            alt_j = window[j][1]
             if lower is None or alt_j < lower:
                 lower = alt_j
             if upper is None or alt_j > upper:
                 upper = alt_j
         if lower is not None and upper is not None:
-            # Local min if neighbors include at least one higher by >= extremum_sep
             if upper - alt_i >= extremum_sep and alt_i <= lower + 1e-6:
                 is_min[i] = True
-            # Local max if neighbors include at least one lower by >= extremum_sep
             if alt_i - lower >= extremum_sep and alt_i >= upper - 1e-6:
                 is_max[i] = True
 

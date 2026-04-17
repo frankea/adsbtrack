@@ -623,10 +623,22 @@ def test_enrich_hex_uses_mictronics_cache(tmp_path):
 
 def test_enrich_hex_no_data_reports_yellow(tmp_path):
     db_path = tmp_path / "t.db"
+    empty_mictronics = tmp_path / "empty-mictronics"
+    empty_mictronics.mkdir()
     runner = CliRunner()
     result = runner.invoke(
         cli,
-        ["enrich", "hex", "--hex", "a66ad3", "--no-hexdb", "--db", str(db_path)],
+        [
+            "enrich",
+            "hex",
+            "--hex",
+            "a66ad3",
+            "--no-hexdb",
+            "--mictronics-dir",
+            str(empty_mictronics),
+            "--db",
+            str(db_path),
+        ],
     )
     assert result.exit_code == 0, result.output
     assert "no data" in result.output.lower()

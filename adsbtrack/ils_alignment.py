@@ -36,6 +36,9 @@ class IlsAlignmentResult:
     runway_name: str
     duration_secs: float
     min_offset_m: float
+    first_ts: float
+    last_ts: float
+    end_alt_ft: int | None
 
 
 def _bearing_deg(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -68,20 +71,28 @@ def _alignment_for_runway(
     max_ft_above_airport: float,
     split_gap_secs: float,
     min_duration_secs: float,
-) -> IlsAlignmentResult | None:
+) -> list[IlsAlignmentResult]:
+    """Return every qualifying alignment segment for a single runway end.
+
+    A segment qualifies when its contiguous duration (in seconds, computed
+    from first-kept-sample ts to last-kept-sample ts) is at least
+    ``min_duration_secs``. Returns an empty list when nothing qualifies.
+    """
     heading = runway.get("heading_deg_true")
     r_lat = runway.get("latitude_deg")
     r_lon = runway.get("longitude_deg")
     if heading is None or r_lat is None or r_lon is None:
-        return None
+        return []
 
     r_heading_f = float(heading)  # type: ignore[arg-type]
     r_lat_f = float(r_lat)  # type: ignore[arg-type]
     r_lon_f = float(r_lon)  # type: ignore[arg-type]
     alt_cap = airport_elev_ft + max_ft_above_airport
 
-    # Collect (ts, offset_m) for every qualifying sample.
-    kept: list[tuple[float, float]] = []
+    # Collect (ts, offset_m, sample) for every qualifying sample. Keep the
+    # sample reference so we can read end-of-segment altitude without a
+    # second walk over the full point stream.
+    kept: list[tuple[float, float, _PointSample]] = []
     for s in samples:
         if s.lat is None or s.lon is None or s.track is None:
             continue
@@ -106,34 +117,65 @@ def _alignment_for_runway(
         if offset_m >= max_offset_m:
             continue
 
-        kept.append((s.ts, offset_m))
+        kept.append((s.ts, offset_m, s))
 
     if not kept:
-        return None
+        return []
 
     # Split on gaps larger than split_gap_secs.
-    segments: list[list[tuple[float, float]]] = [[kept[0]]]
+    segments: list[list[tuple[float, float, _PointSample]]] = [[kept[0]]]
     for prev, cur in zip(kept, kept[1:], strict=False):
         if cur[0] - prev[0] > split_gap_secs:
             segments.append([cur])
         else:
             segments[-1].append(cur)
 
-    # Pick the longest segment that meets the duration floor.
-    best: IlsAlignmentResult | None = None
-    best_dur = 0.0
+    # Emit every segment meeting the duration floor.
+    results: list[IlsAlignmentResult] = []
+    runway_name = str(runway.get("runway_name", ""))
     for seg in segments:
         dur = seg[-1][0] - seg[0][0]
         if dur < min_duration_secs:
             continue
-        if dur > best_dur:
-            best = IlsAlignmentResult(
-                runway_name=str(runway.get("runway_name", "")),
+        results.append(
+            IlsAlignmentResult(
+                runway_name=runway_name,
                 duration_secs=round(dur, 1),
-                min_offset_m=round(min(o for _, o in seg), 1),
+                min_offset_m=round(min(o for _, o, _ in seg), 1),
+                first_ts=seg[0][0],
+                last_ts=seg[-1][0],
+                end_alt_ft=_sample_alt(seg[-1][2]),
             )
-            best_dur = dur
-    return best
+        )
+    return results
+
+
+def _alignments_for_samples(
+    samples: Sequence[_PointSample],
+    runway_ends: Sequence[Mapping[str, object]],
+    *,
+    airport_elev_ft: float,
+    max_offset_m: float,
+    max_ft_above_airport: float,
+    split_gap_secs: float,
+    min_duration_secs: float,
+) -> list[IlsAlignmentResult]:
+    """Flatten per-runway alignment segments into one chronological list."""
+    all_segments: list[IlsAlignmentResult] = []
+    for runway in runway_ends:
+        all_segments.extend(
+            _alignment_for_runway(
+                samples,
+                runway,
+                airport_elev_ft=airport_elev_ft,
+                max_offset_m=max_offset_m,
+                max_ft_above_airport=max_ft_above_airport,
+                split_gap_secs=split_gap_secs,
+                min_duration_secs=min_duration_secs,
+            )
+        )
+    all_segments.sort(key=lambda s: s.first_ts)
+    return all_segments
 
 
 def detect_ils_alignment(
@@ -159,19 +201,43 @@ def detect_ils_alignment(
     if not samples:
         return None
 
-    best: IlsAlignmentResult | None = None
-    for runway in runway_ends:
-        cand = _alignment_for_runway(
-            samples,
-            runway,
-            airport_elev_ft=airport_elev_ft,
-            max_offset_m=max_offset_m,
-            max_ft_above_airport=max_ft_above_airport,
-            split_gap_secs=split_gap_secs,
-            min_duration_secs=min_duration_secs,
-        )
-        if cand is None:
-            continue
-        if best is None or cand.duration_secs > best.duration_secs:
-            best = cand
-    return best
+    segments = _alignments_for_samples(
+        samples,
+        list(runway_ends),
+        airport_elev_ft=airport_elev_ft,
+        max_offset_m=max_offset_m,
+        max_ft_above_airport=max_ft_above_airport,
+        split_gap_secs=split_gap_secs,
+        min_duration_secs=min_duration_secs,
+    )
+    if not segments:
+        return None
+    # Longest wins; tie-break on earliest first_ts for determinism.
+    return max(segments, key=lambda s: (s.duration_secs, -s.first_ts))
+
+
+def detect_all_ils_alignments(
+    metrics: FlightMetrics,
+    *,
+    airport_elev_ft: float,
+    runway_ends: Iterable[Mapping[str, object]],
+    max_offset_m: float = 100.0,
+    max_ft_above_airport: float = 5000.0,
+    split_gap_secs: float = 20.0,
+    min_duration_secs: float = 30.0,
+) -> list[IlsAlignmentResult]:
+    """Return every qualifying ILS-aligned segment across runway ends,
+    chronologically ordered by ``first_ts``. Empty list when none qualified.
+    Same kwargs and thresholds as :func:`detect_ils_alignment`."""
+    samples = list(metrics.recent_points)
+    if not samples:
+        return []
+    return _alignments_for_samples(
+        samples,
+        list(runway_ends),
+        airport_elev_ft=airport_elev_ft,
+        max_offset_m=max_offset_m,
+        max_ft_above_airport=max_ft_above_airport,
+        split_gap_secs=split_gap_secs,
+        min_duration_secs=min_duration_secs,
+    )

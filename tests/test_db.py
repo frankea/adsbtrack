@@ -1247,3 +1247,46 @@ def test_insert_flight_takeoff_runway_defaults_to_null(db) -> None:
     db.commit()
     row = db.conn.execute("SELECT takeoff_runway FROM flights WHERE icao = ?", ("eeeeee",)).fetchone()
     assert row["takeoff_runway"] is None
+
+
+def test_flights_table_has_go_around_and_pattern_cycles(db) -> None:
+    cols = {row[1] for row in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert {"had_go_around", "pattern_cycles"}.issubset(cols)
+
+
+def test_insert_flight_persists_go_around_and_pattern_cycles(db) -> None:
+    f = Flight(
+        icao="dddddd",
+        takeoff_time=datetime(2024, 7, 1, 10, 0),
+        takeoff_lat=27.77,
+        takeoff_lon=-82.67,
+        takeoff_date="2024-07-01",
+        had_go_around=1,
+        pattern_cycles=3,
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT had_go_around, pattern_cycles FROM flights WHERE icao = ?",
+        ("dddddd",),
+    ).fetchone()
+    assert row["had_go_around"] == 1
+    assert row["pattern_cycles"] == 3
+
+
+def test_insert_flight_go_around_pattern_cycles_default_null(db) -> None:
+    f = Flight(
+        icao="cccccc",
+        takeoff_time=datetime(2024, 7, 1, 10, 0),
+        takeoff_lat=27.77,
+        takeoff_lon=-82.67,
+        takeoff_date="2024-07-01",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT had_go_around, pattern_cycles FROM flights WHERE icao = ?",
+        ("cccccc",),
+    ).fetchone()
+    assert row["had_go_around"] is None
+    assert row["pattern_cycles"] is None

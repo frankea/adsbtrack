@@ -5,8 +5,10 @@ from __future__ import annotations
 import math
 from collections import deque
 
+import pytest
+
 from adsbtrack.classifier import _PointSample
-from adsbtrack.ils_alignment import detect_ils_alignment
+from adsbtrack.ils_alignment import detect_all_ils_alignments, detect_ils_alignment
 
 
 def _sample(ts: float, lat: float, lon: float, alt: int, track: float) -> _PointSample:
@@ -196,3 +198,64 @@ def test_multi_runway_picks_longest_segment() -> None:
     assert result is not None
     assert result.runway_name == "09"
     assert result.duration_secs >= 60.0
+
+
+def test_detect_all_ils_alignments_returns_multiple_segments() -> None:
+    """A flight that aligns with one runway in two separate passes returns
+    two segments, chronologically ordered."""
+    runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
+    # First pass: 30 samples at 3 s intervals (~87 s), then 40 s gap,
+    # then second pass of 30 samples at 3 s intervals. Each pass ends on
+    # centerline but the gap between them is large enough to split.
+    seg_a = _walk_toward(33.64, -84.43, 90.0, start_ts=0.0, n=30, spacing_secs=3.0)
+    seg_b = _walk_toward(33.64, -84.43, 90.0, start_ts=200.0, n=30, spacing_secs=3.0)
+    metrics = _Metrics(seg_a + seg_b)
+    results = detect_all_ils_alignments(
+        metrics,
+        airport_elev_ft=1026,
+        runway_ends=[runway],
+    )
+    assert len(results) == 2
+    assert results[0].first_ts < results[1].first_ts
+
+
+def test_detect_all_ils_alignments_empty_when_nothing_qualifies() -> None:
+    runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
+    # Overflight north of centerline, offset > 100 m
+    samples = _walk_toward(33.64 + 0.045, -84.43, 90.0, start_ts=0.0, n=30, spacing_secs=3.0)
+    metrics = _Metrics(samples)
+    assert (
+        detect_all_ils_alignments(
+            metrics,
+            airport_elev_ft=1026,
+            runway_ends=[runway],
+        )
+        == []
+    )
+
+
+def test_detect_all_ils_alignments_single_segment_equals_longest() -> None:
+    """When only one segment qualifies, detect_all_ils_alignments returns
+    a one-element list and detect_ils_alignment returns that same segment."""
+    runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
+    samples = _walk_toward(33.64, -84.43, 90.0, start_ts=0.0, n=30, spacing_secs=3.0)
+    metrics = _Metrics(samples)
+    all_segs = detect_all_ils_alignments(metrics, airport_elev_ft=1026, runway_ends=[runway])
+    longest = detect_ils_alignment(metrics, airport_elev_ft=1026, runway_ends=[runway])
+    assert len(all_segs) == 1
+    assert longest is not None
+    assert all_segs[0].runway_name == longest.runway_name
+    assert all_segs[0].duration_secs == pytest.approx(longest.duration_secs)
+
+
+def test_ils_alignment_result_carries_first_last_ts_and_end_alt() -> None:
+    """New fields on IlsAlignmentResult: first_ts, last_ts, end_alt_ft."""
+    runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
+    samples = _walk_toward(33.64, -84.43, 90.0, start_ts=100.0, n=30, spacing_secs=3.0)
+    metrics = _Metrics(samples)
+    results = detect_all_ils_alignments(metrics, airport_elev_ft=1026, runway_ends=[runway])
+    assert len(results) == 1
+    r = results[0]
+    assert 100.0 <= r.first_ts < r.last_ts
+    assert r.end_alt_ft is not None
+    assert r.end_alt_ft > 0

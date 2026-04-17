@@ -192,6 +192,19 @@ class Flight:
     # rate thresholds weren't met.
     takeoff_runway: str | None = None
 
+    # --- Go-around and pattern-work detection ---
+    # had_go_around: 1 when two or more IlsAlignmentResult segments at the
+    # candidate landing airport were separated by a climb of more than 500 ft
+    # (aircraft went around on an approach and re-attempted). 0 when one or
+    # zero segments, or when segments were not separated by a climb. NULL on
+    # legacy rows extracted before this milestone.
+    had_go_around: int | None = None
+    # pattern_cycles: total count of qualifying ILS-alignment segments at the
+    # candidate landing airport during the flight. 1 is a typical single-
+    # approach landing. 2+ indicates go-around, touch-and-go, or pattern
+    # practice. NULL on legacy rows.
+    pattern_cycles: int | None = None
+
 
 @dataclass
 class AirportMatch:

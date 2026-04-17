@@ -1,5 +1,32 @@
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
+
+
+class LandingType(StrEnum):
+    """Closed set of how a flight ended. Stored as plain strings in the
+    flights.landing_type column; StrEnum inheritance makes the members
+    interchangeable with their string values for comparisons and SQL."""
+
+    CONFIRMED = "confirmed"
+    SIGNAL_LOST = "signal_lost"
+    DROPPED_ON_APPROACH = "dropped_on_approach"
+    UNCERTAIN = "uncertain"
+    ALTITUDE_ERROR = "altitude_error"
+    UNKNOWN = "unknown"
+
+
+class MissionType(StrEnum):
+    """Closed set of mission classifications emitted by classify_mission."""
+
+    EMS_HEMS = "ems_hems"
+    OFFSHORE = "offshore"
+    EXEC_CHARTER = "exec_charter"
+    TRAINING = "training"
+    SURVEY = "survey"
+    PATTERN = "pattern"
+    TRANSPORT = "transport"
+    UNKNOWN = "unknown"
 
 
 @dataclass

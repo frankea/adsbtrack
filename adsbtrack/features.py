@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 
 from .classifier import _haversine_m, descent_score
 from .ils_alignment import _bearing_deg
+from .models import MissionType
 from .solar import is_night_at
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ def classify_mission(
         op_upper = owner_operator.upper()
         for kw in config.offshore_operator_keywords:
             if kw in op_upper:
-                return "offshore"
+                return MissionType.OFFSHORE
 
     # 2. Callsign-based classification
     if callsign:
@@ -68,9 +69,9 @@ def classify_mission(
             if cs.startswith(prefix):
                 return mission
         if cs.startswith("N911"):
-            return "ems_hems"
+            return MissionType.EMS_HEMS
         if cs.endswith("MT") and not cs.endswith(("LMT", "RMT", "AMT")):
-            return "ems_hems"
+            return MissionType.EMS_HEMS
 
     # 3. Physics rules
     # exempt large jets / VIP aircraft from survey and pattern.
@@ -86,7 +87,7 @@ def classify_mission(
         and cruise_gs_kt < 120
         and type_code not in _exempt_survey_pattern
     ):
-        return "survey"
+        return MissionType.SURVEY
 
     # Training: same airport + low altitude on a known primary trainer.
     is_trainer_type = type_code in ("C150", "C152", "C172", "C162", "PA28", "DA20", "DA40")
@@ -98,7 +99,7 @@ def classify_mission(
         and max_altitude < 5000
         and is_trainer_type
     ):
-        return "training"
+        return MissionType.TRAINING
 
     if (
         origin_icao is not None
@@ -108,19 +109,19 @@ def classify_mission(
         and max_altitude < 3000
         and type_code not in _exempt_survey_pattern
     ):
-        return "pattern"
+        return MissionType.PATTERN
 
     if origin_icao is not None and destination_icao is not None and origin_icao != destination_icao:
-        return "transport"
+        return MissionType.TRANSPORT
 
     # 4. Tail-only callsign with at least one airport assigned: bias to
     #    transport so we don't dump it in unknown by default.
     if callsign and (origin_icao is not None or destination_icao is not None):
         cs_upper = callsign.strip().upper()
         if cs_upper.startswith("N") and cs_upper[1:].isalnum():
-            return "transport"
+            return MissionType.TRANSPORT
 
-    return "unknown"
+    return MissionType.UNKNOWN
 
 
 # ----------------------------------------------------------------------

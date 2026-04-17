@@ -25,6 +25,8 @@ import math
 from collections import deque
 from dataclasses import dataclass, field
 
+from .models import LandingType
+
 
 @dataclass(slots=True, frozen=True)
 class PointData:
@@ -1020,7 +1022,7 @@ def classify_landing(
         gs_ground_ratio = metrics.ground_speed_while_ground / max(1, metrics.total_ground_points)
         baro_error_ratio = metrics.baro_error_points / max(1, metrics.data_points)
         if baro_error_ratio > 0.20 or gs_ground_ratio > 0.20:
-            return "altitude_error"
+            return LandingType.ALTITUDE_ERROR
 
     # Flight with no landing transition: signal loss or taxi-like
     if not has_landing:
@@ -1046,14 +1048,14 @@ def classify_landing(
                     descent_rate_fpm=config.dropped_tail_descent_rate_fpm,
                 )
             ):
-                return "dropped_on_approach"
-            return "signal_lost"
-        return "uncertain"
+                return LandingType.DROPPED_ON_APPROACH
+            return LandingType.SIGNAL_LOST
+        return LandingType.UNCERTAIN
 
     # Duration sanity check. Per-type cap beats the global default.
     endurance_cap = endurance_for(type_code, config.type_endurance_minutes, config.max_endurance_minutes)
     if duration_minutes is not None and duration_minutes > endurance_cap:
-        return "uncertain"
+        return LandingType.UNCERTAIN
 
     # Flight has a landing transition. Score it on multiple factors.
     factors = []
@@ -1097,8 +1099,8 @@ def classify_landing(
     score = sum(f * w for f, w in factors) / total_weight if total_weight > 0 else 0.5
 
     if score > 0.6:
-        return "signal_lost"
-    return "confirmed"
+        return LandingType.SIGNAL_LOST
+    return LandingType.CONFIRMED
 
 
 def score_confidence(

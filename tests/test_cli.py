@@ -768,3 +768,71 @@ def test_trips_auto_shows_alignment_column_when_any_row_has_data(tmp_path, monke
     assert result.exit_code == 0, result.output
     assert "Aligned" in result.output
     assert "RWY 27" in result.output and "63s" in result.output  # 62.7 rounds to 63
+
+
+def test_trips_from_column_appends_takeoff_runway(tmp_path, monkeypatch) -> None:
+    """trips From column shows `KSPG/24` when takeoff_runway is populated."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="abc789",
+            takeoff_time=datetime(2023, 11, 14, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2023-11-14",
+            landing_time=datetime(2023, 11, 14, 11, 0),
+            landing_lat=27.0,
+            landing_lon=-82.0,
+            landing_date="2023-11-14",
+            origin_icao="KSPG",
+            origin_name="Albert Whitted",
+            origin_distance_km=0.3,
+            destination_icao="KPIE",
+            destination_name="St Petersburg-Clearwater",
+            destination_distance_km=0.5,
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+            takeoff_runway="24",
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "abc789", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "KSPG/24" in result.output
+
+
+def test_trips_from_column_plain_when_takeoff_runway_null(tmp_path, monkeypatch) -> None:
+    """No `/24` suffix when takeoff_runway is NULL."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="abc790",
+            takeoff_time=datetime(2023, 11, 14, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2023-11-14",
+            landing_time=datetime(2023, 11, 14, 11, 0),
+            landing_lat=27.0,
+            landing_lon=-82.0,
+            landing_date="2023-11-14",
+            origin_icao="KSPG",
+            origin_name="Albert Whitted",
+            origin_distance_km=0.3,
+            destination_icao="KPIE",
+            destination_name="St Petersburg-Clearwater",
+            destination_distance_km=0.5,
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "abc790", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "KSPG" in result.output
+    assert "KSPG/" not in result.output

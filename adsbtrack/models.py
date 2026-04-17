@@ -172,6 +172,18 @@ class Flight:
     # was not computed (e.g. legacy rows before the migration).
     landing_anchor_method: str | None = None
 
+    # --- ILS / runway alignment (populated by adsbtrack.ils_alignment) ---
+    # aligned_runway: runway end name (e.g. "08R") whose extended centerline
+    # the final-approach track best lined up with, or NULL when no runway
+    # passed the alignment gates (no matched airport, no runway data, or
+    # the longest aligned segment was shorter than ils_alignment_min_duration_secs).
+    # aligned_seconds: duration of that best aligned segment in seconds.
+    # aligned_min_offset_m: minimum lateral offset (metres) observed from
+    # the chosen runway's extended centerline during the aligned segment.
+    aligned_runway: str | None = None
+    aligned_seconds: float | None = None
+    aligned_min_offset_m: float | None = None
+
 
 @dataclass
 class AirportMatch:

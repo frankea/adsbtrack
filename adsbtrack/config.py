@@ -279,6 +279,26 @@ class Config:
     # reasonable default for most approach profiles.
     landing_anchor_window_minutes: float = 10.0
 
+    # --- ILS / runway alignment detection ---
+    # Drives adsbtrack.ils_alignment: measure how long the aircraft's final
+    # approach track was aligned with a runway centerline. An "aligned"
+    # sample lies within ils_alignment_max_offset_m metres of the extended
+    # centerline, below ils_alignment_max_ft_above_airport AGL, and within
+    # the landing-anchor window. Consecutive aligned samples separated by
+    # at most ils_alignment_split_gap_secs form an alignment segment; the
+    # segment must run at least ils_alignment_min_duration_secs to count.
+    # The landing_confidence bonus ladder awards +_bonus_short when the
+    # best segment is >= _bonus_short_secs and +_bonus_long when it is
+    # >= _bonus_long_secs (bonuses are not additive; long supersedes short).
+    ils_alignment_max_offset_m: float = 100.0
+    ils_alignment_min_duration_secs: float = 30.0
+    ils_alignment_split_gap_secs: float = 20.0
+    ils_alignment_max_ft_above_airport: float = 5000.0
+    ils_alignment_bonus_short_secs: float = 30.0
+    ils_alignment_bonus_long_secs: float = 60.0
+    ils_alignment_bonus_short: float = 0.15
+    ils_alignment_bonus_long: float = 0.25
+
     # Endurance
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown
     type_endurance_minutes: dict[str, float] = field(default_factory=lambda: dict(TYPE_ENDURANCE_MINUTES))

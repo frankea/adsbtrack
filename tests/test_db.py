@@ -1138,3 +1138,30 @@ def test_config_has_landing_anchor_window_minutes_default():
 
     cfg = Config()
     assert cfg.landing_anchor_window_minutes == 10.0
+
+
+# ---------------------------------------------------------------------------
+# ILS alignment: schema + runway query (Task 1)
+# ---------------------------------------------------------------------------
+
+
+def test_flights_table_has_alignment_columns(tmp_path):
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        cols = {row[1] for row in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert {"aligned_runway", "aligned_seconds", "aligned_min_offset_m"}.issubset(cols)
+
+
+def test_get_runways_for_airport_returns_ordered_rows(tmp_path):
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        db.insert_runway_ends(
+            [
+                ("KFAKE", "08R", 33.64, -84.43, 1026, 82.7, 9000, 150, "ASP", 0, 0),
+                ("KFAKE", "26L", 33.64, -84.44, 1026, 262.7, 9000, 150, "ASP", 0, 0),
+                ("KOTHR", "18", 33.00, -84.00, 800, 180.0, 5000, 100, "ASP", 0, 0),
+            ]
+        )
+        rows = db.get_runways_for_airport("KFAKE")
+    names = [r["runway_name"] for r in rows]
+    assert names == ["08R", "26L"]

@@ -614,3 +614,94 @@ def test_infer_destination_uses_supplied_anchor():
         anchor_lon=-90.0,
     )
     assert result_anchor["probable_destination_icao"] == "KA"
+
+
+# ----------------------------------------------------------------------
+# Squawk signals: squawks_observed, had_emergency, primary_squawk
+# ----------------------------------------------------------------------
+
+
+def _metrics_with_squawk_history(squawks_with_ts: list[tuple[float, str | None]]) -> FlightMetrics:
+    """Build a FlightMetrics by feeding record_point with (ts, squawk) tuples."""
+    import json as _json  # noqa: F401 - keep import local as a reminder tests assert JSON format
+
+    from adsbtrack.classifier import PointData
+
+    m = FlightMetrics()
+    for ts, sq in squawks_with_ts:
+        p = PointData(
+            ts=ts,
+            lat=0.0,
+            lon=0.0,
+            baro_alt=1000,
+            gs=150.0,
+            track=0.0,
+            geom_alt=1000,
+            baro_rate=0.0,
+            geom_rate=None,
+            squawk=sq,
+            category=None,
+            nav_altitude_mcp=None,
+            nav_qnh=None,
+            emergency_field=None,
+            true_heading=None,
+            callsign=None,
+        )
+        m.record_point(p, ground_state="airborne", ground_reason="ok")
+    m.flush_open_squawk()
+    return m
+
+
+def test_compute_squawk_summary_has_emergency() -> None:
+    """Flight with 7700 at any point has had_emergency=1 and emergency_squawk='7700'."""
+    import json
+
+    assert json  # silence linter; json checked in a later test
+    m = _metrics_with_squawk_history(
+        [
+            (0.0, "1200"),
+            (60.0, "1200"),
+            (120.0, "7700"),
+            (180.0, "7700"),
+            (240.0, "1200"),
+            (300.0, "1200"),
+        ]
+    )
+    out = compute_squawk_summary(m, config=Config())
+    assert out["had_emergency"] == 1
+    assert out["emergency_squawk"] == "7700"
+    assert out["primary_squawk"] == "1200"  # longer cumulative duration
+
+
+def test_compute_squawk_summary_three_handoffs() -> None:
+    """Three distinct squawks yields squawk_changes=2 (raw transitions) and
+    squawks_observed listed sorted."""
+    import json
+
+    m = _metrics_with_squawk_history(
+        [
+            (0.0, "1200"),
+            (60.0, "1200"),
+            (90.0, "5201"),
+            (150.0, "5201"),
+            (180.0, "5203"),
+            (240.0, "5203"),
+        ]
+    )
+    out = compute_squawk_summary(m, config=Config())
+    assert out["squawk_changes"] == 2
+    assert out["had_emergency"] == 0
+    assert out["squawks_observed"] == json.dumps(["1200", "5201", "5203"])
+
+
+def test_compute_squawk_summary_no_squawk_data() -> None:
+    """Flight with no observed squawks: all squawk-derived fields NULL-ish."""
+    m = _metrics_with_squawk_history([(0.0, None), (60.0, None)])
+    out = compute_squawk_summary(m, config=Config())
+    assert out["squawk_first"] is None
+    assert out["squawk_last"] is None
+    assert out["squawk_changes"] is None
+    assert out["emergency_squawk"] is None
+    assert out["squawks_observed"] is None
+    assert out["had_emergency"] == 0
+    assert out["primary_squawk"] is None

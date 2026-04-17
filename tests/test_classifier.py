@@ -5,6 +5,8 @@ helpers; this file exercises the record_point side where the running
 counters are built up.
 """
 
+import pytest
+
 from adsbtrack.classifier import FlightMetrics, PointData
 from adsbtrack.config import Config
 
@@ -437,3 +439,62 @@ def test_takeoff_points_capped_at_240_samples() -> None:
     for i in range(300):
         metrics.record_point(_pt(i * 1.0), ground_state="airborne", ground_reason="ok")
     assert len(metrics.takeoff_points) == 240
+
+
+def test_squawk_durations_accumulate_per_code() -> None:
+    """Time spent on each squawk is credited to that squawk's cumulative duration."""
+    metrics = FlightMetrics()
+
+    def _pt(ts: float, squawk: str | None) -> PointData:
+        return PointData(
+            ts=ts,
+            lat=27.77,
+            lon=-82.67,
+            baro_alt=1000,
+            gs=150.0,
+            track=90.0,
+            geom_alt=1000,
+            baro_rate=0.0,
+            geom_rate=None,
+            squawk=squawk,
+            category=None,
+            nav_altitude_mcp=None,
+            nav_qnh=None,
+            emergency_field=None,
+            true_heading=None,
+            callsign=None,
+        )
+
+    # 1200 held 0..90 (90 s) + 150..210 (60 s) = 150 s total
+    # 5201 held 90..150 = 60 s
+    for ts, sq in [(0, "1200"), (60, "1200"), (90, "5201"), (120, "5201"), (150, "1200"), (210, "1200")]:
+        metrics.record_point(_pt(float(ts), sq), ground_state="airborne", ground_reason="ok")
+    metrics.flush_open_squawk()
+
+    assert metrics.squawk_durations.get("1200", 0.0) == pytest.approx(150.0)
+    assert metrics.squawk_durations.get("5201", 0.0) == pytest.approx(60.0)
+
+
+def test_squawk_durations_no_squawk_points_stays_empty() -> None:
+    metrics = FlightMetrics()
+    p = PointData(
+        ts=10.0,
+        lat=27.77,
+        lon=-82.67,
+        baro_alt=1000,
+        gs=150.0,
+        track=90.0,
+        geom_alt=1000,
+        baro_rate=0.0,
+        geom_rate=None,
+        squawk=None,
+        category=None,
+        nav_altitude_mcp=None,
+        nav_qnh=None,
+        emergency_field=None,
+        true_heading=None,
+        callsign=None,
+    )
+    metrics.record_point(p, ground_state="airborne", ground_reason="ok")
+    metrics.flush_open_squawk()
+    assert metrics.squawk_durations == {}

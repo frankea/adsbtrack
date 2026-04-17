@@ -205,6 +205,19 @@ class Flight:
     # practice. NULL on legacy rows.
     pattern_cycles: int | None = None
 
+    # --- Squawk signals (see adsbtrack/features.py:compute_squawk_summary) ---
+    # squawks_observed: JSON sorted list of unique squawks seen during the
+    # flight (e.g., '["1200","5201","7700"]'). NULL when no squawks
+    # observed or for legacy rows.
+    squawks_observed: str | None = None
+    # had_emergency: 1 when any of 7500 / 7600 / 7700 appeared at any point,
+    # 0 otherwise. NULL for legacy rows (re-extract to populate).
+    had_emergency: int | None = None
+    # primary_squawk: the squawk code held for the longest cumulative
+    # duration during the flight. NULL when no squawks were observed or
+    # for legacy rows.
+    primary_squawk: str | None = None
+
 
 @dataclass
 class AirportMatch:

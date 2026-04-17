@@ -131,6 +131,9 @@ CREATE TABLE IF NOT EXISTS flights (
     takeoff_runway TEXT,
     had_go_around INTEGER,
     pattern_cycles INTEGER,
+    squawks_observed TEXT,
+    had_emergency INTEGER,
+    primary_squawk TEXT,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -573,6 +576,10 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         # Go-around + pattern-work counts (see docs/features.md)
         ("had_go_around", "INTEGER"),
         ("pattern_cycles", "INTEGER"),
+        # Squawk signals (docs/features.md)
+        ("squawks_observed", "TEXT"),
+        ("had_emergency", "INTEGER"),
+        ("primary_squawk", "TEXT"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.
@@ -758,7 +765,7 @@ class Database:
                 mlat_pct, tisb_pct, adsb_pct,
                 acars_out, acars_off, acars_on, acars_in, landing_anchor_method,
                 aligned_runway, aligned_seconds, aligned_min_offset_m, takeoff_runway,
-                had_go_around, pattern_cycles)
+                had_go_around, pattern_cycles, squawks_observed, had_emergency, primary_squawk)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?,
                        ?, ?, ?, ?,
@@ -778,7 +785,7 @@ class Database:
                        ?, ?, ?,
                        ?, ?, ?,
                        ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?)""",
+                       ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
                 flight.takeoff_time.isoformat(),
@@ -878,6 +885,9 @@ class Database:
                 flight.takeoff_runway,
                 flight.had_go_around,
                 flight.pattern_cycles,
+                flight.squawks_observed,
+                flight.had_emergency,
+                flight.primary_squawk,
             ),
         )
 

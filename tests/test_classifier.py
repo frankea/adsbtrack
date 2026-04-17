@@ -341,3 +341,35 @@ def test_record_point_populates_lat_lon_on_recent_points():
     assert sample.lat == 33.63
     assert sample.lon == -84.43
     assert sample.baro_alt == 1200
+
+
+def test_record_point_captures_track_on_recent_points() -> None:
+    """After record_point, the last sample in recent_points should carry track.
+
+    The ILS alignment detector (adsbtrack.ils_alignment) needs recent-points
+    samples to expose ground track so it can score runway alignment during
+    approach. This test pins that contract at the FlightMetrics layer.
+    """
+    metrics = FlightMetrics()
+    p = PointData(
+        ts=100.0,
+        lat=33.64,
+        lon=-84.43,
+        baro_alt=3000,
+        gs=150.0,
+        track=87.0,
+        geom_alt=3050,
+        baro_rate=-800.0,
+        geom_rate=None,
+        squawk=None,
+        category=None,
+        nav_altitude_mcp=None,
+        nav_qnh=None,
+        emergency_field=None,
+        true_heading=None,
+        callsign=None,
+    )
+    metrics.record_point(p, ground_state="airborne", ground_reason="ok")
+    assert len(metrics.recent_points) == 1
+    sample = metrics.recent_points[-1]
+    assert sample.track == 87.0

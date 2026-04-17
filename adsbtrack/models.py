@@ -119,7 +119,6 @@ class Flight:
     # --- v3: callsigns history ---
     callsigns: str | None = None  # JSON array of distinct callsigns seen
     callsign_changes: int | None = None  # transitions count (not distinct), e.g. TWY501<->GS501 churn
-    callsign_count: int | None = None  # distinct callsign count = len(set(callsigns))
 
     # --- v3: destination inference for dropped flights ---
     probable_destination_icao: str | None = None

@@ -92,7 +92,6 @@ Extracted flights with airport matching, quality classification, confidence scor
 | night_flight | INTEGER | 1 if >= 50% of in-flight points were at night |
 | callsigns | TEXT | JSON array of distinct callsigns seen |
 | callsign_changes | INTEGER | Transitions between distinct callsigns (capped at distinct - 1) |
-| callsign_count | INTEGER | Number of distinct callsigns |
 | probable_destination_icao | TEXT | Inferred destination for dropped/signal-lost flights |
 | probable_destination_distance_km | REAL | Distance from last_seen to inferred destination |
 | probable_destination_confidence | REAL | [0.0, 1.0] confidence in the inference |

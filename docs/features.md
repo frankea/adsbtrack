@@ -64,7 +64,7 @@ Beyond classification and confidence, every extracted flight is tagged with a se
 
 These columns are diagnostic only and do not feed into mission classification or confidence scoring. Military-allocation squawks (US 4000-4777 block, MODE 3/A) are persisted in `squawks_observed` like any other code; the extractor deliberately does not tag or visually highlight them.
 
-**Callsigns.** `callsigns` is a JSON array of distinct callsigns seen. `callsign_changes` is capped at `max(0, distinct - 1)` so ping-pong flicker doesn't inflate the count. `callsign_count` is the distinct count.
+**Callsigns.** `callsigns` is a JSON array of distinct callsigns seen. The distinct count is derivable as `len(json.loads(callsigns))` when `callsigns` is non-null. `callsign_changes` is capped at `max(0, distinct - 1)` so ping-pong flicker doesn't inflate the count.
 
 **Probable destination.** For `signal_lost` and `dropped_on_approach` flights, `probable_destination_icao` is inferred from the last-seen position with a separate confidence score based on altitude, distance, and descent rate.
 

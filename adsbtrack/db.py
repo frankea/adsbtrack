@@ -101,7 +101,6 @@ CREATE TABLE IF NOT EXISTS flights (
     night_flight INTEGER,
     callsigns TEXT,
     callsign_changes INTEGER,
-    callsign_count INTEGER,
     probable_destination_icao TEXT,
     probable_destination_distance_km REAL,
     probable_destination_confidence REAL,
@@ -546,7 +545,6 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("night_flight", "INTEGER"),
         ("callsigns", "TEXT"),
         ("callsign_changes", "INTEGER"),
-        ("callsign_count", "INTEGER"),
         ("probable_destination_icao", "TEXT"),
         ("probable_destination_distance_km", "REAL"),
         ("probable_destination_confidence", "REAL"),
@@ -601,6 +599,19 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         # "column already exists" is expected when re-running the migration.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(f"ALTER TABLE flights ADD COLUMN {col_name} {col_type}")
+
+
+def _migrate_drop_callsign_count(conn: sqlite3.Connection) -> None:
+    """Drop the legacy flights.callsign_count column. Idempotent.
+
+    callsign_count was strictly len(json.loads(callsigns)) at every write
+    site; the column is redundant with the callsigns JSON array and has no
+    SELECT reader in the codebase. Requires SQLite 3.35+ for ALTER TABLE
+    DROP COLUMN (Python 3.12+ ships SQLite 3.40+).
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(flights)").fetchall()}
+    if "callsign_count" in cols:
+        conn.execute("ALTER TABLE flights DROP COLUMN callsign_count")
 
 
 def _flights_table_exists(conn: sqlite3.Connection) -> bool:
@@ -663,6 +674,8 @@ class Database:
         # databases pick up any columns that might have been added since the
         # schema string was last written (cheap, idempotent).
         _migrate_add_flight_columns(self.conn)
+        # Drop legacy columns that are strictly redundant with others.
+        _migrate_drop_callsign_count(self.conn)
         # aircraft_registry / aircraft_stats column additions
         _migrate_add_v4_columns(self.conn)
         # Seed the curated military-hex allocations. Idempotent -- repeated
@@ -769,7 +782,7 @@ class Database:
                 cruise_alt_ft, cruise_gs_kt, cruise_detected, heavy_signal_gap,
                 peak_climb_fpm, peak_descent_fpm,
                 takeoff_is_night, landing_is_night, night_flight,
-                callsigns, callsign_changes, callsign_count,
+                callsigns, callsign_changes,
                 probable_destination_icao, probable_destination_distance_km, probable_destination_confidence,
                 active_minutes, signal_gap_secs, signal_gap_count, fragments_stitched,
                 nearest_origin_icao, nearest_origin_distance_km,
@@ -792,7 +805,7 @@ class Database:
                        ?, ?, ?,
                        ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?,
+                       ?, ?,
                        ?, ?, ?,
                        ?, ?, ?, ?,
                        ?, ?,
@@ -867,7 +880,6 @@ class Database:
                 flight.night_flight,
                 flight.callsigns,
                 flight.callsign_changes,
-                flight.callsign_count,
                 flight.probable_destination_icao,
                 flight.probable_destination_distance_km,
                 flight.probable_destination_confidence,

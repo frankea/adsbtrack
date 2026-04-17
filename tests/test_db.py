@@ -1523,3 +1523,96 @@ def test_flight_insert_round_trip_navaid_track(tmp_path):
         row = db.conn.execute("SELECT navaid_track FROM flights WHERE icao=?", ("abc123",)).fetchone()
         assert row["navaid_track"].startswith("[")
         assert "CLT" in row["navaid_track"]
+
+
+# ---------------------------------------------------------------------------
+# callsign_count column drop (Task 3)
+# ---------------------------------------------------------------------------
+
+
+def test_drop_callsign_count_migration_removes_column_preserves_data(tmp_path):
+    """A legacy DB with the callsign_count column + a populated row must,
+    after the drop-column migration runs, have the column gone and every
+    other column's data intact.
+
+    Constructs a pre-migration DB by letting the current Database init
+    the modern schema, then re-adding callsign_count via ALTER TABLE and
+    UPDATE so we can verify the next migration pass cleanly drops it.
+    This sidesteps having to vendor an old CREATE TABLE string.
+    """
+    import sqlite3
+
+    from adsbtrack.db import Database
+
+    db_path = tmp_path / "legacy.db"
+    # Step 1: init modern schema, then forcibly re-add callsign_count so
+    # the fixture DB resembles a legacy layout.
+    with Database(db_path) as db:
+        f = Flight(
+            icao="leg001",
+            takeoff_time=datetime(2026, 3, 27, 12, 0, 0, tzinfo=UTC),
+            takeoff_lat=35.0,
+            takeoff_lon=-80.0,
+            takeoff_date="2026-03-27",
+            callsigns=json.dumps(["TWY501", "GS501"]),
+            callsign_changes=2,
+        )
+        db.insert_flight(f)
+    # Re-inject the callsign_count column directly to simulate legacy state.
+    raw = sqlite3.connect(db_path)
+    raw.execute("ALTER TABLE flights ADD COLUMN callsign_count INTEGER")
+    raw.execute("UPDATE flights SET callsign_count = 2 WHERE icao = 'leg001'")
+    raw.commit()
+    raw.close()
+
+    # Step 2: re-open via Database, which should run the drop migration.
+    with Database(db_path) as db:
+        cols = [r["name"] for r in db.conn.execute("PRAGMA table_info(flights)").fetchall()]
+        assert "callsign_count" not in cols, f"callsign_count still present: {cols}"
+        # Sibling columns untouched
+        assert "callsigns" in cols
+        assert "callsign_changes" in cols
+        assert "callsign" in cols  # the singular takeoff-time callsign
+        row = db.conn.execute(
+            "SELECT icao, callsigns, callsign_changes FROM flights WHERE icao = ?", ("leg001",)
+        ).fetchone()
+        assert row["icao"] == "leg001"
+        assert json.loads(row["callsigns"]) == ["TWY501", "GS501"]
+        assert row["callsign_changes"] == 2
+
+
+def test_flight_insert_round_trip_without_callsign_count(tmp_path):
+    """After the refactor, Flight has no callsign_count attribute and the
+    insert / select code path must not reference the column. This test
+    verifies both: the dataclass rejects the attribute, and insert + read
+    round-trip works with just callsigns + callsign_changes."""
+    from adsbtrack.db import Database
+
+    # Attribute removed from dataclass
+    with pytest.raises(TypeError):
+        Flight(
+            icao="abc123",
+            takeoff_time=datetime(2026, 3, 27, 12, 0, 0, tzinfo=UTC),
+            takeoff_lat=35.0,
+            takeoff_lon=-80.0,
+            takeoff_date="2026-03-27",
+            callsign_count=3,  # type: ignore[call-arg]
+        )
+
+    db_path = tmp_path / "rt.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="abc123",
+            takeoff_time=datetime(2026, 3, 27, 12, 0, 0, tzinfo=UTC),
+            takeoff_lat=35.0,
+            takeoff_lon=-80.0,
+            takeoff_date="2026-03-27",
+            callsigns=json.dumps(["UAL123", "UAL456"]),
+            callsign_changes=1,
+        )
+        db.insert_flight(f)
+        row = db.conn.execute("SELECT callsigns, callsign_changes FROM flights WHERE icao = ?", ("abc123",)).fetchone()
+        assert json.loads(row["callsigns"]) == ["UAL123", "UAL456"]
+        # Derive the count that was formerly stored in callsign_count
+        assert len(json.loads(row["callsigns"])) == 2
+        assert row["callsign_changes"] == 1

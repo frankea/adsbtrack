@@ -625,7 +625,7 @@ def compute_squawk_summary(metrics: FlightMetrics, *, config: Config) -> dict:
 
 def compute_callsigns_summary(metrics: FlightMetrics) -> dict:
     if not metrics.callsigns_seen:
-        return {"callsigns": None, "callsign_changes": None, "callsign_count": None}
+        return {"callsigns": None, "callsign_changes": None}
     unique = sorted(set(metrics.callsigns_seen))
     # cap callsign_changes at max(0, distinct - 1). The online
     # counter in FlightMetrics tracks real transitions between the last-
@@ -636,7 +636,6 @@ def compute_callsigns_summary(metrics: FlightMetrics) -> dict:
     return {
         "callsigns": json.dumps(unique, ensure_ascii=True),
         "callsign_changes": capped_changes,
-        "callsign_count": len(unique),
     }
 
 
@@ -969,7 +968,6 @@ def derive_all(
     cs = compute_callsigns_summary(metrics)
     flight.callsigns = cs["callsigns"]
     flight.callsign_changes = cs["callsign_changes"]
-    flight.callsign_count = cs["callsign_count"]
 
     # DO-260 category
     flight.category_do260 = classify_category_do260(metrics)

@@ -109,6 +109,7 @@ Extracted flights with airport matching, quality classification, confidence scor
 | origin_helipad_id | INTEGER | FK to helipads table (takeoff within 200 m of a helipad centroid) |
 | destination_helipad_id | INTEGER | FK to helipads table (landing within 200 m of a helipad centroid) |
 | type_override | TEXT | Per-flight type override when cruise envelope indicates a different type (e.g. MIL_FW for ae69xx H60 ICAOs flying fixed-wing profiles) |
+| navaid_track | TEXT | JSON array of navaid alignment segments for this flight; see `adsbtrack/navaid_alignment.py`. NULL when no segment qualified. Each entry: `{navaid_ident, start_ts, end_ts, min_distance_nm}`. |
 
 ## aircraft_registry
 
@@ -200,6 +201,21 @@ Rows with missing endpoint lat/lon are skipped (heliports, some unsurveyed field
 | surface | TEXT | Surface code ("ASPH", "CONC", "GRVL", ...) |
 | closed | INTEGER | 1 if the runway is marked closed in OurAirports |
 | displaced_threshold_ft | INTEGER | Displaced threshold distance at this end |
+
+## navaids
+
+Cached OurAirports navaid reference data, populated by `adsbtrack.cli navaids refresh`. Primary key is (ident, latitude_deg, longitude_deg) because OurAirports reuses short idents across regions.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| ident | TEXT | Navaid identifier (3-5 letter code) |
+| name | TEXT | Long name |
+| type | TEXT | `VOR`, `VOR-DME`, `VORTAC`, `NDB`, `FIX`, `TACAN`, etc. |
+| latitude_deg | REAL | WGS-84 |
+| longitude_deg | REAL | WGS-84 |
+| elevation_ft | INTEGER | Navaid elevation (NULL when OurAirports lacks it) |
+| frequency_khz | INTEGER | Station frequency in kHz (NULL for fixes) |
+| iso_country | TEXT | Two-letter ISO country code |
 
 ## helipads
 

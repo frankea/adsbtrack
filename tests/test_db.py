@@ -1336,3 +1336,21 @@ def test_insert_flight_squawk_signals_default_to_null(db) -> None:
     assert row["squawks_observed"] is None
     assert row["had_emergency"] is None
     assert row["primary_squawk"] is None
+
+
+def test_navaids_table_schema(tmp_path):
+    from adsbtrack.db import Database
+
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(navaids)").fetchall()}
+    assert {
+        "ident",
+        "name",
+        "type",
+        "latitude_deg",
+        "longitude_deg",
+        "elevation_ft",
+        "frequency_khz",
+        "iso_country",
+    } <= cols

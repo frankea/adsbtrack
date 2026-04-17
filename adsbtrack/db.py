@@ -212,6 +212,18 @@ CREATE TABLE IF NOT EXISTS runways (
     PRIMARY KEY (airport_ident, runway_name)
 );
 
+CREATE TABLE IF NOT EXISTS navaids (
+    ident TEXT NOT NULL,
+    name TEXT,
+    type TEXT,
+    latitude_deg REAL NOT NULL,
+    longitude_deg REAL NOT NULL,
+    elevation_ft INTEGER,
+    frequency_khz INTEGER,
+    iso_country TEXT,
+    PRIMARY KEY (ident, latitude_deg, longitude_deg)
+);
+
 CREATE TABLE IF NOT EXISTS faa_registry (
     mode_s_code_hex TEXT PRIMARY KEY,
     n_number TEXT,
@@ -340,6 +352,8 @@ CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_runways_airport_ident ON runways(airport_ident);
 CREATE INDEX IF NOT EXISTS idx_runways_latlon ON runways(latitude_deg, longitude_deg);
+CREATE INDEX IF NOT EXISTS idx_navaids_latlon ON navaids(latitude_deg, longitude_deg);
+CREATE INDEX IF NOT EXISTS idx_navaids_ident ON navaids(ident);
 CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
 CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_n_number ON faa_registry(n_number);

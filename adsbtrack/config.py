@@ -227,6 +227,7 @@ class Config:
     credentials_path: Path = Path("credentials.json")
     airports_csv_url: str = "https://davidmegginson.github.io/ourairports-data/airports.csv"
     runways_csv_url: str = "https://davidmegginson.github.io/ourairports-data/runways.csv"
+    navaids_csv_url: str = "https://davidmegginson.github.io/ourairports-data/navaids.csv"
     faa_registry_url: str = "https://registry.faa.gov/database/ReleasableAircraft.zip"
     faa_registry_cache_path: Path = Path(".cache/ReleasableAircraft.zip")
     mictronics_base_url: str = "https://raw.githubusercontent.com/Mictronics/readsb-protobuf/dev/webapp/src/db"

@@ -999,3 +999,20 @@ def test_trips_no_squawk_column_by_default(tmp_path, monkeypatch) -> None:
     result = runner.invoke(cli, ["trips", "--hex", "sqwk02", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "Squawk" not in result.output  # column hidden by default
+
+
+def test_navaids_refresh_local_csv(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+
+    from adsbtrack.cli import cli
+
+    db_path = tmp_path / "nav.db"
+    fixture = Path(__file__).parent / "fixtures" / "navaids_sample.csv"
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["navaids", "refresh", "--csv", str(fixture), "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "3 navaids" in result.output

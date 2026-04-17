@@ -14,6 +14,7 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config
 from .db import Database
 from .fetcher import fetch_traces, fetch_traces_opensky
+from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
 from .runways import refresh_runways
@@ -935,6 +936,40 @@ def runways_refresh(csv_path, db_path):
     except OSError as e:
         raise click.ClickException(f"filesystem error: {e}") from e
     console.print(f"[green]Runway geometry loaded:[/] {count} runway ends")
+
+
+@cli.group()
+def navaids():
+    """OurAirports navaid reference data (VOR / NDB / fixes)."""
+
+
+@navaids.command("refresh")
+@click.option(
+    "--csv",
+    "csv_path",
+    type=click.Path(exists=True, path_type=Path, dir_okay=False),
+    default=None,
+    help="Use a local navaids.csv instead of downloading from OurAirports.",
+)
+@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+def navaids_refresh(csv_path, db_path):
+    """Download OurAirports navaids.csv and upsert global navaid reference data.
+
+    Idempotent - re-running replaces existing rows.
+    """
+    import httpx
+
+    cfg = Config(db_path=Path(db_path))
+    try:
+        with Database(cfg.db_path) as db:
+            count = _refresh_navaids(db, cfg, local_csv=csv_path)
+    except httpx.HTTPError as e:
+        raise click.ClickException(f"failed to download navaids.csv: {e}") from e
+    except FileNotFoundError as e:
+        raise click.ClickException(str(e)) from e
+    except OSError as e:
+        raise click.ClickException(f"filesystem error: {e}") from e
+    console.print(f"[green]Navaid reference data loaded:[/] {count} navaids")
 
 
 # -----------------------------------------------------------------------------

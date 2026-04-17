@@ -335,6 +335,21 @@ class Config:
         "BE36",
     )
 
+    # --- Navaid alignment (see adsbtrack/navaid_alignment.py) ---
+    # For each navaid within navaid_max_distance_nm of any flight point, the
+    # algorithm keeps points whose bearing-to-navaid delta from track is under
+    # navaid_alignment_tolerance_deg. Consecutive kept points separated by at
+    # most navaid_split_gap_secs form a segment. A segment qualifies when it
+    # runs at least navaid_min_duration_secs AND the flight's closest approach
+    # to that navaid during the segment is under navaid_near_pass_max_nm.
+    navaid_alignment_tolerance_deg: float = 1.0
+    navaid_max_distance_nm: float = 500.0
+    navaid_split_gap_secs: float = 120.0
+    navaid_min_duration_secs: float = 30.0
+    navaid_near_pass_max_nm: float = 80.0
+    # Bounding-box buffer (nm) applied when prefiltering navaids per flight.
+    navaid_bbox_buffer_nm: float = 50.0
+
     # Endurance
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown
     type_endurance_minutes: dict[str, float] = field(default_factory=lambda: dict(TYPE_ENDURANCE_MINUTES))

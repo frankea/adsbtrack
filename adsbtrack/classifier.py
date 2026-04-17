@@ -238,6 +238,8 @@ class FlightMetrics:
     # not just a tail or head window. Consumed by adsbtrack.navaid_alignment
     # via the parser's navaid_track helper. Unbounded (grows with the flight).
     all_points: list[_PointSample] = field(default_factory=list)
+    # Resolved per-sample thresholds (populated on first record_point call).
+    _thresholds: _RecordPointThresholds | None = None
     # recent airborne positions for bearing-based heading fallback
     # when track data is unavailable (helicopter hover approaches).
     _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
@@ -262,6 +264,10 @@ class FlightMetrics:
         compatibility with older call sites that only supplied the legacy
         scalar knob.
         """
+        if self._thresholds is None:
+            self._thresholds = _resolve_thresholds(config)
+        t = self._thresholds
+
         ts = point.ts
         lat = point.lat
         lon = point.lon
@@ -356,16 +362,8 @@ class FlightMetrics:
             # when available, correcting any spike the raw path recorded
             # during warmup. min() over the window naturally suppresses
             # single-sample spikes because the non-spike values are lower.
-            alt_win_secs = (
-                config.alt_persistence_window_secs
-                if config is not None and hasattr(config, "alt_persistence_window_secs")
-                else 30.0
-            )
-            alt_min_samples = (
-                config.alt_persistence_min_samples
-                if config is not None and hasattr(config, "alt_persistence_min_samples")
-                else 3
-            )
+            alt_win_secs = t.alt_persistence_window_secs
+            alt_min_samples = t.alt_persistence_min_samples
             candidate_alt: int | None = None
             if isinstance(baro_alt, (int, float)):
                 self.last_airborne_alt = int(baro_alt)
@@ -407,16 +405,8 @@ class FlightMetrics:
             if gs is not None:
                 self.last_airborne_gs = gs
                 # v6 B6 fix: same dual-track for ground speed.
-                gs_win_secs = (
-                    config.gs_persistence_window_secs
-                    if config is not None and hasattr(config, "gs_persistence_window_secs")
-                    else 30.0
-                )
-                gs_min_samples = (
-                    config.gs_persistence_min_samples
-                    if config is not None and hasattr(config, "gs_persistence_min_samples")
-                    else 3
-                )
+                gs_win_secs = t.gs_persistence_window_secs
+                gs_min_samples = t.gs_persistence_min_samples
                 gs_val = int(gs)
                 if gs_val > self._raw_max_gs_kt:
                     self._raw_max_gs_kt = gs_val
@@ -440,9 +430,7 @@ class FlightMetrics:
 
         # Phase / peak rate gap threshold: anything above this is treated
         # as a coverage hole and gets special-cased downstream.
-        max_seg_secs = (
-            config.path_max_segment_secs if config is not None and hasattr(config, "path_max_segment_secs") else 60.0
-        )
+        max_seg_secs = t.path_max_segment_secs
 
         # Origin (first observed point, used for max_distance_from_origin)
         if self.origin_lat is None:
@@ -547,10 +535,8 @@ class FlightMetrics:
         # attribute the gap to cruise (if both bracketing alts are above 70%
         # of running max_altitude) or level. Stops the phase sum from
         # silently undercounting on long flights.
-        phase_climb_fpm = config.phase_climb_fpm if config is not None and hasattr(config, "phase_climb_fpm") else 250.0
-        cruise_ratio = (
-            config.phase_cruise_alt_ratio if config is not None and hasattr(config, "phase_cruise_alt_ratio") else 0.70
-        )
+        phase_climb_fpm = t.phase_climb_fpm
+        cruise_ratio = t.phase_cruise_alt_ratio
         if ground_state == "airborne" and prev_ts is not None:
             dt = ts - prev_ts
             if dt > 0:
@@ -591,17 +577,9 @@ class FlightMetrics:
         # 3 to 4 so that 1-2 point baro spikes can't peg the peak. Also
         # filters obvious outliers (>3x median absolute) before computing
         # the mean to suppress single-sample contamination.
-        peak_win_secs = (
-            config.peak_rate_window_secs if config is not None and hasattr(config, "peak_rate_window_secs") else 60.0
-        )
-        peak_min_samples = (
-            config.peak_rate_min_samples if config is not None and hasattr(config, "peak_rate_min_samples") else 4
-        )
-        peak_min_span = (
-            config.peak_rate_min_span_secs
-            if config is not None and hasattr(config, "peak_rate_min_span_secs")
-            else 30.0
-        )
+        peak_win_secs = t.peak_rate_window_secs
+        peak_min_samples = t.peak_rate_min_samples
+        peak_min_span = t.peak_rate_min_span_secs
         if chosen_rate is not None and ground_state == "airborne":
             self._rate_window.append((ts, chosen_rate))
             cutoff = ts - peak_win_secs
@@ -625,19 +603,9 @@ class FlightMetrics:
         # Hover state machine (any rotorcraft gating happens in features.py;
         # here we just collect the raw stats so features.compute_hover can
         # decide whether to emit).
-        hover_gs = (
-            config.hover_gs_threshold_kts if config is not None and hasattr(config, "hover_gs_threshold_kts") else 5.0
-        )
-        hover_baro_max = (
-            config.hover_baro_rate_max_fpm
-            if config is not None and hasattr(config, "hover_baro_rate_max_fpm")
-            else 100.0
-        )
-        hover_min_dur = (
-            config.hover_min_duration_secs
-            if config is not None and hasattr(config, "hover_min_duration_secs")
-            else 20.0
-        )
+        hover_gs = t.hover_gs_threshold_kts
+        hover_baro_max = t.hover_baro_rate_max_fpm
+        hover_min_dur = t.hover_min_duration_secs
         is_hover_now = (
             ground_state == "airborne"
             and gs is not None
@@ -694,9 +662,7 @@ class FlightMetrics:
         # Without this, 358 B407 confirmed landings had no landing_heading
         # because the last airborne track was too far from touchdown.
         if point.track is not None:
-            heading_window = (
-                config.heading_window_secs if config is not None and hasattr(config, "heading_window_secs") else 60.0
-            )
+            heading_window = t.heading_window_secs
             if ground_state == "airborne":
                 # First-60-seconds buffer (takeoff): only accept if within the
                 # heading window from the first observed airborne point.
@@ -769,6 +735,11 @@ class FlightMetrics:
 class _ConfigLike:  # pragma: no cover - structural
     path_max_segment_secs: float
     phase_climb_fpm: float
+    phase_cruise_alt_ratio: float
+    alt_persistence_window_secs: float
+    alt_persistence_min_samples: int
+    gs_persistence_window_secs: float
+    gs_persistence_min_samples: int
     peak_rate_window_secs: float
     peak_rate_min_samples: int
     peak_rate_min_span_secs: float
@@ -776,6 +747,41 @@ class _ConfigLike:  # pragma: no cover - structural
     hover_baro_rate_max_fpm: float
     hover_min_duration_secs: float
     heading_window_secs: float
+
+
+@dataclass(frozen=True)
+class _RecordPointThresholds:
+    """Per-sample thresholds record_point needs, resolved once per flight.
+
+    record_point runs thousands of times per flight; resolving every
+    threshold from the Config (with hasattr fallbacks for tests that pass
+    minimal stand-ins) on every sample added ~14 attribute probes per
+    point. Cache the resolved set here and read fields directly."""
+
+    alt_persistence_window_secs: float = 30.0
+    alt_persistence_min_samples: int = 3
+    gs_persistence_window_secs: float = 30.0
+    gs_persistence_min_samples: int = 3
+    path_max_segment_secs: float = 60.0
+    phase_climb_fpm: float = 250.0
+    phase_cruise_alt_ratio: float = 0.70
+    peak_rate_window_secs: float = 60.0
+    peak_rate_min_samples: int = 4
+    peak_rate_min_span_secs: float = 30.0
+    hover_gs_threshold_kts: float = 5.0
+    hover_baro_rate_max_fpm: float = 100.0
+    hover_min_duration_secs: float = 20.0
+    heading_window_secs: float = 60.0
+
+
+def _resolve_thresholds(config: _ConfigLike | None) -> _RecordPointThresholds:
+    if config is None:
+        return _RecordPointThresholds()
+    kwargs: dict[str, float | int] = {}
+    for name in _RecordPointThresholds.__dataclass_fields__:
+        if hasattr(config, name):
+            kwargs[name] = getattr(config, name)
+    return _RecordPointThresholds(**kwargs)
 
 
 # ----------------------------------------------------------------------

@@ -45,9 +45,13 @@ class StatusView(Vertical):
         self._header.set_title(self._icao)
         self._header.set_crumb("status")
         self._header.set_trailing("")
-        self._body.update(self._render(snap))
+        self._body.update(self._build_body(snap))
 
-    def _render(self, snap: dict) -> str:
+    def _build_body(self, snap: dict) -> str:
+        """Render the dashboard body markup. Renamed from ``_render`` to
+        avoid shadowing Textual's ``Widget._render()`` slot, which takes
+        a ``snap`` arg of a different shape and crashed the view when
+        the compositor tried to call it."""
         lines: list[str] = []
         reg = snap.get("registry") or {}
         stats = snap.get("stats") or {}

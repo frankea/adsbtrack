@@ -13,9 +13,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from rich.text import Text
-from textual.app import ComposeResult
 from textual.containers import Horizontal
-from textual.widget import Widget
 from textual.widgets import Input, Label
 
 # ---- colour tokens (mirror of design/colors_and_type.css) ----
@@ -182,53 +180,67 @@ class PageHeader(Label):
 # ---------------------------------------------------------------------------
 
 
-class FilterBar(Widget):
-    """Filter bar with a cyan ``>`` prompt, an Input, and a count label."""
+class FilterBar:
+    """Factory + handle for an fzf-style filter bar.
 
-    DEFAULT_CSS = """
-    FilterBar {
-        layout: horizontal;
-        height: 1;
-        width: 1fr;
-        background: #0b0f14;
-    }
-    FilterBar > Label.filter-prompt {
-        width: 3;
-        padding: 0 1;
-        color: #4fb8e0;
-        text-style: bold;
-    }
-    FilterBar > Input {
-        background: #0b0f14;
-        color: #e4ecf3;
-        border: none;
-        padding: 0 1;
-        height: 1;
-        width: 1fr;
-    }
-    FilterBar > Label.filter-count {
-        width: auto;
-        padding: 0 1;
-        color: #6b7885;
-    }
+    NOT a widget subclass. Subclassing ``Horizontal`` (or wrapping a
+    ``Horizontal`` in a ``Widget``) in this project broke Textual's
+    ``Input`` paint path: the Input would accept keystrokes and update
+    its value but render blank. The bare ``Horizontal`` returned by
+    :meth:`build` side-steps that. ``set_counts`` and ``input_widget``
+    remain available on this handle for screens to poke.
     """
 
     def __init__(self, placeholder: str = "filter (fzf)", *, widget_id: str | None = None) -> None:
-        super().__init__(id=widget_id, classes="filter-bar")
         self._placeholder = placeholder
+        self._widget_id = widget_id or "filter"
+        self._input = Input(placeholder=placeholder, id=f"{self._widget_id}-input")
+        self._count = Label("0 / 0", classes="filter-count", id=f"{self._widget_id}-count")
 
-    def compose(self) -> ComposeResult:
-        yield Label(">", classes="filter-prompt")
-        yield Input(placeholder=self._placeholder, id=f"{self.id or 'filter'}-input")
-        yield Label("0 / 0", classes="filter-count", id=f"{self.id or 'filter'}-count")
+    def build(self) -> Horizontal:
+        return Horizontal(
+            Label(">", classes="filter-prompt"),
+            self._input,
+            self._count,
+            id=self._widget_id,
+            classes="filter-bar",
+        )
 
     def set_counts(self, matched: int, total: int) -> None:
-        label = self.query_one(f"#{self.id or 'filter'}-count", Label)
-        label.update(f"[{FG_2}]{matched:,} / {total:,}[/]")
+        self._count.update(f"[{FG_2}]{matched:,} / {total:,}[/]")
 
     @property
     def input_widget(self) -> Input:
-        return self.query_one(f"#{self.id or 'filter'}-input", Input)
+        return self._input
+
+
+# App-level CSS for the filter bar styling (applied by id/class because we no
+# longer have a widget class to hang DEFAULT_CSS off of).
+FILTER_BAR_CSS = """
+Horizontal.filter-bar {
+    height: 1;
+    width: 1fr;
+    background: #0b0f14;
+}
+Horizontal.filter-bar Label.filter-prompt {
+    width: 3;
+    padding: 0 1;
+    color: #4fb8e0;
+    text-style: bold;
+}
+Horizontal.filter-bar Input {
+    background: #0b0f14;
+    color: #e4ecf3;
+    border: none;
+    padding: 0 1;
+    width: 1fr;
+}
+Horizontal.filter-bar Label.filter-count {
+    width: auto;
+    padding: 0 1;
+    color: #6b7885;
+}
+"""
 
 
 # ---------------------------------------------------------------------------

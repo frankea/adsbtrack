@@ -46,7 +46,7 @@ class SpoofView(Vertical):
 
     def compose(self) -> ComposeResult:
         yield self._header
-        yield self._filter
+        yield self._filter.build()
         yield self._table
         yield self._detail
 

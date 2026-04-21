@@ -30,7 +30,7 @@ from .views.map import MapView
 from .views.ops import OpsView
 from .views.spoof import SpoofView
 from .views.status import StatusView
-from .widgets import Sidebar, StatusStrip
+from .widgets import FILTER_BAR_CSS, Sidebar, StatusStrip
 
 _STYLES_PATH = Path(__file__).resolve().parent / "styles" / "app.tcss"
 
@@ -39,6 +39,10 @@ class AdsbtrackApp(App):
     """Single-screen workspace over the local SQLite DB the CLI writes."""
 
     CSS_PATH = str(_STYLES_PATH)
+    # Filter-bar styling lives in widgets.py (keyed off `Horizontal.filter-bar`)
+    # because FilterBar is a factory function, not a widget subclass, so it
+    # can't carry its own DEFAULT_CSS. Merged into the app's CSS here.
+    CSS = FILTER_BAR_CSS
     TITLE = "adsbtrack"
 
     BINDINGS = [

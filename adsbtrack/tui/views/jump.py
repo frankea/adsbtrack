@@ -130,7 +130,15 @@ class HelpScreen(ModalScreen[None]):
         rows = [
             [("/", "search"), ("f", "filter"), ("j", "next"), ("k", "prev"), ("g g", "top"), ("G", "bottom")],
             [(":", "jump to hex"), ("esc", "back"), ("?", "help"), ("q", "quit")],
-            [("1", "aircraft"), ("2", "flights"), ("3", "events"), ("4", "spoof"), ("5", "map"), ("6", "status"), ("f", "ops")],
+            [
+                ("1", "aircraft"),
+                ("2", "flights"),
+                ("3", "events"),
+                ("4", "spoof"),
+                ("5", "map"),
+                ("6", "status"),
+                ("f", "ops"),
+            ],
         ]
         lines: list[str] = [f"[b {FG_0}]Keyboard shortcuts[/]", ""]
         for row in rows:

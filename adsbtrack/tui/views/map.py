@@ -185,10 +185,7 @@ class MapTraceInfoStrip(_HudLabel):
             s = secs % 60
             h = m // 60
             m %= 60
-            if h:
-                delta = f"t+{h}:{m:02d}:{s:02d}"
-            else:
-                delta = f"t+{m}m{s:02d}s"
+            delta = f"t+{h}:{m:02d}:{s:02d}" if h else f"t+{m}m{s:02d}s"
         src = point.source.replace("_", "-")
         src_colour = _SOURCE_COLOUR.get(point.source, FG_0)
         alt = f"{point.alt_ft:,} ft" if point.alt_ft is not None else "ground"
@@ -252,9 +249,7 @@ class MapScrubberStrip(_HudLabel):
         width = 24
         fill = int(round(self._progress * width))
         bar = f"[{ACCENT_CYAN}]{'█' * fill}[/][{FG_2}]{'░' * (width - fill)}[/]"
-        return Text.from_markup(
-            f"[{FG_2}]▸[/] {bar}  [{FG_1}]{self._label}[/]  [{FG_2}]×1.0[/]"
-        )
+        return Text.from_markup(f"[{FG_2}]▸[/] {bar}  [{FG_1}]{self._label}[/]  [{FG_2}]×1.0[/]")
 
 
 class _HudRow(Horizontal):
@@ -337,8 +332,7 @@ class MapView(Vertical):
         self._header.set_title(self._icao)
         self._header.set_crumb(f"{self._date}")
         self._header.set_trailing(
-            f"{len(points):,} points {DOT} bbox "
-            f"({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
+            f"{len(points):,} points {DOT} bbox ({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
         )
         origin = points[0].ts
         tail = points[-1]

@@ -18,33 +18,25 @@ from textual.widgets import Static
 from ..queries import status_snapshot
 from ..widgets import (
     ACCENT_AMBER,
-    ACCENT_CYAN,
     ACCENT_MAGENTA,
     ACCENT_OK,
     ACCENT_RED,
     ACCENT_VIOLET,
-    Card,
     DOT,
     FG_0,
     FG_1,
     FG_2,
+    Card,
     PageHeader,
 )
 
 
 def _stat_card_markup(heading: str, value: str, sub: str, *, value_colour: str = FG_0) -> Text:
-    return Text.from_markup(
-        f"[{FG_2}]{heading.upper()}[/]\n"
-        f"[b {value_colour}]{value}[/]\n"
-        f"[{FG_2}]{sub}[/]"
-    )
+    return Text.from_markup(f"[{FG_2}]{heading.upper()}[/]\n[b {value_colour}]{value}[/]\n[{FG_2}]{sub}[/]")
 
 
 def _bar_row(label: str, pct: float, colour: str, *, bar_width: int = 24, total: float = 100.0) -> str:
-    if total <= 0:
-        fill = 0
-    else:
-        fill = max(0, min(bar_width, int(round(pct / total * bar_width))))
+    fill = 0 if total <= 0 else max(0, min(bar_width, int(round(pct / total * bar_width))))
     bar = f"[{colour}]{'█' * fill}[/][{FG_2}]{'░' * (bar_width - fill)}[/]"
     return f"[{FG_2}]{label:<8}[/]{bar}  [{FG_1}]{pct:5.1f}%[/]"
 
@@ -68,7 +60,6 @@ def _build_sources_body(src: dict[str, Any] | None) -> Text:
 def _build_missions_body(missions: list[tuple[str, int]]) -> Text:
     if not missions:
         return Text.from_markup(f"[{FG_2}](no mission data)[/]")
-    total = sum(n for _, n in missions) or 1
     lines = [f"[{FG_2}]MISSION MIX[/]"]
     top = max(n for _, n in missions)
     for name, n in missions[:6]:
@@ -194,9 +185,7 @@ class StatusView(Vertical):
         ]
         crumb = f" {DOT} ".join(p for p in crumb_parts if p) or "status"
         self._header.set_crumb(crumb)
-        self._header.set_trailing(
-            f"{stats.get('first_seen') or '-'} .. {stats.get('last_seen') or '-'}"
-        )
+        self._header.set_trailing(f"{stats.get('first_seen') or '-'} .. {stats.get('last_seen') or '-'}")
 
         total_hours = stats.get("total_hours") or 0.0
         total_flights = stats.get("total_flights") or 0
@@ -217,7 +206,11 @@ class StatusView(Vertical):
                     f"avg {avg_min:.1f} min / flight" if avg_min else "avg -- / flight",
                 )
             ),
-            Card(_stat_card_markup("Total flights", f"{total_flights:,}", f"{stats.get('days_with_data') or 0} days with data")),
+            Card(
+                _stat_card_markup(
+                    "Total flights", f"{total_flights:,}", f"{stats.get('days_with_data') or 0} days with data"
+                )
+            ),
             Card(
                 _stat_card_markup(
                     "Distinct airports",

@@ -24,11 +24,10 @@ from ..widgets import (
     ACCENT_CYAN,
     ACCENT_OK,
     ACCENT_RED,
-    Card,
     DOT,
-    FG_0,
     FG_1,
     FG_2,
+    Card,
     PageHeader,
 )
 
@@ -188,7 +187,11 @@ class OpsView(Vertical):
         elapsed = (datetime.now(UTC) - job.started_at).total_seconds()
         last = job.last_line or "(no output yet)"
         bar = self._progress_bar(job, status_colour)
-        hint = f"[{FG_2}][[/][{ACCENT_CYAN}]c[/][{FG_2}]] cancel  [/][{FG_2}][[/][{ACCENT_CYAN}]b[/][{FG_2}]] background  [/][{FG_2}][[/][{ACCENT_CYAN}]l[/][{FG_2}]] live log[/]"
+        hint = (
+            f"[{FG_2}][[/][{ACCENT_CYAN}]c[/][{FG_2}]] cancel  [/]"
+            f"[{FG_2}][[/][{ACCENT_CYAN}]b[/][{FG_2}]] background  [/]"
+            f"[{FG_2}][[/][{ACCENT_CYAN}]l[/][{FG_2}]] live log[/]"
+        )
         return Text.from_markup(
             f"[{FG_2}]#{idx:02d}  {heading.upper()}[/]\n"
             f"[b {value_colour}]{value_text}[/]\n"

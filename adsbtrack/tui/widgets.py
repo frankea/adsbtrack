@@ -416,11 +416,7 @@ class Sidebar(Label):
             # left border in TUI proportions.
             marker = f"[{ACCENT_CYAN}]▌[/]" if is_active else " "
             label_text = label[: cls._LABEL_WIDTH]
-            shortcut_cell = (
-                f"[{FG_2} on {BG_0}] {shortcut} [/]"
-                if shortcut
-                else "   "
-            )
+            shortcut_cell = f"[{FG_2} on {BG_0}] {shortcut} [/]" if shortcut else "   "
             padded = f"{label_text:<{cls._LABEL_WIDTH}}"
             if is_active:
                 row = f"{marker} [{FG_0} on {OVERLAY_SELECTED}]{padded}[/]{shortcut_cell}"

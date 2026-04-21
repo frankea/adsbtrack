@@ -396,12 +396,19 @@ def status_snapshot(db: Database, icao: str) -> dict[str, Any]:
 
     indicators_row = db.conn.execute(
         """SELECT
-               SUM(CASE WHEN emergency_squawk IS NOT NULL AND emergency_squawk != '' THEN 1 ELSE 0 END) AS emergency_flights,
-               SUM(CASE WHEN had_go_around = 1 THEN 1 ELSE 0 END) AS go_around_flights,
-               SUM(CASE WHEN max_hover_secs IS NOT NULL AND max_hover_secs >= 300 THEN 1 ELSE 0 END) AS long_hover_flights,
-               SUM(CASE WHEN landing_type = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_landings,
-               SUM(CASE WHEN landing_type = 'signal_lost' THEN 1 ELSE 0 END) AS signal_lost_landings,
-               SUM(CASE WHEN landing_type = 'confirmed' AND (destination_icao IS NULL OR destination_icao = '') THEN 1 ELSE 0 END) AS off_airport_landings
+               SUM(CASE WHEN emergency_squawk IS NOT NULL AND emergency_squawk != ''
+                        THEN 1 ELSE 0 END) AS emergency_flights,
+               SUM(CASE WHEN had_go_around = 1
+                        THEN 1 ELSE 0 END) AS go_around_flights,
+               SUM(CASE WHEN max_hover_secs IS NOT NULL AND max_hover_secs >= 300
+                        THEN 1 ELSE 0 END) AS long_hover_flights,
+               SUM(CASE WHEN landing_type = 'confirmed'
+                        THEN 1 ELSE 0 END) AS confirmed_landings,
+               SUM(CASE WHEN landing_type = 'signal_lost'
+                        THEN 1 ELSE 0 END) AS signal_lost_landings,
+               SUM(CASE WHEN landing_type = 'confirmed'
+                         AND (destination_icao IS NULL OR destination_icao = '')
+                        THEN 1 ELSE 0 END) AS off_airport_landings
              FROM flights
             WHERE icao = ?""",
         (icao,),

@@ -279,3 +279,102 @@ def test_non_confirmed_landing_is_not_off_airport(tmp_path):
         db.commit()
         events = collect_events(db, "bbb004")
     assert events == []
+
+
+# ---------------------------------------------------------------------------
+# Bimodal-integrity spoof detector (opt-in)
+# ---------------------------------------------------------------------------
+
+
+def _make_sample(version, nic, sil, *, t=0.0, lat=25.25, lon=55.38, alt="ground"):
+    """Construct a 14-element readsb trace sample for tests."""
+    ac = {"version": version, "nic": nic, "sil": sil, "flight": "EK01    ", "category": "A5"}
+    return [t, lat, lon, alt, 0.5, 30.9, 0, None, ac, "adsb_icao", None, None, None, None]
+
+
+def _insert_trace_day(db, icao, date, samples, source="adsbx"):
+    """Direct-insert a trace_day with synthetic readsb samples."""
+    import json
+
+    db.conn.execute(
+        """INSERT INTO trace_days
+           (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            icao,
+            date,
+            source,
+            1776600000.0,
+            json.dumps(samples),
+            len(samples),
+            datetime(2026, 4, 21, tzinfo=UTC).isoformat(),
+        ),
+    )
+
+
+def test_spoof_detector_flags_bimodal_integrity(tmp_path):
+    """A trace_day where >= 10% of v2 samples carry sil=0 and the day has
+    >= 25 v2 samples must produce a spoof_bimodal_integrity event."""
+    db_path = tmp_path / "spoof.db"
+    samples = (
+        [_make_sample(2, 8, 3) for _ in range(40)]  # 40 realistic v2
+        + [_make_sample(2, 0, 0) for _ in range(20)]  # 20 garbage v2 (33%)
+    )
+    with Database(db_path) as db:
+        _insert_trace_day(db, "89618d", "2026-04-21", samples)
+        db.commit()
+        events = collect_events(db, "89618d", include_spoof_checks=True)
+    spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
+    assert len(spoof) == 1
+    assert spoof[0].context["v2_samples"] == 60
+    assert spoof[0].context["v2_sil0_pct"] > 30.0
+    assert spoof[0].callsign == "EK01"
+
+
+def test_spoof_detector_opt_in_default_off(tmp_path):
+    """Without include_spoof_checks, the detector never runs. Guards
+    against retroactively tagging trace_days on unrelated queries."""
+    db_path = tmp_path / "spoof_off.db"
+    samples = [_make_sample(2, 0, 0) for _ in range(60)]  # all garbage, very spoofy
+    with Database(db_path) as db:
+        _insert_trace_day(db, "89618d", "2026-04-21", samples)
+        db.commit()
+        events = collect_events(db, "89618d")
+    assert [e for e in events if e.event_type == "spoof_bimodal_integrity"] == []
+
+
+def test_spoof_detector_ignores_clean_day(tmp_path):
+    """A realistic trace_day (sil0 = 0%) emits no event."""
+    db_path = tmp_path / "clean.db"
+    samples = [_make_sample(2, 8, 3) for _ in range(100)]
+    with Database(db_path) as db:
+        _insert_trace_day(db, "89618d", "2025-12-01", samples)
+        db.commit()
+        events = collect_events(db, "89618d", include_spoof_checks=True)
+    assert [e for e in events if e.event_type == "spoof_bimodal_integrity"] == []
+
+
+def test_spoof_detector_skips_sparse_day(tmp_path):
+    """Fewer than 25 v2 samples on a day -> detector bails out even if
+    the ratio looks bad; one-off ground-handling bursts should not flag."""
+    db_path = tmp_path / "sparse.db"
+    samples = [_make_sample(2, 0, 0) for _ in range(10)]  # all garbage but sparse
+    with Database(db_path) as db:
+        _insert_trace_day(db, "89618d", "2026-04-08", samples)
+        db.commit()
+        events = collect_events(db, "89618d", include_spoof_checks=True)
+    assert [e for e in events if e.event_type == "spoof_bimodal_integrity"] == []
+
+
+def test_spoof_detector_dedupes_across_aggregators(tmp_path):
+    """Five aggregators that all received the same spoofed broadcast must
+    produce exactly one event for that date, not five."""
+    db_path = tmp_path / "dedup.db"
+    spoofy_samples = [_make_sample(2, 8, 3) for _ in range(40)] + [_make_sample(2, 0, 0) for _ in range(20)]
+    with Database(db_path) as db:
+        for src in ("adsbx", "adsbfi", "adsblol", "airplaneslive", "theairtraffic"):
+            _insert_trace_day(db, "89618d", "2026-04-21", spoofy_samples, source=src)
+        db.commit()
+        events = collect_events(db, "89618d", include_spoof_checks=True)
+    spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
+    assert len(spoof) == 1

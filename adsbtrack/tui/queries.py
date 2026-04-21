@@ -151,6 +151,63 @@ def count_flights(db: Database) -> int:
     return row["n"] if row else 0
 
 
+def count_trace_bytes(db: Database) -> int:
+    """Total size on disk of all ``trace_days`` JSON payloads.
+
+    Used by the status strip to match the concept's `traces 3.4 GB`
+    field. Computed via ``length(trace_json)`` so we don't have to stat
+    the DB file and avoid counting index overhead.
+    """
+    row = db.conn.execute("SELECT COALESCE(SUM(length(trace_json)), 0) AS n FROM trace_days").fetchone()
+    return int(row["n"]) if row else 0
+
+
+@dataclass(frozen=True)
+class JumpMatch:
+    icao: str
+    registration: str | None
+    type_code: str | None
+    description: str | None
+
+
+def search_aircraft(db: Database, query: str, *, limit: int = 8) -> list[JumpMatch]:
+    """Return aircraft matching ``query`` across icao / reg / type / desc.
+
+    Backs the jump-to-hex overlay. Matches are case-insensitive substring.
+    """
+    q = (query or "").strip().lower()
+    sql = (
+        "SELECT s.icao AS icao, "
+        "       COALESCE(r.registration, x.registration) AS registration, "
+        "       COALESCE(r.type_code, x.type_code) AS type_code, "
+        "       COALESCE(r.description, x.type_description) AS description "
+        "  FROM aircraft_stats s "
+        "  LEFT JOIN aircraft_registry r ON r.icao = s.icao "
+        "  LEFT JOIN hex_crossref x ON x.icao = s.icao"
+    )
+    params: list[Any] = []
+    if q:
+        sql += (
+            " WHERE lower(s.icao) LIKE ?"
+            "    OR lower(COALESCE(r.registration, x.registration, '')) LIKE ?"
+            "    OR lower(COALESCE(r.type_code, x.type_code, '')) LIKE ?"
+            "    OR lower(COALESCE(r.description, x.type_description, '')) LIKE ?"
+        )
+        needle = f"%{q}%"
+        params.extend([needle, needle, needle, needle])
+    sql += " ORDER BY s.last_seen DESC LIMIT ?"
+    params.append(limit)
+    return [
+        JumpMatch(
+            icao=r["icao"],
+            registration=r["registration"],
+            type_code=r["type_code"],
+            description=r["description"],
+        )
+        for r in db.conn.execute(sql, params).fetchall()
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Flight timeline
 # ---------------------------------------------------------------------------
@@ -337,9 +394,38 @@ def status_snapshot(db: Database, icao: str) -> dict[str, Any]:
 
     spoof_count_row = db.conn.execute("SELECT COUNT(*) AS n FROM spoofed_broadcasts WHERE icao = ?", (icao,)).fetchone()
 
+    indicators_row = db.conn.execute(
+        """SELECT
+               SUM(CASE WHEN emergency_squawk IS NOT NULL AND emergency_squawk != '' THEN 1 ELSE 0 END) AS emergency_flights,
+               SUM(CASE WHEN had_go_around = 1 THEN 1 ELSE 0 END) AS go_around_flights,
+               SUM(CASE WHEN max_hover_secs IS NOT NULL AND max_hover_secs >= 300 THEN 1 ELSE 0 END) AS long_hover_flights,
+               SUM(CASE WHEN landing_type = 'confirmed' THEN 1 ELSE 0 END) AS confirmed_landings,
+               SUM(CASE WHEN landing_type = 'signal_lost' THEN 1 ELSE 0 END) AS signal_lost_landings,
+               SUM(CASE WHEN landing_type = 'confirmed' AND (destination_icao IS NULL OR destination_icao = '') THEN 1 ELSE 0 END) AS off_airport_landings
+             FROM flights
+            WHERE icao = ?""",
+        (icao,),
+    ).fetchone()
+
+    days_row = db.conn.execute(
+        "SELECT COUNT(DISTINCT date) AS n FROM trace_days WHERE icao = ?",
+        (icao,),
+    ).fetchone()
+
+    stats_dict = dict(stats) if stats else None
+    if stats_dict is not None:
+        stats_dict["days_with_data"] = days_row["n"] if days_row else 0
+        if indicators_row is not None:
+            stats_dict["emergency_flights"] = indicators_row["emergency_flights"] or 0
+            stats_dict["go_around_flights"] = indicators_row["go_around_flights"] or 0
+            stats_dict["long_hover_flights"] = indicators_row["long_hover_flights"] or 0
+            stats_dict["confirmed_landings"] = indicators_row["confirmed_landings"] or 0
+            stats_dict["signal_lost_landings"] = indicators_row["signal_lost_landings"] or 0
+            stats_dict["off_airport_landings"] = indicators_row["off_airport_landings"] or 0
+
     return {
         "icao": icao,
-        "stats": dict(stats) if stats else None,
+        "stats": stats_dict,
         "registry": dict(registry) if registry else None,
         "sources": {
             "total_points": source_row["total_points"] or 0,

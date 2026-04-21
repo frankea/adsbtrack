@@ -18,11 +18,13 @@ from adsbtrack.models import Flight
 from adsbtrack.tui.queries import (
     count_aircraft,
     count_flights,
+    count_trace_bytes,
     distinct_dates_for_icao,
     list_aircraft,
     list_flights,
     list_spoofed_broadcasts,
     load_trace_points,
+    search_aircraft,
     status_snapshot,
 )
 
@@ -183,3 +185,49 @@ def test_load_trace_points_empty_when_no_trace(seeded_db):
 def test_distinct_dates_for_icao(seeded_db):
     with Database(seeded_db) as db:
         assert distinct_dates_for_icao(db, "aaa111") == []
+
+
+def test_count_trace_bytes_empty(seeded_db):
+    with Database(seeded_db) as db:
+        assert count_trace_bytes(db) == 0
+
+
+def test_count_trace_bytes_counts_stored_json(seeded_db):
+    with Database(seeded_db) as db:
+        db.conn.execute(
+            "INSERT INTO trace_days (icao, date, source, timestamp, trace_json, point_count, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("aaa111", "2026-04-20", "adsbx", 1_700_000_000.0, "[[0,40,-74,1000]]", 1, "2026-04-21T00:00:00Z"),
+        )
+        db.commit()
+        assert count_trace_bytes(db) == len("[[0,40,-74,1000]]")
+
+
+def test_search_aircraft_by_icao(seeded_db):
+    with Database(seeded_db) as db:
+        hits = search_aircraft(db, "aaa")
+    assert [h.icao for h in hits] == ["aaa111"]
+
+
+def test_search_aircraft_by_description(seeded_db):
+    with Database(seeded_db) as db:
+        hits = search_aircraft(db, "737")
+    assert any(h.icao == "aaa111" for h in hits)
+
+
+def test_search_aircraft_empty_query_returns_list(seeded_db):
+    with Database(seeded_db) as db:
+        hits = search_aircraft(db, "")
+    assert hits  # at least the seeded aircraft
+
+
+def test_status_snapshot_includes_indicators(seeded_db):
+    with Database(seeded_db) as db:
+        snap = status_snapshot(db, "aaa111")
+    stats = snap["stats"]
+    # Indicators: seeded flight is a clean confirmed landing, no emergencies.
+    assert stats["confirmed_landings"] == 1
+    assert stats["emergency_flights"] == 0
+    assert stats["signal_lost_landings"] == 0
+    assert stats["off_airport_landings"] == 0
+    assert stats["days_with_data"] == 0

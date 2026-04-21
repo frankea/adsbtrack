@@ -1,14 +1,15 @@
 """Main Textual application for the adsbtrack TUI.
 
 Architecture note. The whole app runs inside a single Screen that owns
-a persistent 3-part layout (status strip on top, sidebar on the left,
-content pane on the right). The content pane is a ``ContentSwitcher``
-hosting every view as a sibling Container. Switching views changes the
-current container - the sidebar and status strip never unmount.
+a persistent 4-part layout (status strip on top, sidebar on the left,
+content pane on the right, action bar at the bottom). The content
+pane is a ``ContentSwitcher`` hosting every view as a sibling
+Container. Switching views changes the current container - the
+sidebar, status strip, and action bar never unmount.
 
-This is different from the earlier push_screen()-per-view pattern,
-which worked functionally but erased the persistent chrome every time
-the user switched views.
+The action bar (``ActionBar``) replaces Textual's stock ``Footer`` so
+the chrome matches ``design/ui_kits/tui/index.html`` exactly: a
+monospace kbd-hint strip with a trailing mode indicator on the right.
 """
 
 from __future__ import annotations
@@ -19,29 +20,37 @@ from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.widgets import ContentSwitcher, Footer
+from textual.widgets import ContentSwitcher
 
 from ..db import Database
-from .queries import count_aircraft, count_flights
+from .queries import count_aircraft, count_flights, count_trace_bytes
 from .views.aircraft import AircraftOpenFlights, AircraftView
 from .views.events import EventsView
 from .views.flights import FlightsView
+from .views.jump import HelpScreen, JumpSelected, JumpToHex
 from .views.map import MapView
 from .views.ops import OpsView
 from .views.spoof import SpoofView
 from .views.status import StatusView
-from .widgets import FILTER_BAR_CSS, Sidebar, StatusStrip
+from .widgets import FILTER_BAR_CSS, ActionBar, Sidebar, StatusStrip
 
 _STYLES_PATH = Path(__file__).resolve().parent / "styles" / "app.tcss"
+
+_MODE_NAMES = {
+    "aircraft": "aircraft list",
+    "flights": "flight timeline",
+    "events": "event feed",
+    "spoof": "spoofed broadcasts",
+    "map": "map",
+    "status": "status dashboard",
+    "ops": "operations",
+}
 
 
 class AdsbtrackApp(App):
     """Single-screen workspace over the local SQLite DB the CLI writes."""
 
     CSS_PATH = str(_STYLES_PATH)
-    # Filter-bar styling lives in widgets.py (keyed off `Horizontal.filter-bar`)
-    # because FilterBar is a factory function, not a widget subclass, so it
-    # can't carry its own DEFAULT_CSS. Merged into the app's CSS here.
     CSS = FILTER_BAR_CSS
     TITLE = "adsbtrack"
 
@@ -54,6 +63,7 @@ class AdsbtrackApp(App):
         Binding("6", "goto('status')", "Status"),
         Binding("f", "goto('ops')", "Ops"),
         Binding("slash", "focus_filter", "Filter"),
+        Binding("colon", "jump", "Jump"),
         Binding("q", "quit", "Quit"),
         Binding("question_mark", "help", "Help"),
     ]
@@ -74,14 +84,14 @@ class AdsbtrackApp(App):
         return self._db
 
     def on_mount(self) -> None:
-        flights_n, aircraft_n = 0, 0
+        flights_n, aircraft_n, traces_n = 0, 0, 0
         with contextlib.suppress(Exception):
             flights_n = count_flights(self.db)
             aircraft_n = count_aircraft(self.db)
-        self.query_one(StatusStrip).set_counts(flights=flights_n, aircraft=aircraft_n)
+            traces_n = count_trace_bytes(self.db)
+        self.query_one(StatusStrip).set_counts(flights=flights_n, aircraft=aircraft_n, traces=traces_n)
         self.query_one(Sidebar).set_active("aircraft")
-        # Set the initial active view after all children are mounted so
-        # ContentSwitcher can resolve the id to a real child widget.
+        self.query_one(ActionBar).set_mode(_MODE_NAMES["aircraft"])
         self.query_one(ContentSwitcher).current = "view-aircraft"
 
     def on_unmount(self) -> None:
@@ -92,7 +102,7 @@ class AdsbtrackApp(App):
     # --- composition ---
 
     def compose(self) -> ComposeResult:
-        yield StatusStrip(db_path=str(self._db_path), flights=0, aircraft=0)
+        yield StatusStrip(db_path=str(self._db_path), flights=0, aircraft=0, traces=0)
         with Horizontal(id="app-row"):
             yield Sidebar()
             with Vertical(id="content"):  # noqa: SIM117 -- Textual needs distinct with blocks
@@ -104,7 +114,7 @@ class AdsbtrackApp(App):
                     yield MapView()
                     yield StatusView()
                     yield OpsView()
-        yield Footer()
+        yield ActionBar()
 
     # --- navigation ---
 
@@ -119,21 +129,26 @@ class AdsbtrackApp(App):
         if callable(focus):
             focus()
 
+    def action_jump(self) -> None:
+        self.push_screen(JumpToHex())
+
     def action_help(self) -> None:
-        self.notify(
-            "1/2/3/4/5/6 switch views, f ops, / filter, enter opens flights, esc back, q quit",
-            title="help",
-        )
+        self.push_screen(HelpScreen())
 
     # --- cross-view messages ---
 
     def on_aircraft_open_flights(self, message: AircraftOpenFlights) -> None:
-        self._current_icao = message.icao
-        # Tell the scoped views which ICAO they should be showing.
-        self.query_one(FlightsView).set_icao(message.icao)
-        self.query_one(EventsView).set_icao(message.icao)
-        self.query_one(MapView).set_icao(message.icao)
-        self.query_one(StatusView).set_icao(message.icao)
+        self._open_icao(message.icao)
+
+    def on_jump_selected(self, message: JumpSelected) -> None:
+        self._open_icao(message.icao)
+
+    def _open_icao(self, icao: str) -> None:
+        self._current_icao = icao
+        self.query_one(FlightsView).set_icao(icao)
+        self.query_one(EventsView).set_icao(icao)
+        self.query_one(MapView).set_icao(icao)
+        self.query_one(StatusView).set_icao(icao)
         self._goto("flights")
 
     # --- helpers ---
@@ -141,13 +156,10 @@ class AdsbtrackApp(App):
     def _goto(self, view_id: str) -> None:
         target = f"view-{view_id}"
         switcher = self.query_one(ContentSwitcher)
-        if view_id in {"flights", "events", "map", "status"} and self._current_icao is None and view_id != "events":
+        if view_id in {"flights", "map", "status"} and self._current_icao is None:
             self.bell()
             self.notify("select an aircraft first (press 1)", severity="warning")
             return
-        # EventsView can run against "all aircraft" when no ICAO is set,
-        # but the others need a selection. We already rebuffered above;
-        # still call the setters for freshness.
         if view_id == "flights":
             self.query_one(FlightsView).set_icao(self._current_icao or "")
         elif view_id == "map":
@@ -155,18 +167,19 @@ class AdsbtrackApp(App):
         elif view_id == "status":
             self.query_one(StatusView).set_icao(self._current_icao)
         elif view_id == "events":
-            # Re-run without resetting ICAO so the scope stays consistent with the current selection.
             self.query_one(EventsView).set_icao(self._current_icao)
         elif view_id == "spoof":
             self.query_one(SpoofView).refresh_data()
         switcher.current = target
-        self.query_one(Sidebar).set_active(
+        active_id = (
             view_id
             if view_id in {"aircraft", "flights", "events", "spoof", "map", "status"}
             else "ops"
             if view_id == "ops"
             else self._current_sidebar_id()
         )
+        self.query_one(Sidebar).set_active(active_id)
+        self.query_one(ActionBar).set_mode(_MODE_NAMES.get(active_id, view_id))
 
     def _current_view(self):  # type: ignore[no-untyped-def]
         switcher = self.query_one(ContentSwitcher)

@@ -1,8 +1,8 @@
 /* adsbtrack TUI styles
  * Screen-level and table-level rules only; individual chrome widgets
- * (StatusStrip, Sidebar, PageHeader, FilterBar) carry their own
- * DEFAULT_CSS in adsbtrack/tui/widgets.py so a rule in two places
- * doesn't silently fight itself.
+ * (StatusStrip, Sidebar, PageHeader, FilterBar, ActionBar, Card) carry
+ * their own DEFAULT_CSS in adsbtrack/tui/widgets.py so a rule in two
+ * places doesn't silently fight itself.
  *
  * Keep the palette here in lockstep with design/colors_and_type.css.
  */
@@ -10,11 +10,6 @@
 Screen {
     background: #0b0f14;
     color: #e4ecf3;
-}
-
-Footer {
-    background: #141b23;
-    color: #aab6c2;
 }
 
 #app-row {
@@ -51,12 +46,13 @@ DataTable > .datatable--header {
 }
 
 DataTable > .datatable--cursor {
-    background: #232d39;
+    background: #102b37;
     color: #e4ecf3;
+    text-style: bold;
 }
 
 DataTable > .datatable--hover {
-    background: #1c242e;
+    background: #141a22;
 }
 
 DataTable > .datatable--odd-row {
@@ -64,21 +60,22 @@ DataTable > .datatable--odd-row {
 }
 
 DataTable > .datatable--even-row {
-    background: #11171f;
+    background: #0e131a;
 }
 
-/* Spoof detail pane */
+/* Spoof inline detail panel (violet left border, bg-1). */
 
 .spoof-detail {
     height: auto;
-    max-height: 14;
+    max-height: 16;
     background: #141b23;
     color: #aab6c2;
     border-left: thick #c24bd6;
     padding: 1 2;
+    margin: 0 1 1 1;
 }
 
-/* Ops view */
+/* Ops view: grid of cards, one input field across the top. */
 
 #ops-input {
     background: #0b0f14;
@@ -90,11 +87,129 @@ DataTable > .datatable--even-row {
 }
 
 #ops-suggestions {
-    margin: 1 1;
+    margin: 0 1;
     color: #6b7885;
+    height: auto;
 }
 
-#ops-jobs {
-    padding: 0 1;
+#ops-grid {
+    grid-size: 2 1;
+    grid-gutter: 1 1;
+    padding: 1 1;
+    height: auto;
+}
+
+/* Status dashboard grid. */
+
+#status-grid {
+    grid-size: 4;
+    grid-gutter: 1 1;
+    padding: 1 1;
     height: 1fr;
+    overflow-y: auto;
+}
+
+/* Map HUD overlays: absolutely-positioned labels over the braille canvas. */
+
+#map-body {
+    height: 1fr;
+    width: 1fr;
+    layers: base hud;
+}
+
+MapCanvas {
+    layer: base;
+    height: 1fr;
+    width: 1fr;
+}
+
+.map-hud {
+    layer: hud;
+    background: #141b23;
+    color: #aab6c2;
+    border: solid #222c37;
+    padding: 0 1;
+    height: auto;
+    width: auto;
+}
+
+.map-layers {
+    dock: left;
+    width: 24;
+    margin: 1 0 0 1;
+}
+
+.map-info {
+    dock: right;
+    width: 30;
+    margin: 1 1 0 0;
+}
+
+.map-scalebar {
+    dock: bottom;
+    width: 24;
+    margin: 0 0 1 1;
+}
+
+.map-scrubber {
+    dock: bottom;
+    width: 44;
+    margin: 0 1 1 0;
+    content-align: right middle;
+}
+
+/* Jump-to-hex modal. */
+
+JumpToHex {
+    align: center top;
+}
+
+#jump-dialog {
+    width: 60%;
+    min-width: 48;
+    max-width: 96;
+    height: auto;
+    background: #141b23;
+    border: solid #2d3946;
+    padding: 0;
+    margin-top: 6;
+}
+
+#jump-dialog > .jump-title {
+    height: 1;
+    background: #141b23;
+    color: #6b7885;
+    padding: 0 1;
+    border-bottom: solid #222c37;
+}
+
+#jump-dialog > Input {
+    background: #141b23;
+    color: #e4ecf3;
+    border: none;
+    padding: 0 1;
+}
+
+#jump-dialog > DataTable {
+    height: auto;
+    max-height: 12;
+    background: #141b23;
+    border-top: solid #222c37;
+}
+
+/* Help overlay. */
+
+HelpScreen {
+    align: center middle;
+}
+
+#help-dialog {
+    width: 60%;
+    min-width: 48;
+    max-width: 96;
+    height: auto;
+    background: #141b23;
+    border: solid #2d3946;
+    padding: 1 2;
+    color: #aab6c2;
 }

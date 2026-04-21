@@ -1,0 +1,239 @@
+/* adsbtrack TUI styles
+ * Mirrors design/colors_and_type.css tokens in Textual's CSS dialect.
+ * Any change here should also land in design/colors_and_type.css so
+ * the TUI and the static GUI export stay visually aligned.
+ */
+
+Screen {
+    background: #0b0f14;
+    color: #e4ecf3;
+}
+
+Header {
+    background: #141b23;
+    color: #e4ecf3;
+    dock: top;
+    height: 1;
+}
+
+Footer {
+    background: #141b23;
+    color: #aab6c2;
+    dock: bottom;
+    height: 1;
+}
+
+/* Status strip below the header with DB + counts + active job */
+#status-strip {
+    dock: top;
+    height: 1;
+    padding: 0 1;
+    background: #141b23;
+    color: #aab6c2;
+    border-bottom: solid #222c37;
+}
+
+#status-strip .brand {
+    color: #e4ecf3;
+    text-style: bold;
+}
+
+#status-strip .job {
+    color: #f2b136;
+}
+
+#status-strip .clock {
+    color: #4fb8e0;
+}
+
+/* View switcher (left sidebar) */
+#view-switcher {
+    dock: left;
+    width: 22;
+    background: #141b23;
+    border-right: solid #222c37;
+    padding: 0;
+}
+
+ListView#view-switcher > ListItem {
+    padding: 0 1;
+    background: #141b23;
+}
+
+ListView#view-switcher > ListItem.--highlight {
+    background: #1c242e;
+    color: #4fb8e0;
+}
+
+ListView#view-switcher > ListItem > Label {
+    padding: 0 1;
+}
+
+/* Content pane */
+#content {
+    padding: 0;
+}
+
+/* Filter bar */
+FilterBar {
+    height: 1;
+    background: #0b0f14;
+    border-bottom: solid #222c37;
+}
+
+FilterBar > Label.prompt {
+    width: 3;
+    padding: 0 1;
+    color: #4fb8e0;
+    text-style: bold;
+}
+
+FilterBar > Input {
+    background: #0b0f14;
+    color: #e4ecf3;
+    border: none;
+    padding: 0 1;
+}
+
+FilterBar > Label.count {
+    width: auto;
+    padding: 0 1;
+    color: #6b7885;
+}
+
+/* Data tables */
+DataTable {
+    background: #0b0f14;
+    color: #e4ecf3;
+}
+
+DataTable > .datatable--header {
+    background: #141b23;
+    color: #6b7885;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #232d39;
+    color: #e4ecf3;
+}
+
+DataTable > .datatable--hover {
+    background: #1c242e;
+}
+
+/* Semantic accent classes for inline spans */
+.ok { color: #4ec07a; }
+.cyan { color: #4fb8e0; }
+.amber { color: #f2b136; }
+.red { color: #e0433a; }
+.violet { color: #c24bd6; }
+.magenta { color: #d47bd4; }
+.dim { color: #6b7885; }
+
+/* Per-page headers */
+PageHeader {
+    dock: top;
+    height: 1;
+    padding: 0 1;
+    background: #0b0f14;
+    border-bottom: solid #222c37;
+}
+
+PageHeader .title {
+    color: #e4ecf3;
+    text-style: bold;
+}
+
+PageHeader .crumb {
+    color: #6b7885;
+}
+
+/* Event feed rows */
+EventRow {
+    padding: 0 1;
+    border-bottom: solid #222c37;
+}
+
+EventRow.emergency {
+    color: #e0433a;
+}
+
+EventRow.unusual {
+    color: #f2b136;
+}
+
+EventRow.spoof {
+    color: #c24bd6;
+}
+
+/* Spoof detail JSON expand/collapse */
+SpoofDetail {
+    background: #141b23;
+    border-left: solid #c24bd6;
+    padding: 1;
+}
+
+/* Status dashboard card */
+StatusCard {
+    border: solid #222c37;
+    padding: 0 1;
+    margin: 0 1 1 0;
+    height: auto;
+}
+
+StatusCard .label {
+    color: #6b7885;
+    text-style: bold;
+}
+
+StatusCard .value {
+    color: #e4ecf3;
+}
+
+/* Map canvas: text grid of trace points coloured by source */
+MapView {
+    background: #0b0f14;
+    color: #6b7885;
+}
+
+MapView .src-adsb { color: #4ec07a; }
+MapView .src-mlat { color: #6b7885; }
+MapView .src-tisb { color: #f2b136; }
+MapView .src-adsr { color: #4fb8e0; }
+MapView .src-adsc { color: #c24bd6; }
+
+/* Ops cards */
+OpsCard {
+    border: solid #222c37;
+    padding: 1;
+    margin: 0 1 1 0;
+    height: auto;
+}
+
+OpsCard .cmd {
+    color: #4fb8e0;
+    text-style: bold;
+}
+
+OpsCard .progress {
+    color: #f2b136;
+}
+
+OpsCard .status-ok {
+    color: #4ec07a;
+}
+
+OpsCard .status-error {
+    color: #e0433a;
+}
+
+/* Help overlay */
+HelpOverlay {
+    background: #141b23;
+    border: thick #4fb8e0;
+    padding: 1 2;
+    width: 60;
+    height: auto;
+    align: center middle;
+}

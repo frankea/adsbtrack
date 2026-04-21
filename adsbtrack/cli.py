@@ -1462,5 +1462,22 @@ def mcp_serve(db_path):
     serve(Path(db_path))
 
 
+@cli.command()
+@click.option("--db", "db_path", default="adsbtrack.db", help="SQLite database path to open in the TUI.")
+def tui(db_path):
+    """Launch the Textual TUI over the local SQLite database.
+
+    Six views (aircraft list, flight timeline, event feed, spoofed
+    broadcasts, map, status) plus an ops pane that wraps DB-writing
+    commands. Requires the 'tui' extra: `uv sync --extra tui`.
+    """
+    try:
+        from .tui import AdsbtrackApp
+    except ImportError as e:
+        raise click.ClickException("TUI extra is not installed. Run `uv sync --extra tui` to add textual.") from e
+
+    AdsbtrackApp(Path(db_path)).run()
+
+
 if __name__ == "__main__":
     cli()

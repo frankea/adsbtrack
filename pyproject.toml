@@ -52,6 +52,11 @@ faa = [
 mcp = [
     "mcp>=1.0",
 ]
+# Textual TUI surface. Install with `uv sync --extra tui`; the app is
+# launched via `adsbtrack tui --db <path>`.
+tui = [
+    "textual>=0.80",
+]
 
 [tool.ruff]
 target-version = "py312"

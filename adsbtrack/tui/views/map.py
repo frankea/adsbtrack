@@ -1,16 +1,20 @@
 """Text-mode map view: trace points rendered into a character grid.
 
-Textual has no native map widget. We project the lat/lon of the loaded
-trace into an 80x24 character grid and colour each cell by the readsb
-source tag. Good enough for at-a-glance trace inspection; real
-cartography lives in the GUI export.
+Textual has no native map widget, so we project trace lat/lon into a
+character grid coloured by readsb source tag. The canvas sizes itself
+to the available pane dimensions and re-projects on resize - the old
+fixed 80x24 grid left most of a wide terminal black.
+
+Real cartography lives in the GUI export (Leaflet via
+``adsbtrack gui``). This is the TUI's at-a-glance trace shape.
 """
 
 from __future__ import annotations
 
+from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.widgets import Static
+from textual.widget import Widget
 
 from ..queries import TracePoint, distinct_dates_for_icao, load_trace_points
 from ..widgets import (
@@ -21,9 +25,6 @@ from ..widgets import (
     FG_2,
     PageHeader,
 )
-
-_GRID_W = 80
-_GRID_H = 24
 
 _SOURCE_COLOUR = {
     "adsb_icao": "#4ec07a",
@@ -38,11 +39,9 @@ _SOURCE_COLOUR = {
 }
 
 
-def _project_points(
-    points: list[TracePoint],
-) -> tuple[dict[tuple[int, int], str], tuple[float, float, float, float]]:
-    if not points:
-        return {}, (0.0, 0.0, 0.0, 0.0)
+def _project_points(points: list[TracePoint], width: int, height: int) -> dict[tuple[int, int], str]:
+    if not points or width <= 0 or height <= 0:
+        return {}
     lats = [p.lat for p in points]
     lons = [p.lon for p in points]
     lat_min, lat_max = min(lats), max(lats)
@@ -53,19 +52,19 @@ def _project_points(
         lon_max = lon_min + 0.0001
     grid: dict[tuple[int, int], str] = {}
     for p in points:
-        col = int((p.lon - lon_min) / (lon_max - lon_min) * (_GRID_W - 1))
-        row = _GRID_H - 1 - int((p.lat - lat_min) / (lat_max - lat_min) * (_GRID_H - 1))
-        col = max(0, min(_GRID_W - 1, col))
-        row = max(0, min(_GRID_H - 1, row))
+        col = int((p.lon - lon_min) / (lon_max - lon_min) * (width - 1))
+        row = height - 1 - int((p.lat - lat_min) / (lat_max - lat_min) * (height - 1))
+        col = max(0, min(width - 1, col))
+        row = max(0, min(height - 1, row))
         grid[(row, col)] = p.source
-    return grid, (lat_min, lat_max, lon_min, lon_max)
+    return grid
 
 
-def _render_grid(grid: dict[tuple[int, int], str]) -> str:
+def _render_grid(grid: dict[tuple[int, int], str], width: int, height: int) -> str:
     lines: list[str] = []
-    for r in range(_GRID_H):
+    for r in range(height):
         row_chars: list[str] = []
-        for c in range(_GRID_W):
+        for c in range(width):
             src = grid.get((r, c))
             if src is None:
                 row_chars.append(" ")
@@ -76,6 +75,56 @@ def _render_grid(grid: dict[tuple[int, int], str]) -> str:
     return "\n".join(lines)
 
 
+class MapCanvas(Widget):
+    """Adaptive text-mode trace canvas.
+
+    Reads its own ``self.size`` at render time so the grid fills
+    whatever width/height the containing pane offers. Repaints on
+    resize via ``on_resize``.
+    """
+
+    DEFAULT_CSS = """
+    MapCanvas {
+        height: 1fr;
+        width: 1fr;
+        background: #0b0f14;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__(id="map-canvas")
+        self._points: list[TracePoint] = []
+        self._bbox: tuple[float, float, float, float] | None = None
+
+    def set_points(self, points: list[TracePoint]) -> None:
+        self._points = points
+        if points:
+            lats = [p.lat for p in points]
+            lons = [p.lon for p in points]
+            self._bbox = (min(lats), max(lats), min(lons), max(lons))
+        else:
+            self._bbox = None
+        self.refresh()
+
+    def on_resize(self) -> None:
+        self.refresh()
+
+    def render(self) -> Text:
+        w, h = self.size.width, self.size.height
+        # Reserve the bottom row for the legend line so points do not
+        # overlap it.
+        grid_h = max(1, h - 1)
+        if not self._points or w <= 2 or grid_h <= 2:
+            return Text.from_markup(f"[{FG_2}]no trace points available (resize the pane if this is wrong)[/]")
+        grid = _project_points(self._points, w, grid_h)
+        body = _render_grid(grid, w, grid_h)
+        legend = (
+            f"[{ACCENT_OK}]* adsb[/]   [{FG_2}]* mlat[/]   [#f2b136]* tisb[/]   "
+            f"[{ACCENT_CYAN}]* adsr[/]   [{ACCENT_VIOLET}]* adsc[/]"
+        )
+        return Text.from_markup(f"{body}\n{legend}")
+
+
 class MapView(Vertical):
     """Trace playback for one aircraft, one date."""
 
@@ -84,11 +133,11 @@ class MapView(Vertical):
         self._icao: str | None = None
         self._date: str | None = None
         self._header = PageHeader("map", crumb="select an aircraft first", widget_id="map-header")
-        self._body = Static(" ", id="map-body")
+        self._canvas = MapCanvas()
 
     def compose(self) -> ComposeResult:
         yield self._header
-        yield self._body
+        yield self._canvas
 
     def set_icao(self, icao: str | None) -> None:
         self._icao = icao
@@ -97,30 +146,30 @@ class MapView(Vertical):
 
     def refresh_data(self) -> None:
         if self._icao is None:
-            self._body.update(f"[{FG_2}]no aircraft selected. press 1 and pick one.[/]")
+            self._canvas.set_points([])
             self._header.set_crumb("select an aircraft first")
+            self._header.set_trailing("")
             return
         if self._date is None:
             dates = distinct_dates_for_icao(self.app.db, self._icao)
             if not dates:
-                self._body.update(f"[{FG_2}]no trace data for {self._icao}[/]")
+                self._canvas.set_points([])
                 self._header.set_title(self._icao)
                 self._header.set_crumb("no trace data")
+                self._header.set_trailing("")
                 return
             self._date = dates[0]
         points = load_trace_points(self.app.db, self._icao, self._date)
-        grid, bounds = _project_points(points)
-        if not grid:
-            self._body.update(f"[{FG_2}]no trace points on {self._date} for {self._icao}[/]")
+        self._canvas.set_points(points)
+        if not points:
+            self._header.set_title(self._icao)
+            self._header.set_crumb(f"map / {self._date} (no trace points)")
+            self._header.set_trailing("")
             return
-        lat_min, lat_max, lon_min, lon_max = bounds
-        legend = (
-            f"[{FG_2}]bbox[/] ({lat_min:.3f},{lon_min:.3f})-({lat_max:.3f},{lon_max:.3f})   "
-            f"[{FG_2}]points[/] [{FG_0}]{len(points):,}[/]\n"
-            f"[{ACCENT_OK}]* adsb[/]   [{FG_2}]* mlat[/]   [#f2b136]* tisb[/]   "
-            f"[{ACCENT_CYAN}]* adsr[/]   [{ACCENT_VIOLET}]* adsc[/]\n"
-        )
-        self._body.update(legend + "\n" + _render_grid(grid))
+        lats = [p.lat for p in points]
+        lons = [p.lon for p in points]
         self._header.set_title(self._icao)
         self._header.set_crumb(f"map / {self._date}")
-        self._header.set_trailing(f"{len(points):,} points")
+        self._header.set_trailing(
+            f"{len(points):,} points   bbox ({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
+        )

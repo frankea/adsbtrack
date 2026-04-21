@@ -297,15 +297,28 @@ class Sidebar(Label):
         lines.extend(self._render_items(_SESSION, highlight=None))
         return Text.from_markup("\n".join(lines))
 
-    @staticmethod
-    def _render_items(items: list[tuple[str, str, str]], *, highlight: str | None) -> list[str]:
+    # Sidebar width is 24 cols, padding 1 on each side -> 22 usable.
+    # Layout per row: marker (2) + label + shortcut-box (3) = 22.
+    _LABEL_WIDTH = 17
+    _ROW_WIDTH = 22
+
+    @classmethod
+    def _render_items(cls, items: list[tuple[str, str, str]], *, highlight: str | None) -> list[str]:
         out: list[str] = []
         for view_id, label, shortcut in items:
             is_active = highlight is not None and view_id == highlight
             label_colour = FG_0 if is_active else FG_1
-            marker = f"[{ACCENT_CYAN}]|[/] " if is_active else "  "
-            shortcut_cell = f" [{FG_2}]{shortcut}[/]" if shortcut else ""
-            out.append(f"{marker}[{label_colour}]{label:<20}[/]{shortcut_cell}")
+            marker = f"[{ACCENT_CYAN}]│[/] " if is_active else "  "
+            # Truncate to available width if a label is unexpectedly long.
+            label_text = label[: cls._LABEL_WIDTH]
+            shortcut_cell = (
+                f"[{FG_2} on #1c242e] {shortcut} [/]"
+                if shortcut
+                else "   "  # Same width as the pill so all rows line up.
+            )
+            # Pad label out so the shortcut lands at the right edge.
+            padded = f"{label_text:<{cls._LABEL_WIDTH}}"
+            out.append(f"{marker}[{label_colour}]{padded}[/]{shortcut_cell}")
         return out
 
 

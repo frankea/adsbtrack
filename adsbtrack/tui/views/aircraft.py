@@ -32,15 +32,20 @@ def _fmt_last_seen(s: str | None) -> Text:
 
 
 def _fmt_flags(row: AircraftRow) -> Text:
+    """Render the trailing FLAGS cell.
+
+    SPF is a bare badge because the count already has its own column
+    to the left; doubling the number would be redundant and noisier
+    than the design.
+    """
     parts: list[str] = []
     if row.is_military:
         parts.append(pill_markup("MIL", ACCENT_VIOLET))
     if row.spoof_count:
-        parts.append(pill_markup(f"SPF {row.spoof_count}", ACCENT_VIOLET))
+        parts.append(pill_markup("SPF", ACCENT_VIOLET))
     if "HELI" in row.flags.split():
         parts.append(pill_markup("HELI", ACCENT_AMBER))
-    text = Text.from_markup(" ".join(parts)) if parts else dash()
-    return text
+    return Text.from_markup(" ".join(parts)) if parts else dash()
 
 
 class AircraftOpenFlights(Message):
@@ -101,7 +106,7 @@ class AircraftView(Vertical):
             self._table.add_row(
                 cell(row.icao, style=ACCENT_CYAN),
                 cell(row.display_reg, style=FG_0),
-                cell(self._describe_type(row), style=FG_1),
+                cell(row.display_type, style=FG_1),
                 num_cell(f"{row.total_flights:,}", style=FG_0),
                 num_cell(f"{row.total_hours:.1f}", style=FG_0),
                 cell(row.display_home, style=FG_0),
@@ -130,12 +135,3 @@ class AircraftView(Vertical):
 
     def focus_filter(self) -> None:
         self._filter.input_widget.focus()
-
-    # --- helpers ---
-
-    @staticmethod
-    def _describe_type(row: AircraftRow) -> str:
-        """Prefer the longer description if the caller's query carried one, else fall back
-        to the type code. The queries layer only ships type_code today, but the cell is
-        styled in the softer FG_1 so it blends with the rest of the row."""
-        return row.type_code or "-"

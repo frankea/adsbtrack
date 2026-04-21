@@ -1477,6 +1477,53 @@ def test_insert_flight_squawk_signals_default_to_null(db) -> None:
     assert row["primary_squawk"] is None
 
 
+def test_flights_table_has_expanded_source_columns(db) -> None:
+    cols = _columns(db, "flights")
+    assert {"other_pct", "adsc_pct"} <= cols
+
+
+def test_insert_flight_persists_expanded_source_percents(db) -> None:
+    f = Flight(
+        icao="spf001",
+        takeoff_time=datetime(2026, 4, 21, 0, 49),
+        takeoff_lat=25.25,
+        takeoff_lon=55.38,
+        takeoff_date="2026-04-21",
+        adsb_pct=100.0,
+        mlat_pct=0.0,
+        tisb_pct=0.0,
+        other_pct=0.0,
+        adsc_pct=0.0,
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT adsb_pct, mlat_pct, tisb_pct, other_pct, adsc_pct FROM flights WHERE icao = ?",
+        ("spf001",),
+    ).fetchone()
+    assert row["adsb_pct"] == 100.0
+    assert row["other_pct"] == 0.0
+    assert row["adsc_pct"] == 0.0
+
+
+def test_insert_flight_expanded_source_columns_default_to_null(db) -> None:
+    f = Flight(
+        icao="spf002",
+        takeoff_time=datetime(2026, 4, 21, 0, 49),
+        takeoff_lat=25.25,
+        takeoff_lon=55.38,
+        takeoff_date="2026-04-21",
+    )
+    db.insert_flight(f)
+    db.commit()
+    row = db.conn.execute(
+        "SELECT other_pct, adsc_pct FROM flights WHERE icao = ?",
+        ("spf002",),
+    ).fetchone()
+    assert row["other_pct"] is None
+    assert row["adsc_pct"] is None
+
+
 def test_navaids_table_schema(tmp_path):
     from adsbtrack.db import Database
 

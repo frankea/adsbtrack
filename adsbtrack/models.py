@@ -176,11 +176,17 @@ class Flight:
 
     # --- Position source mix (readsb type/src field) ---
     # Per-flight percentage of trace points whose position_source matched
-    # each bucket. Remaining points (e.g. "other", "mode_s", "adsc",
-    # unknown) are not represented here, so these three need not sum to 100.
+    # each bucket. other_pct covers any value that didn't match the named
+    # buckets (e.g. readsb "other" for ADS-R rebroadcasts, "mode_s" for
+    # Mode-S-only surveillance). adsc_pct breaks out CPDLC/ADS-C oceanic
+    # reports separately so they don't dilute the "other" bucket. The
+    # five percentages need not sum to 100 because points with no
+    # position_source tag are not counted.
     mlat_pct: float | None = None
     tisb_pct: float | None = None
     adsb_pct: float | None = None
+    other_pct: float | None = None
+    adsc_pct: float | None = None
 
     # --- ACARS OOOI timestamps (ISO 8601 UTC) ---
     # Populated by acars.fetch_acars when an OOOI-bearing ACARS message

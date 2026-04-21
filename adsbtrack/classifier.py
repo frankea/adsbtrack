@@ -102,11 +102,15 @@ class FlightMetrics:
     sources: set[str] = field(default_factory=set)
     # Position source tallies (readsb type/src field). Every recorded point
     # is bucketed by its position_source so per-flight percentages line up
-    # with data_points. Values outside ADS-B / MLAT / TIS-B (e.g. "other",
-    # "mode_s", "adsc", None) fall through and are not counted here.
+    # with data_points. adsc_points covers CPDLC/ADS-C oceanic reports;
+    # other_points is the catch-all for anything the named buckets don't
+    # claim (e.g. readsb's "other" and "mode_s"). Points with no source
+    # tag are not counted.
     adsb_points: int = 0
     mlat_points: int = 0
     tisb_points: int = 0
+    other_points: int = 0
+    adsc_points: int = 0
     # Dual-track raw and persisted peaks. The raw value is updated every
     # point (warmup fallback). The persisted value is updated only when
     # the persistence filter has >= min_samples points in its window.
@@ -302,6 +306,10 @@ class FlightMetrics:
                 self.mlat_points += 1
             elif src.startswith("tisb_"):
                 self.tisb_points += 1
+            elif src == "adsc":
+                self.adsc_points += 1
+            else:
+                self.other_points += 1
         prev_ts = self.last_point_ts
         if self.first_point_ts is None:
             self.first_point_ts = ts

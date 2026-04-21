@@ -1022,17 +1022,22 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flight.baro_error_points = metrics.baro_error_points
 
         # Position source mix. When data_points is zero or the trace carried
-        # no source tags, leave all three at 0.0 so downstream queries can
-        # rely on non-null values.
+        # no source tags, leave every bucket at 0.0 so downstream queries
+        # can rely on non-null values. other_pct covers unknown/Mode-S-only
+        # rebroadcasts; adsc_pct breaks out CPDLC/ADS-C oceanic reports.
         total = metrics.data_points
         if total > 0:
             flight.mlat_pct = round(metrics.mlat_points * 100.0 / total, 2)
             flight.tisb_pct = round(metrics.tisb_points * 100.0 / total, 2)
             flight.adsb_pct = round(metrics.adsb_points * 100.0 / total, 2)
+            flight.other_pct = round(metrics.other_points * 100.0 / total, 2)
+            flight.adsc_pct = round(metrics.adsc_points * 100.0 / total, 2)
         else:
             flight.mlat_pct = 0.0
             flight.tisb_pct = 0.0
             flight.adsb_pct = 0.0
+            flight.other_pct = 0.0
+            flight.adsc_pct = 0.0
 
         # v3 derived features - must run AFTER classify_landing + airport
         # matching so mission/loiter/cruise/day-night all see final values.

@@ -108,6 +108,7 @@ Extracted flights with airport matching, quality classification, confidence scor
 | origin_helipad_id | INTEGER | FK to helipads table (takeoff within 200 m of a helipad centroid) |
 | destination_helipad_id | INTEGER | FK to helipads table (landing within 200 m of a helipad centroid) |
 | type_override | TEXT | Per-flight type override when cruise envelope indicates a different type (e.g. MIL_FW for ae69xx H60 ICAOs flying fixed-wing profiles) |
+| adsb_pct / mlat_pct / tisb_pct / adsc_pct / other_pct | REAL | Per-flight percentage of trace points whose `position_source` matched each bucket. `adsc_pct` covers CPDLC/ADS-C oceanic reports; `other_pct` is the catch-all for everything the named buckets don't claim (readsb `other`/`mode_s`). Points with no tag contribute to none of the buckets, so the five percentages need not sum to 100. See docs/features.md. |
 | navaid_track | TEXT | JSON array of navaid alignment segments for this flight; see `adsbtrack/navaid_alignment.py`. NULL when no segment qualified. Each entry: `{navaid_ident, start_ts, end_ts, min_distance_nm}`. |
 
 ## aircraft_registry

@@ -123,6 +123,8 @@ CREATE TABLE IF NOT EXISTS flights (
     mlat_pct REAL,
     tisb_pct REAL,
     adsb_pct REAL,
+    other_pct REAL,
+    adsc_pct REAL,
     landing_anchor_method TEXT,
     aligned_runway TEXT,
     aligned_seconds REAL,
@@ -572,6 +574,10 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("mlat_pct", "REAL"),
         ("tisb_pct", "REAL"),
         ("adsb_pct", "REAL"),
+        # Expanded source buckets: other covers ADS-R / Mode-S-only
+        # rebroadcasts; adsc covers CPDLC/ADS-C oceanic reports.
+        ("other_pct", "REAL"),
+        ("adsc_pct", "REAL"),
         # ACARS OOOI timestamps (ISO 8601, UTC) populated from airframes.io
         # messages with labels 14 / 44 / 4T that fall in the flight window.
         ("acars_out", "TEXT"),
@@ -791,7 +797,7 @@ class Database:
                 origin_helipad_id, destination_helipad_id,
                 type_override,
                 turnaround_category, is_first_observed_flight, is_last_observed_flight,
-                mlat_pct, tisb_pct, adsb_pct,
+                mlat_pct, tisb_pct, adsb_pct, other_pct, adsc_pct,
                 acars_out, acars_off, acars_on, acars_in, landing_anchor_method,
                 aligned_runway, aligned_seconds, aligned_min_offset_m, takeoff_runway,
                 had_go_around, pattern_cycles, squawks_observed, had_emergency, primary_squawk, navaid_track)
@@ -813,7 +819,7 @@ class Database:
                        ?, ?, ?, ?, ?,
                        ?, ?, ?,
                        ?, ?, ?,
-                       ?, ?, ?, ?, ?,
+                       ?, ?, ?, ?, ?, ?, ?,
                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 flight.icao,
@@ -902,6 +908,8 @@ class Database:
                 flight.mlat_pct,
                 flight.tisb_pct,
                 flight.adsb_pct,
+                flight.other_pct,
+                flight.adsc_pct,
                 flight.acars_out,
                 flight.acars_off,
                 flight.acars_on,

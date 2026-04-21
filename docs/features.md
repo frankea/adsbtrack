@@ -104,11 +104,13 @@ Both tables are surfaced in the `status` command and queryable directly.
 
 ## Position source breakdown
 
-Every point in a readsb trace carries a source type (`adsb_icao`, `mlat`, `tisb_icao`, `other`, `adsc`, ...). `classifier.FlightMetrics` tallies three buckets per flight -- `adsb_points`, `mlat_points`, `tisb_points` -- and the parser writes `adsb_pct`, `mlat_pct`, `tisb_pct` on the flight row at close time. Points outside those three buckets (e.g. `other`, `mode_s`, `adsc`, NULL) are not counted, so the three percentages do not necessarily sum to 100.
+Every point in a readsb trace carries a source type (`adsb_icao`, `mlat`, `tisb_icao`, `other`, `adsc`, ...). `classifier.FlightMetrics` tallies five buckets per flight -- `adsb_points`, `mlat_points`, `tisb_points`, `adsc_points`, `other_points` -- and the parser writes `adsb_pct`, `mlat_pct`, `tisb_pct`, `adsc_pct`, `other_pct` on the flight row at close time. `adsc_pct` covers CPDLC/ADS-C oceanic reports; `other_pct` is the catch-all for anything the named buckets don't claim (readsb's own `other` and `mode_s` tags land here). Points with no source tag contribute to none of the buckets, so the five percentages need not sum to 100.
 
 The point source is read from trace element `point[9]` in 14-element rows and from `detail["type"]` in 9-element rows (they match in every observed sample). OpenSky-synthesized traces under 10 elements with no `detail` object get NULL sources and contribute no percentage.
 
-`status` renders a "Position sources" block showing the three percentages, weighted by flight `data_points`, whenever any flight in the dataset has at least one tagged point.
+A flight whose `adsb_pct` is high (>90) while `mlat_pct` and `other_pct` are both 0 across hours of claimed cruise is a suspicious signature: real en-route traffic picks up MLAT samples from multi-receiver overlap and `other` samples from ADS-R / Mode-S rebroadcasts. Pure-ADS-B-only flights far from any feeder are either out of coverage or (combined with other tells) spoofed.
+
+`status` renders a "Position sources" block showing the five percentages, weighted by flight `data_points`, whenever any flight in the dataset has at least one tagged point.
 
 ## ACARS OOOI on flights
 

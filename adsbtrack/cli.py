@@ -731,13 +731,19 @@ def status(hex_code, db_path):
 
         # Position source breakdown (readsb type/src field). Weight each
         # flight's percentage by its data_points so the total matches the
-        # true per-point mix rather than an unweighted average.
+        # true per-point mix rather than an unweighted average. Prefers the
+        # explicit other_pct/adsc_pct columns when present; legacy rows that
+        # only carried adsb/mlat/tisb are reconstructed via 100-minus-sum.
         src_row = db.conn.execute(
             """SELECT
                    SUM(data_points) AS total_points,
                    SUM(adsb_pct * data_points) / NULLIF(SUM(data_points), 0) AS adsb,
                    SUM(mlat_pct * data_points) / NULLIF(SUM(data_points), 0) AS mlat,
-                   SUM(tisb_pct * data_points) / NULLIF(SUM(data_points), 0) AS tisb
+                   SUM(tisb_pct * data_points) / NULLIF(SUM(data_points), 0) AS tisb,
+                   SUM(other_pct * data_points) / NULLIF(SUM(data_points), 0) AS other,
+                   SUM(adsc_pct * data_points) / NULLIF(SUM(data_points), 0) AS adsc,
+                   SUM(CASE WHEN other_pct IS NOT NULL OR adsc_pct IS NOT NULL
+                            THEN data_points ELSE 0 END) AS typed_points
                FROM flights
                WHERE icao = ? AND data_points > 0
                  AND (adsb_pct IS NOT NULL OR mlat_pct IS NOT NULL OR tisb_pct IS NOT NULL)""",
@@ -747,11 +753,22 @@ def status(hex_code, db_path):
             adsb_pct = src_row["adsb"] or 0.0
             mlat_pct = src_row["mlat"] or 0.0
             tisb_pct = src_row["tisb"] or 0.0
-            other_pct = max(0.0, 100.0 - adsb_pct - mlat_pct - tisb_pct)
+            # Use explicit adsc/other columns when every contributing row has
+            # them populated; otherwise fall back to 100-minus-sum so legacy
+            # rows still render a non-negative Other bucket.
+            have_explicit = src_row["typed_points"] and src_row["typed_points"] >= src_row["total_points"]
+            if have_explicit:
+                adsc_pct = src_row["adsc"] or 0.0
+                other_pct = src_row["other"] or 0.0
+            else:
+                adsc_pct = 0.0
+                other_pct = max(0.0, 100.0 - adsb_pct - mlat_pct - tisb_pct)
             console.print("\n[bold]Position sources:[/]\n")
             console.print(f"  ADS-B:  {adsb_pct:>5.1f}%")
             console.print(f"  MLAT:   {mlat_pct:>5.1f}%")
             console.print(f"  TIS-B:  {tisb_pct:>5.1f}%")
+            if adsc_pct > 0.05:
+                console.print(f"  ADS-C:  {adsc_pct:>5.1f}%")
             if other_pct > 0.05:
                 console.print(f"  Other:  {other_pct:>5.1f}%")
 

@@ -2,6 +2,103 @@
 
 ADS-B Exchange and sibling trackers store daily trace files for every aircraft they've seen. Each trace is a series of timestamped position reports with lat/lon, barometric altitude, ground speed, vertical rate, and geometric altitude. The fetcher downloads these day by day and stores them in SQLite.
 
+## Async fetcher
+
+`adsbtrack/fetcher.py::fetch_traces` is an async implementation wrapped in a sync-compatible public signature. Bounded concurrency via `asyncio.Semaphore(Config.fetch_concurrency)` (default 4, overridable with `--concurrency` on `fetch`). `concurrency=1` is byte-identical to the old serial path.
+
+**Rate limiting on request starts, not completions.** A single `asyncio.Lock` serializes slot reservations so consecutive HTTP starts are at least `current_delay` seconds apart regardless of how many workers are in flight. Per-worker delays would let N workers each burn through a bucket-worth of requests in parallel and trip the CDN's rate limiter; the shared lock enforces the guarantee the user asked for with `--rate`.
+
+**429 backoff.** On HTTP 429 the worker takes the lock, doubles `current_delay` (capped at `Config.rate_limit_max = 30.0 s`), resets the `successes_since_backoff` counter, and sleeps any `Retry-After` hint inside the lock so queued workers pick up the new delay on their next slot acquisition. After `Config.rate_limit_recovery = 10` consecutive successes the delay halves back down toward `Config.rate_limit`.
+
+**403 circuit breaker.** A per-day outcome map plus a reverse-scan of `sorted_days` trips a `RuntimeError` when the three most-recently-completed days (skipping in-flight ones) all exhausted their retry budget on 403. Any non-403 terminal outcome on an intervening day resets the streak. Without this, a CDN that flips from 429 to 403 (bot-detection escalation) would silently churn through the entire range.
+
+**DB writes serialized via a single `_db_writer` task** draining an `asyncio.Queue`. Each day's `insert_trace_day` + `insert_fetch_log` + `commit` is atomic; SIGINT mid-run either commits both rows or neither. Rich `Progress.advance` runs inside the writer task after commit so the progress bar reflects durable state, never "optimistic" counters from workers that later failed.
+
+### Rate-limit floor is mathematical
+
+Wall time has a hard lower bound from the rate-limit lock alone:
+
+```
+min_wall_time = (N_days - 1) * rate_limit + last_request_latency
+```
+
+For 50 days at `rate_limit = 0.5`, that's `~25.0 s` at any concurrency. This is not a pathology to debug - it's the guarantee the lock provides. Parallelism can only help when per-request latency exceeds `rate_limit` and workers can overlap in-flight *between* the enforced start gaps. On a CDN with sub-100 ms responses and `rate_limit = 0.5`, `concurrency=1` and `concurrency=4` will produce indistinguishable wall times: rate limit is the binding constraint, not concurrency.
+
+### Benchmark protocol
+
+Use `python -m adsbtrack.bench` (not the CLI's `fetch` command) to time fetching in isolation. The bench module skips `ensure_airports` and the post-fetch auto-extract, prints a self-documenting `[bench]` header with the active config, and reports per-run status histograms plus orphan-200 counts (rows where `fetch_log` recorded a 200 but `trace_days` never saw the insert - the canonical check for DB-consistency bugs under concurrency).
+
+Two-phase pattern so airport download doesn't dominate:
+
+```bash
+# 1. Build an airport-populated template DB once.
+rm -f bench-airports.db
+uv run python -c "
+from adsbtrack.db import Database
+from adsbtrack.config import Config
+from adsbtrack.airports import download_airports
+from pathlib import Path
+p = Path('bench-airports.db')
+with Database(p) as db:
+    cfg = Config(db_path=p)
+    n = download_airports(db, cfg)
+    db.commit()
+    print(f'airports loaded: {n}')
+"
+
+# 2. Copy the template and bench fetch only, per concurrency.
+export HEX=a66ad3 START=2024-06-01 END=2024-07-20 SRC=adsbx  # 50-day window
+for C in 1 2 4; do
+  cp bench-airports.db bench-c${C}.db
+  uv run python -m adsbtrack.bench \
+    --hex ${HEX} --start ${START} --end ${END} \
+    --source ${SRC} --concurrency ${C} --rate 0.5 \
+    --db bench-c${C}.db
+done
+```
+
+To actually see parallelism help, run a second pass at `--rate 0.1` against a source you know tolerates it. The floor drops from ~25 s to ~5 s and per-request latency has a chance to exceed the rate spacing. If `c=4` beats `c=1` at that rate, concurrency is overlapping real in-flight time; if it doesn't, the source is fast enough that no concurrency can beat the lock. The second outcome is still a merge pass - the infrastructure is correct, just idle on this source - but it's worth knowing which regime you're in.
+
+### Expected wall-time and error-rate behaviour
+
+| Signal | c=1 | c=2 | c=4 | Interpretation |
+|--------|-----|-----|-----|----------------|
+| Wall time | ~25.0 s | T(c=1) / 1.5 | T(c=1) / 2 | Healthy - concurrency is helping. |
+| Wall time | ~25.0 s | ~25.0 s | ~25.0 s | Healthy - rate limit is binding. Effective concurrency is 1 on this source, and lowering `--rate` is the lever if you want speed. |
+| Wall time | **< 25.0 s** | any | any | Bug - rate-limit lock is broken. 50 starts at 0.5 s spacing is a mathematical floor at 25.0 s. |
+| Wall time | ~25.0 s | > 25.0 s | > 25.0 s | Bug - concurrency is *hurting*, likely lock contention or an implicit 429 storm. |
+| 429 count | baseline | <= baseline + 1 | <= baseline + 1 | Healthy - rate limit is respected. |
+| 429 count | baseline | > baseline + 3 | any | Bug - rate limit is too loose under concurrency. |
+| 403 count | baseline | > baseline | any | Bug - the CDN is starting to distinguish bot traffic. Back off `--concurrency` or `--rate`. |
+| Orphan 200s | 0 | 0 | 0 | Prerequisite for a clean run. Anything non-zero means DB-writer task died or SIGINT recovery broke. |
+
+### SIGINT resilience
+
+The writer task pattern is the reason SIGINT is safe. The protocol is: send SIGINT, the workers cancel, the writer drains its queue and commits whatever rows it has, and the next run with the same args picks up from the committed state via `get_fetched_dates`. Verify with:
+
+```bash
+cp bench-airports.db bench-sigint.db
+uv run python -m adsbtrack.bench \
+  --hex ${HEX} --start 2024-06-01 --end 2024-06-20 \
+  --source ${SRC} --concurrency 4 --rate 0.5 --db bench-sigint.db &
+PID=$!
+sleep 5
+kill -INT ${PID}
+wait ${PID} 2>/dev/null
+
+# Orphan check (the bench script does this on success; run it by hand on cancel):
+sqlite3 bench-sigint.db \
+  "SELECT COUNT(*) FROM fetch_log f WHERE f.status = 200
+   AND NOT EXISTS (SELECT 1 FROM trace_days t
+                   WHERE t.icao = f.icao AND t.date = f.date AND t.source = f.source);"
+# Must print 0.
+
+# Resume must pick up where it left off without re-fetching committed days.
+uv run python -m adsbtrack.bench \
+  --hex ${HEX} --start 2024-06-01 --end 2024-06-20 \
+  --source ${SRC} --concurrency 4 --rate 0.5 --db bench-sigint.db
+```
+
 ## Trace merging
 
 When multiple data sources are fetched for the same aircraft, traces are merged by absolute timestamp and deduplicated (points within 1 second and 0.001 degrees of each other are collapsed). Different receiver networks catch different points for the same flight, so combining them improves coverage.

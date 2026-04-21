@@ -187,6 +187,39 @@ Each import validates the file's header line against a required-columns list bef
 
 Conflicts (differing registrations or type codes between sources) are reported in the return value but don't block the write. An independent check against `mil_hex_ranges` runs on every hex and stamps `is_military` / `mil_country` / `mil_branch` regardless of which civilian source supplied the row, so e.g. a hex with a Mictronics registration can still be flagged as military when it sits in a DoD allocation block.
 
+## Interactive surfaces (TUI + GUI)
+
+Two read-only surfaces sit on top of the same `adsbtrack.db`. Neither introduces a
+backend, a server, or an additional persistence layer. They are views.
+
+**TUI (`adsbtrack/tui/`, behind the `tui` extra).** Textual app launched via
+`adsbtrack tui --db <path>`. Six views (aircraft list, flight timeline, event feed,
+spoofed-broadcasts audit, map, status dashboard) plus an operations pane that shells
+out to the DB-writing CLI commands so long-running jobs (`fetch`, `extract`, `enrich`,
+`acars`, `registry`) can be monitored without leaving the app.
+
+All SQL the TUI runs lives in `adsbtrack/tui/queries.py`. Screen modules only handle
+layout and rendering. Isolating the SQL this way keeps screens small, lets the query
+layer be unit-tested against throwaway DB fixtures, and means the GUI export can
+reuse the same queries to build its JSON snapshot. Styling is in
+`adsbtrack/tui/styles/app.tcss`; the tokens there mirror `design/colors_and_type.css`
+by hand and should be kept in lockstep when the palette changes.
+
+**GUI export (`adsbtrack gui`).** Writes a self-contained static HTML bundle into an
+output directory: `index.html`, `app.js`, `app.css`, `data.json`, plus the design
+tokens and logo copied from `design/`. No server, no build step; the user opens
+`index.html` directly in a browser, which loads `data.json` and renders a
+three-column explorer with a Leaflet trace map in the center. Rerun the command to
+refresh the snapshot. The JS never writes untrusted strings through `innerHTML` and
+instead builds every DOM node via `createElement` + `textContent`, because
+callsigns and registrations arrive from spoofable ADS-B broadcasts - a pytest guards
+this rule (`tests/test_gui_export.py::test_export_app_js_uses_safe_dom_construction`).
+
+The design system itself lives in `design/`. Provenance and rules are documented in
+`design/README.md`; the tokens CSS lives in `design/colors_and_type.css` and is
+consumed directly by the GUI export, mirrored by hand into the TUI's `.tcss`, and
+referenced by the specimen HTML in `design/preview/`.
+
 ## SQL in docs
 
 Any committed document containing SQL that queries the adsbtrack schema must execute cleanly against the current schema at commit time. "Renders as markdown" is not enough; "parses as SQL" is not enough. The query has to run.

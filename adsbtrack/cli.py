@@ -1479,5 +1479,29 @@ def tui(db_path):
     AdsbtrackApp(Path(db_path)).run()
 
 
+@cli.command("gui")
+@click.option("--db", "db_path", default="adsbtrack.db", help="SQLite database path to export from.")
+@click.option(
+    "--out",
+    "out_dir",
+    default="gui-export",
+    help="Output directory for the static GUI bundle (overwritten on each run).",
+)
+@click.option("--hex", "hex_code", default=None, help="Focus the initial view on one ICAO hex (optional).")
+def gui(db_path, out_dir, hex_code):
+    """Write a static three-column HTML explorer backed by a JSON data snapshot.
+
+    Produces `index.html`, `data.json`, and the design tokens CSS into
+    ``--out``. Open `index.html` in any modern browser; the page loads
+    `data.json` and renders the aircraft list, flight timeline, events,
+    and spoofed-broadcasts audit. Read-only; rerun the command to refresh.
+    """
+    from .gui_export import export_gui
+
+    written = export_gui(Path(db_path), Path(out_dir), focus_hex=hex_code)
+    console.print(f"[green]Wrote {len(written)} files to {out_dir}[/]")
+    console.print(f"[dim]Open {out_dir}/index.html in your browser.[/]")
+
+
 if __name__ == "__main__":
     cli()

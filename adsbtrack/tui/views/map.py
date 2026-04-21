@@ -1,12 +1,12 @@
-"""Text-mode map view: trace points rendered into a character grid.
+"""Braille-based text-mode map for the TUI.
 
-Textual has no native map widget, so we project trace lat/lon into a
-character grid coloured by readsb source tag. The canvas sizes itself
-to the available pane dimensions and re-projects on resize - the old
-fixed 80x24 grid left most of a wide terminal black.
+The canvas is a character grid where each cell encodes a 2x4 dot
+sub-grid via Unicode braille characters. Trace points are projected
+into the dot space and connected with Bresenham line segments so the
+output reads as a continuous path instead of loose dots.
 
-Real cartography lives in the GUI export (Leaflet via
-``adsbtrack gui``). This is the TUI's at-a-glance trace shape.
+Real cartography still lives in the GUI export (Leaflet via
+``adsbtrack gui``); this surface is the TUI's at-a-glance trace view.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widget import Widget
 
+from ..braille import BrailleCanvas
 from ..queries import TracePoint, distinct_dates_for_icao, load_trace_points
 from ..widgets import (
     ACCENT_CYAN,
@@ -39,49 +40,48 @@ _SOURCE_COLOUR = {
 }
 
 
-def _project_points(points: list[TracePoint], width: int, height: int) -> dict[tuple[int, int], str]:
-    if not points or width <= 0 or height <= 0:
-        return {}
+def _project_to_dots(points: list[TracePoint], dot_w: int, dot_h: int) -> list[tuple[int, int, str]]:
+    """Project trace points into dot coordinates on the braille canvas.
+
+    Returns ``(dot_x, dot_y, source)`` triples in input order. Lat/lon
+    is projected into ``[0, dot_w-1] x [0, dot_h-1]`` with lat inverted
+    (north = top of screen). A tiny epsilon protects against a
+    degenerate bbox from a single-point trace.
+    """
+    if not points or dot_w <= 1 or dot_h <= 1:
+        return []
     lats = [p.lat for p in points]
     lons = [p.lon for p in points]
     lat_min, lat_max = min(lats), max(lats)
     lon_min, lon_max = min(lons), max(lons)
     if lat_max == lat_min:
-        lat_max = lat_min + 0.0001
+        lat_max = lat_min + 1e-6
     if lon_max == lon_min:
-        lon_max = lon_min + 0.0001
-    grid: dict[tuple[int, int], str] = {}
+        lon_max = lon_min + 1e-6
+    out: list[tuple[int, int, str]] = []
     for p in points:
-        col = int((p.lon - lon_min) / (lon_max - lon_min) * (width - 1))
-        row = height - 1 - int((p.lat - lat_min) / (lat_max - lat_min) * (height - 1))
-        col = max(0, min(width - 1, col))
-        row = max(0, min(height - 1, row))
-        grid[(row, col)] = p.source
-    return grid
+        x = int((p.lon - lon_min) / (lon_max - lon_min) * (dot_w - 1))
+        y = dot_h - 1 - int((p.lat - lat_min) / (lat_max - lat_min) * (dot_h - 1))
+        out.append((x, y, p.source))
+    return out
 
 
-def _render_grid(grid: dict[tuple[int, int], str], width: int, height: int) -> str:
-    lines: list[str] = []
-    for r in range(height):
-        row_chars: list[str] = []
-        for c in range(width):
-            src = grid.get((r, c))
-            if src is None:
-                row_chars.append(" ")
-                continue
-            colour = _SOURCE_COLOUR.get(src, FG_0)
-            row_chars.append(f"[{colour}]*[/]")
-        lines.append("".join(row_chars))
-    return "\n".join(lines)
+def _render_trace(points: list[TracePoint], cols: int, rows: int) -> str:
+    """Rasterise the trace onto a new braille canvas sized ``cols x rows``."""
+    canvas = BrailleCanvas(cols=cols, rows=rows)
+    projected = _project_to_dots(points, canvas.dot_width, canvas.dot_height)
+    for (x0, y0, src), (x1, y1, _) in zip(projected, projected[1:], strict=False):
+        canvas.line(x0, y0, x1, y1, _SOURCE_COLOUR.get(src, FG_0))
+    # Drop a highlighted dot at the final position so the user can see
+    # where the trace ends.
+    if projected:
+        last_x, last_y, last_src = projected[-1]
+        canvas.set(last_x, last_y, _SOURCE_COLOUR.get(last_src, FG_0))
+    return canvas.render()
 
 
 class MapCanvas(Widget):
-    """Adaptive text-mode trace canvas.
-
-    Reads its own ``self.size`` at render time so the grid fills
-    whatever width/height the containing pane offers. Repaints on
-    resize via ``on_resize``.
-    """
+    """Adaptive text-mode trace canvas backed by a braille raster."""
 
     DEFAULT_CSS = """
     MapCanvas {
@@ -94,16 +94,9 @@ class MapCanvas(Widget):
     def __init__(self) -> None:
         super().__init__(id="map-canvas")
         self._points: list[TracePoint] = []
-        self._bbox: tuple[float, float, float, float] | None = None
 
     def set_points(self, points: list[TracePoint]) -> None:
         self._points = points
-        if points:
-            lats = [p.lat for p in points]
-            lons = [p.lon for p in points]
-            self._bbox = (min(lats), max(lats), min(lons), max(lons))
-        else:
-            self._bbox = None
         self.refresh()
 
     def on_resize(self) -> None:
@@ -111,16 +104,16 @@ class MapCanvas(Widget):
 
     def render(self) -> Text:
         w, h = self.size.width, self.size.height
-        # Reserve the bottom row for the legend line so points do not
-        # overlap it.
+        # Reserve one row for the legend.
         grid_h = max(1, h - 1)
         if not self._points or w <= 2 or grid_h <= 2:
-            return Text.from_markup(f"[{FG_2}]no trace points available (resize the pane if this is wrong)[/]")
-        grid = _project_points(self._points, w, grid_h)
-        body = _render_grid(grid, w, grid_h)
+            return Text.from_markup(
+                f"[{FG_2}]no trace points available. select an aircraft (1) with trace data, then hit 5.[/]"
+            )
+        body = _render_trace(self._points, cols=w, rows=grid_h)
         legend = (
-            f"[{ACCENT_OK}]* adsb[/]   [{FG_2}]* mlat[/]   [#f2b136]* tisb[/]   "
-            f"[{ACCENT_CYAN}]* adsr[/]   [{ACCENT_VIOLET}]* adsc[/]"
+            f"[{ACCENT_OK}]● adsb[/]   [{FG_2}]● mlat[/]   [#f2b136]● tisb[/]   "
+            f"[{ACCENT_CYAN}]● adsr[/]   [{ACCENT_VIOLET}]● adsc[/]"
         )
         return Text.from_markup(f"{body}\n{legend}")
 

@@ -112,6 +112,19 @@ A flight whose `adsb_pct` is high (>90) while `mlat_pct` and `other_pct` are bot
 
 `status` renders a "Position sources" block showing the five percentages, weighted by flight `data_points`, whenever any flight in the dataset has at least one tagged point.
 
+## Spoofed-broadcast handling
+
+**Detector (`events.py`).** `collect_events(db, icao, include_spoof_checks=True)` runs a bimodal-integrity scan over stored trace_days and emits a `spoof_bimodal_integrity` event for any date whose pooled ADS-B version-2 samples show `sil=0` on >= 10% of samples (threshold `_SPOOF_V2_SIL0_PCT`), provided the pooled v2 count on the date is >= 25 (`_SPOOF_MIN_V2_SAMPLES`). Pooling runs across every aggregator that fetched the same date so a single source's transient integrity-field glitch does not by itself produce an event; real spoofs emitted over the air hit every receiver that can hear them. Event context includes the per-source `sil=0` rate list so the evidence is auditable. The flag defaults to False so historical queries do not retroactively tag trace_days.
+
+**Why `sil=0` under v2 is diagnostic.** DO-260B transponders on production aircraft report a Source Integrity Level >= 2; a populated broadcast with a significant fraction of `sil=0` samples implies either two independent emitters on the same ICAO (one realistic, one garbage) or a single spoofer that hardcoded the integrity fields. Empirical calibration from the 2026-04 Strait-of-Hormuz Emirates A380 spoofs had the spoofed days at 14-42% pooled v2_sil0, while the same airframes' legitimate Dec-2025 flights sat at 0-1.4%.
+
+**Reject-in-extract gate (`parser.py`).** Before inserting each derived flight into `flights`, the extractor consults `_compute_spoof_scores_by_date` (same pooled metric as the detector, run once per extract) and applies two gates:
+
+1. `bimodal_integrity` -- the flight's `takeoff_date` pooled v2_sil0 >= `config.spoof_v2_sil0_pct`.
+2. `crude_heuristic` -- `max_altitude < config.spoof_crude_max_altitude_ft` (default 500 ft) AND `origin_icao` / `destination_icao` both NULL AND callsign matching `^EK\d+$` (IATA flight-number format, not an ATC callsign).
+
+Bimodal wins if both fire. A rejected flight is inserted into `spoofed_broadcasts` (see [schema.md](schema.md)) with reason + per-source rate detail, skipped from `flights`, and does not advance `prev_end_time` so turnaround math for the next real flight is not polluted by a fabricated gap. Turn off by setting `config.reject_spoofed_flights = False`.
+
 ## ACARS OOOI on flights
 
 When `acars --hex <icao> --start <date>` runs, the fetcher pulls ACARS / VDL2 / HFDL messages for the aircraft from airframes.io and the OOOI parser scans each message against the flight timeline. Supported formats:

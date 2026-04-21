@@ -1,6 +1,7 @@
 import contextlib
 import json
 import math
+import re
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -397,6 +398,116 @@ def _stitch_fragments(
     return stitched_flights, stitched_metrics
 
 
+_EK_FLIGHTNUM_RE = re.compile(r"^EK\d+$")
+
+
+def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str, dict]:
+    """Return a per-date summary of bimodal-integrity spoof indicators.
+
+    Pool v2 samples across every aggregator that fetched the same date:
+    the denominator is the union of v2 samples from all sources, the
+    numerator counts how many carried sil=0. A date is flagged when the
+    pooled v2 count is at least config.spoof_min_v2_samples and the
+    pooled sil=0 share is >= config.spoof_v2_sil0_pct.
+
+    Pooling (instead of picking the worst single source) dilutes
+    aggregator-specific artifacts: a real spoof emitted over the air hits
+    every aggregator, so the rate holds up against dilution; a single
+    aggregator's transient integrity-field glitch gets averaged out by
+    the other sources.
+    """
+    by_date: dict[str, dict] = defaultdict(
+        lambda: {
+            "v2": 0,
+            "sil0": 0,
+            "nic0": 0,
+            "sources": set(),
+            "source_rates": [],
+        }
+    )
+    for row in trace_days:
+        try:
+            samples = json.loads(row["trace_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(samples, list):
+            continue
+        src_v2 = 0
+        src_sil0 = 0
+        src_nic0 = 0
+        for s in samples:
+            if not isinstance(s, list) or len(s) <= 8:
+                continue
+            ac = s[8]
+            if not isinstance(ac, dict) or ac.get("version") != 2:
+                continue
+            src_v2 += 1
+            if ac.get("sil") == 0:
+                src_sil0 += 1
+            if ac.get("nic") == 0:
+                src_nic0 += 1
+        if src_v2 == 0:
+            continue
+        agg = by_date[row["date"]]
+        agg["v2"] += src_v2
+        agg["sil0"] += src_sil0
+        agg["nic0"] += src_nic0
+        agg["sources"].add(row["source"])
+        agg["source_rates"].append((row["source"], round(100.0 * src_sil0 / src_v2, 2)))
+
+    flagged: dict[str, dict] = {}
+    for date, agg in by_date.items():
+        v2 = agg["v2"]
+        if v2 < config.spoof_min_v2_samples:
+            continue
+        sil_pct = 100.0 * agg["sil0"] / v2
+        if sil_pct < config.spoof_v2_sil0_pct:
+            continue
+        flagged[date] = {
+            "v2_samples": v2,
+            "v2_sil0_pct": sil_pct,
+            "v2_nic0_pct": 100.0 * agg["nic0"] / v2,
+            "sources": sorted(agg["sources"]),
+            "source_rates": sorted(agg["source_rates"]),
+        }
+    return flagged
+
+
+def _flight_is_spoofed(
+    flight: Flight, spoof_scores_by_date: dict[str, dict], config: Config
+) -> tuple[str, dict] | None:
+    """Return ``(reason, detail)`` when a flight should be rejected.
+
+    Two gates, matching the spec:
+      - "bimodal_integrity": the flight's takeoff_date shows sil=0 on
+        >= config.spoof_v2_sil0_pct of v2 samples.
+      - "crude_heuristic": max_altitude < config.spoof_crude_max_altitude_ft
+        AND origin_icao / destination_icao both null AND callsign matches
+        ``^EK\\d+$`` (IATA flight-number format, not an ATC callsign).
+    Bimodal wins if both fire because the evidence is stronger.
+    """
+    bimodal = spoof_scores_by_date.get(flight.takeoff_date)
+    if bimodal is not None:
+        return "bimodal_integrity", {
+            "date": flight.takeoff_date,
+            **bimodal,
+        }
+    cs = (flight.callsign or "").strip()
+    if (
+        flight.max_altitude is not None
+        and flight.max_altitude < config.spoof_crude_max_altitude_ft
+        and flight.origin_icao is None
+        and flight.destination_icao is None
+        and _EK_FLIGHTNUM_RE.fullmatch(cs)
+    ):
+        return "crude_heuristic", {
+            "max_altitude": flight.max_altitude,
+            "callsign": cs,
+            "pattern": r"^EK\d+$",
+        }
+    return None
+
+
 def _any_climb_between(
     segments: list[IlsAlignmentResult],
     recent_points: Iterable,
@@ -533,6 +644,13 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             if row["owner_operator"]:
                 owner_operator = row["owner_operator"]
                 break
+
+    # Compute per-date bimodal-integrity spoof scores up front so the
+    # rejection step below can query without re-scanning trace_json.
+    # Disabling reject_spoofed_flights skips the scan entirely.
+    spoof_scores_by_date: dict[str, dict] = (
+        _compute_spoof_scores_by_date(list(trace_days), config) if config.reject_spoofed_flights else {}
+    )
 
     # Group by date and merge multi-source rows
     by_date: dict[str, list] = defaultdict(list)
@@ -1219,6 +1337,36 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # Drop all_points after the navaid pass so per-flight buffers don't
         # stay pinned until extract returns on multi-hundred-flight hexes.
         metrics.all_points.clear()
+
+        # Spoof-rejection gate. Runs after all derivations so the gate
+        # sees final values for max_altitude / origin_icao / destination_icao
+        # / callsign. A rejected flight goes to spoofed_broadcasts and is
+        # excluded from final_flights + prev_end_time so turnaround math
+        # for the next real flight is not polluted by a fabricated gap.
+        if config.reject_spoofed_flights:
+            spoof_verdict = _flight_is_spoofed(flight, spoof_scores_by_date, config)
+            if spoof_verdict is not None:
+                reason, detail = spoof_verdict
+                with contextlib.suppress(Exception):
+                    db.insert_spoofed_broadcast(
+                        icao=flight.icao,
+                        takeoff_time=flight.takeoff_time.isoformat(),
+                        landing_time=flight.landing_time.isoformat() if flight.landing_time else None,
+                        takeoff_date=flight.takeoff_date,
+                        callsign=flight.callsign,
+                        takeoff_lat=flight.takeoff_lat,
+                        takeoff_lon=flight.takeoff_lon,
+                        landing_lat=flight.landing_lat,
+                        landing_lon=flight.landing_lon,
+                        max_altitude=flight.max_altitude,
+                        data_points=flight.data_points,
+                        sources=flight.sources,
+                        origin_icao=flight.origin_icao,
+                        destination_icao=flight.destination_icao,
+                        reason=reason,
+                        reason_detail=json.dumps(detail),
+                    )
+                continue
 
         # turnaround_minutes from previous flight's end to this takeoff.
         # cap at 72 hours (4320 min). Anything longer reflects a

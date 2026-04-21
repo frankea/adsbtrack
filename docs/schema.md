@@ -156,6 +156,31 @@ Materialized rollup of utilization per aircraft (refreshed on every extract).
 | second_base_share | REAL | Fraction of takeoffs from second base |
 | updated_at | TEXT | When the rollup was last refreshed |
 
+## spoofed_broadcasts
+
+Audit log of flights rejected by the spoof-broadcast gate in `parser.extract_flights`. Populated instead of `flights` when a would-be flight either (a) originates from a trace_day whose pooled v2 samples carry `sil=0` at `>= config.spoof_v2_sil0_pct` (default 10%), or (b) matches the crude shallow-EK signature (max_altitude below `config.spoof_crude_max_altitude_ft`, both `origin_icao` and `destination_icao` NULL, callsign matching `^EK\d+$`). Turn the gate off by setting `config.reject_spoofed_flights = False` to see the raw parser output unfiltered; `clear_flights(icao)` also clears this table so `extract --reprocess` stays consistent.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| id | INTEGER | Primary key |
+| icao | TEXT | ICAO hex code |
+| takeoff_time | TEXT | ISO timestamp of the rejected flight's takeoff |
+| landing_time | TEXT | ISO timestamp of the rejected flight's landing (NULL for signal_lost) |
+| takeoff_date | TEXT | YYYY-MM-DD |
+| callsign | TEXT | Last callsign observed on the rejected flight |
+| takeoff_lat / takeoff_lon | REAL | Takeoff coordinates |
+| landing_lat / landing_lon | REAL | Landing coordinates (NULL when no landing transition) |
+| max_altitude | INTEGER | Peak altitude observed |
+| data_points | INTEGER | Number of trace points that fed the rejected flight |
+| sources | TEXT | Comma-separated aggregator names that contributed trace data |
+| origin_icao | TEXT | On-field origin airport (if any) |
+| destination_icao | TEXT | On-field destination airport (if any) |
+| reason | TEXT | `bimodal_integrity` or `crude_heuristic` |
+| reason_detail | TEXT | JSON blob with specifics: for `bimodal_integrity`, `{date, v2_samples, v2_sil0_pct, v2_nic0_pct, sources, source_rates}`; for `crude_heuristic`, `{max_altitude, callsign, pattern}` |
+| detected_at | TEXT | When the rejection happened |
+
+UNIQUE(icao, takeoff_time) mirrors the `flights` table so the two are keyed compatibly.
+
 ## fetch_log
 
 Tracks which dates have been fetched per source.

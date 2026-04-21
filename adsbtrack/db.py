@@ -350,6 +350,35 @@ CREATE TABLE IF NOT EXISTS acars_messages (
     fetched_at TEXT NOT NULL
 );
 
+-- Rejected-at-extract broadcasts. Populated by parser.extract_flights
+-- when a would-be flight trips the spoof-detection gate (bimodal-integrity
+-- on its source trace_day, or the crude EK-flightnumber / null-airport /
+-- sub-500-ft signature). Parallels the flights table in key columns so
+-- the audit trail survives without polluting flights aggregates.
+CREATE TABLE IF NOT EXISTS spoofed_broadcasts (
+    id INTEGER PRIMARY KEY,
+    icao TEXT NOT NULL,
+    takeoff_time TEXT NOT NULL,
+    landing_time TEXT,
+    takeoff_date TEXT NOT NULL,
+    callsign TEXT,
+    takeoff_lat REAL,
+    takeoff_lon REAL,
+    landing_lat REAL,
+    landing_lon REAL,
+    max_altitude INTEGER,
+    data_points INTEGER,
+    sources TEXT,
+    origin_icao TEXT,
+    destination_icao TEXT,
+    reason TEXT NOT NULL,
+    reason_detail TEXT,
+    detected_at TEXT NOT NULL,
+    UNIQUE(icao, takeoff_time)
+);
+
+CREATE INDEX IF NOT EXISTS idx_spoofed_broadcasts_icao_time ON spoofed_broadcasts(icao, takeoff_time);
+
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_runways_airport_ident ON runways(airport_ident);
@@ -755,6 +784,59 @@ class Database:
 
     def clear_flights(self, icao: str):
         self.conn.execute("DELETE FROM flights WHERE icao = ?", (icao,))
+        # Clear rejections too so a reprocess-with-updated-rules doesn't
+        # leave stale entries from the previous gate configuration.
+        self.conn.execute("DELETE FROM spoofed_broadcasts WHERE icao = ?", (icao,))
+
+    def insert_spoofed_broadcast(
+        self,
+        *,
+        icao: str,
+        takeoff_time: str,
+        landing_time: str | None,
+        takeoff_date: str,
+        callsign: str | None,
+        takeoff_lat: float | None,
+        takeoff_lon: float | None,
+        landing_lat: float | None,
+        landing_lon: float | None,
+        max_altitude: int | None,
+        data_points: int | None,
+        sources: str | None,
+        origin_icao: str | None,
+        destination_icao: str | None,
+        reason: str,
+        reason_detail: str | None,
+    ) -> None:
+        """Record a flight that the extractor rejected as a spoofed broadcast."""
+        self.conn.execute(
+            """INSERT OR REPLACE INTO spoofed_broadcasts
+               (icao, takeoff_time, landing_time, takeoff_date, callsign,
+                takeoff_lat, takeoff_lon, landing_lat, landing_lon,
+                max_altitude, data_points, sources,
+                origin_icao, destination_icao,
+                reason, reason_detail, detected_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                icao,
+                takeoff_time,
+                landing_time,
+                takeoff_date,
+                callsign,
+                takeoff_lat,
+                takeoff_lon,
+                landing_lat,
+                landing_lon,
+                max_altitude,
+                data_points,
+                sources,
+                origin_icao,
+                destination_icao,
+                reason,
+                reason_detail,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
 
     def insert_flight(self, flight: Flight):
         # B3 guard: refuse to persist a flight whose landing_time predates

@@ -268,6 +268,18 @@ class Config:
     stationary_max_alt_ft: float = 1000.0  # raised from 500 to catch ramp at higher-elevation airports
     stationary_max_gs_kt: float = 15.0
 
+    # Spoofed-broadcast gate (see parser.extract_flights). When enabled
+    # (default), a flight whose source trace_day shows bimodal-integrity
+    # spoofing (>= spoof_v2_sil0_pct share of v2 samples with sil=0) or
+    # matches the crude shallow-EK-flight signature (max_alt < 500 ft,
+    # origin/dest both null, callsign ~= ^EK\d+$) is diverted to the
+    # spoofed_broadcasts audit table instead of being inserted into
+    # flights. Turn off to see the raw parser output unfiltered.
+    reject_spoofed_flights: bool = True
+    spoof_v2_sil0_pct: float = 10.0
+    spoof_min_v2_samples: int = 25
+    spoof_crude_max_altitude_ft: float = 500.0
+
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km

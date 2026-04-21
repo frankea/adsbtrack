@@ -1,0 +1,39 @@
+<!doctype html>
+<html data-theme="dark"><head>
+<meta charset="utf-8">
+<title>Input fields</title>
+<link rel="stylesheet" href="_card.css">
+<style>
+  .input {
+    display: block; width: 100%; padding: 6px 10px; font-family: var(--font-mono);
+    font-size: 13px; background: var(--bg-0); border: 1px solid var(--bd-0);
+    border-radius: 0; color: var(--fg-0); box-sizing: border-box; outline: none;
+  }
+  .input:focus { border-color: var(--bd-focus); box-shadow: 0 0 0 1px var(--bd-focus); }
+  .lbl { font-family: var(--font-mono); font-size: 10px; color: var(--fg-2);
+         text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 4px; display:block;}
+  .hint { font-family: var(--font-mono); font-size: 11px; color: var(--fg-2); margin-top: 4px; }
+  .prefix {
+    display: flex; align-items: center; background: var(--bg-0); border: 1px solid var(--bd-0);
+  }
+  .prefix span { padding: 6px 8px; font-family: var(--font-mono); font-size: 12px; color: var(--fg-2); border-right: 1px solid var(--bd-0); }
+  .prefix input { flex: 1; border: 0; padding: 6px 8px; background: transparent; color: var(--fg-0); font: inherit; outline: none; }
+</style>
+</head><body class="card">
+  <div class="label-tiny" style="margin-bottom:12px">Inputs &middot; ground-truth prefix, no rounded corners</div>
+  <div class="col" style="gap: 12px; max-width: 420px;">
+    <div>
+      <label class="lbl">ICAO hex</label>
+      <input class="input" value="a66ad3" />
+    </div>
+    <div>
+      <label class="lbl">Tail / registration</label>
+      <div class="prefix"><span>N</span><input value="512WB" style="font-family: var(--font-mono);" /></div>
+      <div class="hint">converted to hex a66ad3</div>
+    </div>
+    <div>
+      <label class="lbl">Date range</label>
+      <input class="input" value="2026-01-01 .. 2026-04-10" />
+    </div>
+  </div>
+</body></html>

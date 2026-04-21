@@ -1,0 +1,33 @@
+<!doctype html>
+<html data-theme="dark"><head>
+<meta charset="utf-8">
+<title>Buttons</title>
+<link rel="stylesheet" href="_card.css">
+<style>
+  .btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 10px; font-family: var(--font-mono); font-size: 12px;
+    border: 1px solid var(--bd-1); background: var(--bg-1);
+    color: var(--fg-0); border-radius: 2px; cursor: pointer; line-height: 1.4;
+  }
+  .btn:hover { background: var(--bg-2); }
+  .btn.primary { background: var(--accent-cyan); color: #0b0f14; border-color: var(--accent-cyan); }
+  .btn.danger { background: transparent; color: var(--accent-red); border-color: var(--accent-red); }
+  .btn.ghost { background: transparent; border-color: var(--bd-0); color: var(--fg-1); }
+  .btn .kbd { font-size: 10px; color: var(--fg-2); border: 1px solid var(--bd-0); padding: 0 4px; border-radius: 2px; background: var(--bg-0); }
+  .btn.primary .kbd { color: #0b0f14; border-color: #0b0f14; background: transparent; }
+</style>
+</head><body class="card">
+  <div class="label-tiny" style="margin-bottom:12px">Buttons &middot; monospace labels, inline kbd glyph</div>
+  <div class="row" style="gap: 10px;">
+    <button class="btn primary">Fetch <span class="kbd">F</span></button>
+    <button class="btn">Extract</button>
+    <button class="btn ghost">Cancel <span class="kbd">esc</span></button>
+    <button class="btn danger">Clear traces</button>
+  </div>
+  <div class="row" style="gap: 10px; margin-top: 14px;">
+    <button class="btn" disabled style="opacity: 0.5;">Disabled</button>
+    <button class="btn" style="background: var(--bg-3);">Pressed</button>
+    <button class="btn" style="outline: 1px solid var(--bd-focus); outline-offset: 1px;">Focused</button>
+  </div>
+</body></html>

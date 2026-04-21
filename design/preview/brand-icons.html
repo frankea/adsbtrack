@@ -1,0 +1,32 @@
+<!doctype html>
+<html data-theme="dark"><head>
+<meta charset="utf-8">
+<title>Iconography</title>
+<link rel="stylesheet" href="_card.css">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.js"></script>
+<style>
+  .ic {
+    display: inline-flex; flex-direction: column; align-items: center; gap: 6px;
+    width: 72px;
+  }
+  .ic svg { width: 20px; height: 20px; stroke: var(--fg-0); stroke-width: 1.5; fill: none; }
+  .ic .l { font-family: var(--font-mono); font-size: 10px; color: var(--fg-2); text-transform: uppercase; letter-spacing: 0.06em; }
+</style>
+</head><body class="card">
+  <div class="label-tiny" style="margin-bottom:12px">Lucide icons &middot; 20px, 1.5 stroke, no fill. Monoline only.</div>
+  <div class="row" style="gap: 4px; flex-wrap: wrap;">
+    <div class="ic"><i data-lucide="plane"></i><div class="l">aircraft</div></div>
+    <div class="ic"><i data-lucide="radar"></i><div class="l">radar</div></div>
+    <div class="ic"><i data-lucide="map"></i><div class="l">map</div></div>
+    <div class="ic"><i data-lucide="list"></i><div class="l">list</div></div>
+    <div class="ic"><i data-lucide="activity"></i><div class="l">events</div></div>
+    <div class="ic"><i data-lucide="shield-alert"></i><div class="l">spoof</div></div>
+    <div class="ic"><i data-lucide="alert-triangle"></i><div class="l">alert</div></div>
+    <div class="ic"><i data-lucide="search"></i><div class="l">search</div></div>
+    <div class="ic"><i data-lucide="filter"></i><div class="l">filter</div></div>
+    <div class="ic"><i data-lucide="download"></i><div class="l">fetch</div></div>
+    <div class="ic"><i data-lucide="database"></i><div class="l">db</div></div>
+    <div class="ic"><i data-lucide="terminal"></i><div class="l">cli</div></div>
+  </div>
+  <script>lucide.createIcons();</script>
+</body></html>

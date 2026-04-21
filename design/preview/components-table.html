@@ -1,0 +1,25 @@
+<!doctype html>
+<html data-theme="dark"><head>
+<meta charset="utf-8">
+<title>Table row</title>
+<link rel="stylesheet" href="_card.css">
+</head><body class="card">
+  <div class="label-tiny" style="margin-bottom:12px">Table row anatomy &middot; left-align text, right-align numeric</div>
+  <div style="border: 1px solid var(--bd-0); background: var(--bg-1);">
+    <div class="table-row table-head" style="grid-template-columns: 100px 80px 80px 80px 80px 70px 90px 60px;">
+      <div>DATE</div><div>FROM</div><div>TO</div><div style="text-align:right">DUR</div><div>CALLSIGN</div><div>MISSION</div><div style="text-align:right">CONF</div><div>TYPE</div>
+    </div>
+    <div class="table-row" style="grid-template-columns: 100px 80px 80px 80px 80px 70px 90px 60px; color: var(--fg-0);">
+      <div>2026-03-27</div><div class="c-ok">KSPG</div><div class="c-ok">KHKY</div><div class="num">1h 53m</div><div class="dim">N512WB</div><div class="c-magenta">XFER</div><div class="num c-ok">89%</div><div class="c-ok">OK</div>
+    </div>
+    <div class="table-row" style="grid-template-columns: 100px 80px 80px 80px 80px 70px 90px 60px; background: var(--overlay-stripe);">
+      <div>2026-03-28</div><div class="c-ok">KHKY</div><div class="c-ok">KVNC</div><div class="num">2h 41m</div><div class="dim">N512WB</div><div class="c-magenta">XFER</div><div class="num c-ok">86%</div><div class="c-ok">OK</div>
+    </div>
+    <div class="table-row" style="grid-template-columns: 100px 80px 80px 80px 80px 70px 90px 60px; background: var(--overlay-selected); border-left: 2px solid var(--accent-cyan); padding-left: 8px;">
+      <div>2026-03-29</div><div class="c-ok">KSPG</div><div class="c-amber">~KFXE</div><div class="num">12m</div><div class="dim">N512WB</div><div class="dim">&mdash;</div><div class="num c-amber">0%</div><div class="c-amber">DROP</div>
+    </div>
+    <div class="table-row" style="grid-template-columns: 100px 80px 80px 80px 80px 70px 90px 60px;">
+      <div>2026-03-30</div><div class="c-ok">KVNC</div><div class="c-red">sig lost</div><div class="num">47m</div><div class="dim">EMRAT6</div><div class="c-magenta">EMS</div><div class="num c-red">12%</div><div class="c-red">SIG LOST</div>
+    </div>
+  </div>
+</body></html>

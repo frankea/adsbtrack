@@ -1,0 +1,85 @@
+/* Shared preview card styles */
+@import url("../colors_and_type.css");
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg-0);
+}
+body.card {
+  padding: 20px;
+  font-family: var(--font-sans);
+  font-size: var(--fs-13);
+  color: var(--fg-0);
+  box-sizing: border-box;
+  min-height: 100vh;
+}
+body.card * { box-sizing: border-box; }
+
+.row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.col { display: flex; flex-direction: column; gap: 8px; }
+.grid { display: grid; gap: 12px; }
+
+.swatch {
+  width: 100%;
+  aspect-ratio: 1 / 1;
+  border-radius: var(--r-2);
+  border: 1px solid var(--bd-0);
+  position: relative;
+  overflow: hidden;
+}
+.swatch-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-2);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-top: 6px;
+  line-height: 1.2;
+}
+.swatch-hex {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-1);
+  line-height: 1.3;
+}
+.swatch-name {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-0);
+  line-height: 1.3;
+}
+
+.label-tiny {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--fg-2);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.divider {
+  height: 1px;
+  background: var(--bd-0);
+  width: 100%;
+}
+
+/* table-ish rows for density specimens */
+.table-row {
+  display: grid;
+  padding: 6px 10px;
+  font-family: var(--font-mono);
+  font-size: var(--fs-12);
+  border-bottom: 1px solid var(--bd-0);
+  align-items: center;
+}
+.table-row:last-child { border-bottom: 0; }
+.table-head {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-2);
+  padding: 4px 10px;
+  border-bottom: 1px solid var(--bd-1);
+}

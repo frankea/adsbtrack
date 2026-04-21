@@ -15,7 +15,6 @@ from datetime import UTC, datetime
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal
-from textual.reactive import reactive
 from textual.widget import Widget
 from textual.widgets import Input, Label
 
@@ -33,27 +32,37 @@ ACCENT_RED = "#e0433a"
 ACCENT_VIOLET = "#c24bd6"
 
 
-def pill_markup(label: str, colour: str) -> str:
-    """Return Rich markup for a single inline pill: coloured text padded with spaces.
+_PILL_BG = {
+    # Tinted backgrounds mirroring the CSS --accent-*-bg swatches
+    # (rgba at ~12% opacity). Terminal paints these as the named
+    # accent hue dimmed; the outlined effect comes from setting
+    # foreground = full accent and background = dimmed accent.
+    "#e0433a": "#2a1413",  # red
+    "#f2b136": "#2d2210",  # amber
+    "#c24bd6": "#291433",  # violet
+    "#4ec07a": "#142c1d",  # ok
+    "#4fb8e0": "#102b37",  # cyan
+}
 
-    Terminals render this as a solid coloured rectangle carrying the
-    label in the accent colour's foreground (inverted by Rich's ``on``
-    + foreground combination). Spaces pad the label so the pill reads
-    as a block, not a typographic glyph.
+
+def pill_markup(label: str, colour: str) -> str:
+    """Return Rich markup for an outlined pill.
+
+    Border + tint is simulated in the terminal by setting the foreground
+    to the accent colour and the background to a dimmed version of the
+    same accent. Matches the design's outlined-with-tinted-bg pill style.
+    """
+    bg = _PILL_BG.get(colour, "#1c242e")
+    return f"[{colour} on {bg}] {label} [/]"
+
+
+def pill_solid(label: str, colour: str) -> str:
+    """Return Rich markup for a solid pill (accent as background, white fg).
+
+    Used where the pill itself is the meaning (e.g. the SEV column in the
+    event feed) rather than a badge attached to something else.
     """
     return f"[{FG_0} on {colour}] {label} [/]"
-
-
-def pill_outline(label: str, colour: str) -> str:
-    """Return Rich markup for an outlined pill: coloured text with accent foreground.
-
-    When the accent itself is the brand signal (e.g. SPF / MIL on the
-    aircraft list), an outlined pill reads as a badge without the
-    solid-block weight of ``pill_markup``. Rendered as ``[colour]``
-    wrapping the label with square brackets that mimic the design's
-    1px borders.
-    """
-    return f"[{colour}]\\[{label}][/]"
 
 
 # ---------------------------------------------------------------------------
@@ -61,43 +70,50 @@ def pill_outline(label: str, colour: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-class StatusStrip(Widget):
-    """Top-of-screen status strip with DB path, counts, active job, UTC clock."""
+class StatusStrip(Label):
+    """Top-of-screen status strip with DB path, counts, active job, UTC clock.
+
+    Implemented as a ``Label`` subclass (not a bare ``Widget``) because
+    ``Label`` sets its content via the base-class renderable protocol,
+    which means Textual's compositor computes a content height of 1
+    from our single-line markup. A ``Widget`` with ``render()`` returning
+    a ``Text`` renders but reports a content height of 0, which hides it.
+    """
 
     DEFAULT_CSS = """
     StatusStrip {
         height: 1;
-        dock: top;
-        content-align: left middle;
+        width: 1fr;
+        background: #141b23;
+        color: #aab6c2;
     }
     """
 
-    _flights = reactive(0)
-    _aircraft = reactive(0)
-    _job: reactive[str | None] = reactive(None)
-    _clock = reactive("--:--:--Z")
-
     def __init__(self, *, db_path: str, flights: int, aircraft: int) -> None:
-        super().__init__(id="status-strip")
         self._db_path = db_path
         self._flights = flights
         self._aircraft = aircraft
+        self._job: str | None = None
         self._clock = datetime.now(UTC).strftime("%H:%M:%SZ")
+        super().__init__(self._build(), id="status-strip")
 
     def on_mount(self) -> None:
         self.set_interval(1.0, self._tick)
 
     def set_job(self, text: str | None) -> None:
         self._job = text
+        self.update(self._build())
 
     def set_counts(self, flights: int, aircraft: int) -> None:
         self._flights = flights
         self._aircraft = aircraft
+        self.update(self._build())
 
     def _tick(self) -> None:
         self._clock = datetime.now(UTC).strftime("%H:%M:%SZ")
+        self.update(self._build())
 
-    def render(self) -> Text:
+    def _build(self) -> Text:
         left = (
             f"[b {FG_0}]adsbtrack[/]   "
             f"[{FG_2}]{self._db_path}[/]   "
@@ -116,36 +132,42 @@ class StatusStrip(Widget):
 # ---------------------------------------------------------------------------
 
 
-class PageHeader(Widget):
-    """Per-screen header: title, breadcrumb, trailing dim detail."""
+class PageHeader(Label):
+    """Per-screen header: title, breadcrumb, trailing dim detail.
+
+    Label subclass for the same compositor-height reason StatusStrip
+    documents above.
+    """
 
     DEFAULT_CSS = """
     PageHeader {
         height: 1;
-        content-align: left middle;
+        width: 1fr;
+        background: #0b0f14;
+        color: #e4ecf3;
+        padding: 0 1;
     }
     """
 
-    _title = reactive("")
-    _crumb = reactive("")
-    _trailing = reactive("")
-
     def __init__(self, title: str, crumb: str = "", trailing: str = "", *, widget_id: str | None = None) -> None:
-        super().__init__(id=widget_id, classes="page-header")
         self._title = title
         self._crumb = crumb
         self._trailing = trailing
+        super().__init__(self._build(), id=widget_id, classes="page-header")
 
     def set_title(self, title: str) -> None:
         self._title = title
+        self.update(self._build())
 
     def set_crumb(self, crumb: str) -> None:
         self._crumb = crumb
+        self.update(self._build())
 
     def set_trailing(self, trailing: str) -> None:
         self._trailing = trailing
+        self.update(self._build())
 
-    def render(self) -> Text:
+    def _build(self) -> Text:
         parts = [f"[b {FG_0}]{self._title}[/]"]
         if self._crumb:
             parts.append(f"[{FG_2}]> {self._crumb}[/]")
@@ -162,6 +184,34 @@ class PageHeader(Widget):
 
 class FilterBar(Widget):
     """Filter bar with a cyan ``>`` prompt, an Input, and a count label."""
+
+    DEFAULT_CSS = """
+    FilterBar {
+        layout: horizontal;
+        height: 1;
+        width: 1fr;
+        background: #0b0f14;
+    }
+    FilterBar > Label.filter-prompt {
+        width: 3;
+        padding: 0 1;
+        color: #4fb8e0;
+        text-style: bold;
+    }
+    FilterBar > Input {
+        background: #0b0f14;
+        color: #e4ecf3;
+        border: none;
+        padding: 0 1;
+        height: 1;
+        width: 1fr;
+    }
+    FilterBar > Label.filter-count {
+        width: auto;
+        padding: 0 1;
+        color: #6b7885;
+    }
+    """
 
     def __init__(self, placeholder: str = "filter (fzf)", *, widget_id: str | None = None) -> None:
         super().__init__(id=widget_id, classes="filter-bar")
@@ -210,26 +260,32 @@ _SESSION: list[tuple[str, str, str]] = [
 ]
 
 
-class Sidebar(Widget):
-    """Left-hand navigation: 3 groups (Views / Operations / Session)."""
+class Sidebar(Label):
+    """Left-hand navigation: 3 groups (Views / Operations / Session).
+
+    Label subclass for compositor-height reasons documented on StatusStrip.
+    """
 
     DEFAULT_CSS = """
     Sidebar {
         width: 24;
         height: 1fr;
-        dock: left;
+        background: #141b23;
+        color: #aab6c2;
+        border-right: solid #222c37;
+        padding: 1 1;
     }
     """
 
-    _active = reactive("aircraft")
-
     def __init__(self) -> None:
-        super().__init__(id="sidebar")
+        self._active = "aircraft"
+        super().__init__(self._build(), id="sidebar")
 
     def set_active(self, view_id: str) -> None:
         self._active = view_id
+        self.update(self._build())
 
-    def render(self) -> Text:
+    def _build(self) -> Text:
         lines: list[str] = []
         lines.append(f"[{FG_2}]VIEWS[/]")
         lines.extend(self._render_items(_VIEWS, highlight=self._active))

@@ -1,7 +1,10 @@
 /* adsbtrack TUI styles
- * Mirrors design/colors_and_type.css tokens in Textual's CSS dialect.
- * Keep in lockstep with the CSS file; tokens that change there should
- * change here as well.
+ * Screen-level and table-level rules only; individual chrome widgets
+ * (StatusStrip, Sidebar, PageHeader, FilterBar) carry their own
+ * DEFAULT_CSS in adsbtrack/tui/widgets.py so a rule in two places
+ * doesn't silently fight itself.
+ *
+ * Keep the palette here in lockstep with design/colors_and_type.css.
  */
 
 Screen {
@@ -14,80 +17,26 @@ Footer {
     color: #aab6c2;
 }
 
-/* ---- Top status strip (row 1) ---- */
-
-#status-strip {
-    dock: top;
-    height: 1;
-    padding: 0 1;
-    background: #141b23;
-    color: #aab6c2;
-    border-bottom: solid #222c37;
-}
-
-/* ---- Main row: sidebar + content ---- */
-
 #app-row {
     height: 1fr;
-}
-
-#sidebar {
-    width: 24;
-    background: #141b23;
-    color: #aab6c2;
-    border-right: solid #222c37;
-    padding: 1 1;
 }
 
 #content {
     width: 1fr;
     height: 1fr;
-    padding: 0;
 }
 
 ContentSwitcher {
     height: 1fr;
 }
 
-/* ---- View container chrome ---- */
+/* Views (each is a Vertical subclass in adsbtrack/tui/views/). */
 
-.page-header {
-    height: 1;
-    padding: 0 1;
-    background: #0b0f14;
-    color: #e4ecf3;
-    border-bottom: solid #222c37;
+.view {
+    height: 1fr;
 }
 
-.filter-bar {
-    layout: horizontal;
-    height: 1;
-    background: #0b0f14;
-    border-bottom: solid #222c37;
-}
-
-.filter-bar > .filter-prompt {
-    width: 3;
-    padding: 0 1;
-    color: #4fb8e0;
-    text-style: bold;
-}
-
-.filter-bar > Input {
-    background: #0b0f14;
-    color: #e4ecf3;
-    border: none;
-    padding: 0 1;
-    height: 1;
-}
-
-.filter-bar > .filter-count {
-    width: auto;
-    padding: 0 1;
-    color: #6b7885;
-}
-
-/* ---- Tables ---- */
+/* Tables */
 
 DataTable {
     background: #0b0f14;
@@ -118,7 +67,7 @@ DataTable > .datatable--even-row {
     background: #11171f;
 }
 
-/* ---- Spoof detail pane ---- */
+/* Spoof detail pane */
 
 .spoof-detail {
     height: auto;
@@ -129,7 +78,7 @@ DataTable > .datatable--even-row {
     padding: 1 2;
 }
 
-/* ---- Ops view cards ---- */
+/* Ops view */
 
 #ops-input {
     background: #0b0f14;

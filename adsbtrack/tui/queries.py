@@ -31,13 +31,14 @@ class AircraftRow:
     icao: str
     registration: str | None
     type_code: str | None
+    description: str | None  # full type description, e.g. "AIRBUS A-380-800"
     total_flights: int
     total_hours: float
     home_base_icao: str | None
     last_seen: str | None
     spoof_count: int
     is_military: int
-    flags: str  # pre-rendered MIL/SPF/HOVER/TYP badge string
+    flags: str  # pre-rendered MIL/SPF/HOVER badge string
 
     @property
     def display_reg(self) -> str:
@@ -45,7 +46,13 @@ class AircraftRow:
 
     @property
     def display_type(self) -> str:
-        return self.type_code or "-"
+        """Prefer the human-friendly description over the terse type code.
+
+        `description` holds values like "AIRBUS A-380-800" while `type_code`
+        is the four-letter Mode S tag like "A388". The design specifies the
+        full description; we fall back to the type code then a dash.
+        """
+        return self.description or self.type_code or "-"
 
     @property
     def display_home(self) -> str:
@@ -72,6 +79,7 @@ def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int 
         SELECT s.icao AS icao,
                COALESCE(r.registration, x.registration) AS registration,
                COALESCE(r.type_code, x.type_code) AS type_code,
+               COALESCE(r.description, x.type_description) AS description,
                s.total_flights AS total_flights,
                s.total_hours AS total_hours,
                s.home_base_icao AS home_base_icao,
@@ -108,6 +116,7 @@ def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int 
                 icao=row["icao"],
                 registration=row["registration"],
                 type_code=row["type_code"],
+                description=row["description"],
                 total_flights=row["total_flights"] or 0,
                 total_hours=row["total_hours"] or 0.0,
                 home_base_icao=row["home_base_icao"],

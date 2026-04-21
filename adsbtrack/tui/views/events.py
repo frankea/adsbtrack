@@ -19,7 +19,7 @@ from ..widgets import (
     FilterBar,
     PageHeader,
     cell,
-    pill_markup,
+    pill_solid,
 )
 
 _SEV_STYLE = {
@@ -97,7 +97,7 @@ class EventsView(Vertical):
             ts_short = e.ts.strftime("%Y-%m-%d %H:%MZ") if getattr(e, "ts", None) else "-"
             self._table.add_row(
                 cell(ts_short, style=FG_1),
-                Text.from_markup(pill_markup(label, colour)),
+                Text.from_markup(pill_solid(label, colour)),
                 cell(e.event_type, style=FG_0),
                 cell(e.icao, style=ACCENT_CYAN),
                 cell(e.callsign or "-", style=FG_0 if e.callsign else FG_2),

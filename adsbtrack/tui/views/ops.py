@@ -1,10 +1,4 @@
-"""Operations pane: launch DB-writing commands with progress + cancel.
-
-Commands run in background worker threads that shell out to the same
-CLI subcommands the user would invoke manually. Each running command
-gets a card with the command line, a live status line, and a cancel
-binding.
-"""
+"""Operations pane: launch DB-writing adsbtrack commands with live status."""
 
 from __future__ import annotations
 
@@ -16,10 +10,17 @@ from datetime import UTC, datetime
 
 from textual.app import ComposeResult
 from textual.containers import Vertical, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import Input, Static
 
-from ..widgets import PageHeader
+from ..widgets import (
+    ACCENT_AMBER,
+    ACCENT_CYAN,
+    ACCENT_OK,
+    ACCENT_RED,
+    FG_0,
+    FG_2,
+    PageHeader,
+)
 
 
 @dataclass
@@ -32,10 +33,8 @@ class OpsJob:
     last_line: str = ""
 
 
-class OpsScreen(Screen):
-    """Launchpad + live status for long-running adsbtrack commands."""
-
-    BINDINGS = [("escape", "back", "Back")]
+class OpsView(Vertical):
+    """Launch + monitor long-running adsbtrack commands."""
 
     SUGGESTED_COMMANDS = [
         "adsbtrack fetch --hex <HEX> --source all --start 2026-01-01",
@@ -46,36 +45,39 @@ class OpsScreen(Screen):
     ]
 
     def __init__(self) -> None:
-        super().__init__()
-        self._header = PageHeader("operations", crumb="fetch / extract / enrich / acars / registry")
+        super().__init__(id="view-ops")
+        self._header = PageHeader(
+            "operations",
+            crumb="fetch / extract / enrich / acars / registry",
+            widget_id="ops-header",
+        )
         self._input = Input(placeholder="adsbtrack <command> ...   (enter to launch)", id="ops-input")
         self._jobs_panel = VerticalScroll(id="ops-jobs")
         self._suggestions = Static(
-            "[#6b7885]examples:[/]\n  " + "\n  ".join(self.SUGGESTED_COMMANDS),
+            f"[{FG_2}]examples:[/]\n  " + "\n  ".join(self.SUGGESTED_COMMANDS),
             id="ops-suggestions",
         )
         self._jobs: list[OpsJob] = []
         self._job_widgets: dict[int, Static] = {}
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield self._header
-            yield self._input
-            yield self._suggestions
-            yield self._jobs_panel
+        yield self._header
+        yield self._input
+        yield self._suggestions
+        yield self._jobs_panel
 
     def on_mount(self) -> None:
         self.set_interval(0.5, self._poll)
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:  # type: ignore[override]
+    def on_input_submitted(self, event: Input.Submitted) -> None:
         line = event.value.strip()
         if not line:
             return
         self._launch(line)
         self._input.value = ""
 
-    def action_back(self) -> None:
-        self.app.pop_screen()
+    def focus_filter(self) -> None:
+        self._input.focus()
 
     # --- job bookkeeping ---
 
@@ -87,10 +89,8 @@ class OpsScreen(Screen):
             return
         if not cmd:
             return
-        # Prefix with `uv run` when the user invokes `adsbtrack` so the project
-        # venv is used; otherwise run the command as-is.
         if cmd[0] == "adsbtrack":
-            cmd = ["uv", "run", "-m", "adsbtrack.cli", *cmd[1:]]
+            cmd = ["uv", "run", "python", "-m", "adsbtrack.cli", *cmd[1:]]
         try:
             proc = subprocess.Popen(
                 cmd,
@@ -110,14 +110,12 @@ class OpsScreen(Screen):
         self._jobs_panel.mount(widget)
 
     def _flash_error(self, text: str) -> None:
-        widget = Static(f"[#e0433a]{text}[/]")
+        widget = Static(f"[{ACCENT_RED}]{text}[/]")
         self._jobs_panel.mount(widget)
 
     def _poll(self) -> None:
         for idx, job in enumerate(self._jobs):
-            if job.proc is None:
-                continue
-            if job.returncode is not None:
+            if job.proc is None or job.returncode is not None:
                 continue
             rc = job.proc.poll()
             if job.proc.stdout is not None:
@@ -137,11 +135,14 @@ class OpsScreen(Screen):
     def _render_job(self, idx: int, job: OpsJob) -> str:
         cmd = " ".join(job.cmd)
         if job.returncode is None:
-            status = "[#f2b136]running[/]"
+            status = f"[{ACCENT_AMBER}]running[/]"
         elif job.returncode == 0:
-            status = "[#4ec07a]done[/]"
+            status = f"[{ACCENT_OK}]done[/]"
         else:
-            status = f"[#e0433a]exit {job.returncode}[/]"
+            status = f"[{ACCENT_RED}]exit {job.returncode}[/]"
         elapsed = (datetime.now(UTC) - job.started_at).total_seconds()
         last = job.last_line or "(no output yet)"
-        return f"[#4fb8e0]#{idx:02d}[/]  [b]{cmd}[/b]  {status}  [#6b7885]{elapsed:.0f}s[/]\n     [#6b7885]{last}[/]"
+        return (
+            f"[{ACCENT_CYAN}]#{idx:02d}[/]   [b {FG_0}]{cmd}[/]   {status}   "
+            f"[{FG_2}]{elapsed:.0f}s[/]\n     [{FG_2}]{last}[/]"
+        )

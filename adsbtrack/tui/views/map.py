@@ -1,20 +1,26 @@
-"""Text-mode map view: trace points projected into a character grid.
+"""Text-mode map view: trace points rendered into a character grid.
 
-Textual has no native map widget, so we render trace points into a
-fixed-width character grid coloured by readsb source. Good enough for
-at-a-glance trace shape inspection; the real cartographic view lives
-in the GUI export.
+Textual has no native map widget. We project the lat/lon of the loaded
+trace into an 80x24 character grid and colour each cell by the readsb
+source tag. Good enough for at-a-glance trace inspection; real
+cartography lives in the GUI export.
 """
 
 from __future__ import annotations
 
 from textual.app import ComposeResult
 from textual.containers import Vertical
-from textual.screen import Screen
 from textual.widgets import Static
 
 from ..queries import TracePoint, distinct_dates_for_icao, load_trace_points
-from ..widgets import PageHeader
+from ..widgets import (
+    ACCENT_CYAN,
+    ACCENT_OK,
+    ACCENT_VIOLET,
+    FG_0,
+    FG_2,
+    PageHeader,
+)
 
 _GRID_W = 80
 _GRID_H = 24
@@ -32,8 +38,9 @@ _SOURCE_COLOUR = {
 }
 
 
-def _project_points(points: list[TracePoint]) -> tuple[dict[tuple[int, int], str], tuple[float, float, float, float]]:
-    """Project lat/lon to a _GRID_W x _GRID_H grid; return a cell -> source dict."""
+def _project_points(
+    points: list[TracePoint],
+) -> tuple[dict[tuple[int, int], str], tuple[float, float, float, float]]:
     if not points:
         return {}, (0.0, 0.0, 0.0, 0.0)
     lats = [p.lat for p in points]
@@ -63,54 +70,57 @@ def _render_grid(grid: dict[tuple[int, int], str]) -> str:
             if src is None:
                 row_chars.append(" ")
                 continue
-            colour = _SOURCE_COLOUR.get(src, "#e4ecf3")
+            colour = _SOURCE_COLOUR.get(src, FG_0)
             row_chars.append(f"[{colour}]*[/]")
         lines.append("".join(row_chars))
     return "\n".join(lines)
 
 
-class MapScreen(Screen):
+class MapView(Vertical):
     """Trace playback for one aircraft, one date."""
 
-    BINDINGS = [("escape", "back", "Back")]
-
-    def __init__(self, icao: str, date: str | None = None) -> None:
-        super().__init__()
-        self._icao = icao
-        self._date = date
-        self._header = PageHeader(icao, crumb="map")
-        self._body = Static("loading...", id="map-body")
+    def __init__(self) -> None:
+        super().__init__(id="view-map")
+        self._icao: str | None = None
+        self._date: str | None = None
+        self._header = PageHeader("map", crumb="select an aircraft first", widget_id="map-header")
+        self._body = Static(" ", id="map-body")
 
     def compose(self) -> ComposeResult:
-        with Vertical():
-            yield self._header
-            yield self._body
+        yield self._header
+        yield self._body
 
-    def on_mount(self) -> None:
+    def set_icao(self, icao: str | None) -> None:
+        self._icao = icao
+        self._date = None
+        self.refresh_data()
+
+    def refresh_data(self) -> None:
+        if self._icao is None:
+            self._body.update(f"[{FG_2}]no aircraft selected. press 1 and pick one.[/]")
+            self._header.set_crumb("select an aircraft first")
+            return
         if self._date is None:
             dates = distinct_dates_for_icao(self.app.db, self._icao)
             if not dates:
-                self._body.update(f"no trace data for {self._icao}")
+                self._body.update(f"[{FG_2}]no trace data for {self._icao}[/]")
+                self._header.set_title(self._icao)
+                self._header.set_crumb("no trace data")
                 return
             self._date = dates[0]
-        self._refresh()
-
-    def action_back(self) -> None:
-        self.app.pop_screen()
-
-    def _refresh(self) -> None:
-        points = load_trace_points(self.app.db, self._icao, self._date or "")
+        points = load_trace_points(self.app.db, self._icao, self._date)
         grid, bounds = _project_points(points)
         if not grid:
-            self._body.update(f"no trace points on {self._date} for {self._icao}")
+            self._body.update(f"[{FG_2}]no trace points on {self._date} for {self._icao}[/]")
             return
         lat_min, lat_max, lon_min, lon_max = bounds
         legend = (
-            f"[#6b7885]bbox[/] ({lat_min:.3f},{lon_min:.3f})-({lat_max:.3f},{lon_max:.3f})  "
-            f"[#6b7885]points[/] {len(points):,}\n"
-            "[#4ec07a]* adsb[/]  [#6b7885]* mlat[/]  [#f2b136]* tisb[/]  "
-            "[#4fb8e0]* adsr[/]  [#c24bd6]* adsc[/]\n"
+            f"[{FG_2}]bbox[/] ({lat_min:.3f},{lon_min:.3f})-({lat_max:.3f},{lon_max:.3f})   "
+            f"[{FG_2}]points[/] [{FG_0}]{len(points):,}[/]\n"
+            f"[{ACCENT_OK}]* adsb[/]   [{FG_2}]* mlat[/]   [#f2b136]* tisb[/]   "
+            f"[{ACCENT_CYAN}]* adsr[/]   [{ACCENT_VIOLET}]* adsc[/]\n"
         )
         self._body.update(legend + "\n" + _render_grid(grid))
+        self._header.set_title(self._icao)
         self._header.set_crumb(f"map / {self._date}")
         self._header.set_trailing(f"{len(points):,} points")

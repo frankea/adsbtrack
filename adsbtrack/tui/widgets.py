@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal
+from textual.css.query import NoMatches
 from textual.widgets import Input, Label, Static
 
 # ---- colour tokens (mirror of design/colors_and_type.css) ----
@@ -63,11 +64,10 @@ _PILL_BG = {
 
 
 def pill_markup(label: str, colour: str) -> str:
-    """Return Rich markup for an outlined pill.
-
-    Border + tint is simulated in the terminal by setting the foreground
-    to the accent colour and the background to a dimmed version of the
-    same accent. Matches the design's outlined-with-tinted-bg pill style.
+    """Return Rich markup for a tinted-background pill: accent-hued text
+    on a dimmed version of the same accent. No terminal border is drawn;
+    the separation from surrounding text comes from the background tint.
+    Pair with ``pill_solid`` when the pill itself carries the meaning.
     """
     bg = _PILL_BG.get(colour, BG_2)
     return f"[{colour} on {bg}] {label} [/]"
@@ -94,7 +94,10 @@ def _widget_width(widget, fallback: int = 120) -> int:
     """
     try:
         w = widget.size.width
-    except Exception:
+    except (RuntimeError, NoMatches):
+        # RuntimeError: Textual raises this from DOM resolution when the
+        # widget is not yet attached to a screen (pre-mount ``_build()``).
+        # NoMatches: same, but raised by ``find_widget`` on a detached tree.
         return fallback
     return w if w else fallback
 
@@ -399,11 +402,7 @@ class Sidebar(Label):
         lines.extend(self._render_items(_SESSION, highlight=None))
         return Text.from_markup("\n".join(lines))
 
-    # Sidebar width is 24 cols. We paint a 1-cell leading "▌" marker when
-    # active, then 1 space of gutter, then the label padded to fill, then
-    # a 3-cell trailing kbd box aligned right.
     _LABEL_WIDTH = 17
-    _ROW_WIDTH = 22
 
     @classmethod
     def _render_items(cls, items: list[tuple[str, str, str]], *, highlight: str | None) -> list[str]:

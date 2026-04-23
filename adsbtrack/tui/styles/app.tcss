@@ -109,54 +109,11 @@ DataTable > .datatable--even-row {
     overflow-y: auto;
 }
 
-/* Map HUD overlays: absolutely-positioned labels over the braille canvas. */
-
-#map-body {
-    height: 1fr;
-    width: 1fr;
-    layers: base hud;
-}
-
-MapCanvas {
-    layer: base;
-    height: 1fr;
-    width: 1fr;
-}
-
-.map-hud {
-    layer: hud;
-    background: #141b23;
-    color: #aab6c2;
-    border: solid #222c37;
-    padding: 0 1;
-    height: auto;
-    width: auto;
-}
-
-.map-layers {
-    dock: left;
-    width: 24;
-    margin: 1 0 0 1;
-}
-
-.map-info {
-    dock: right;
-    width: 30;
-    margin: 1 1 0 0;
-}
-
-.map-scalebar {
-    dock: bottom;
-    width: 24;
-    margin: 0 0 1 1;
-}
-
-.map-scrubber {
-    dock: bottom;
-    width: 44;
-    margin: 0 1 1 0;
-    content-align: right middle;
-}
+/* Map view: canvas and HUD strip styling lives inline in
+ * adsbtrack/tui/views/map.py on MapCanvas, _HudRow, and _HudLabel.
+ * The layout is a plain Vertical of PageHeader / _HudRow(top) / canvas /
+ * _HudRow(bottom); no docking or CSS layers are involved.
+ */
 
 /* Jump-to-hex modal. */
 

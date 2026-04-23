@@ -15,6 +15,8 @@ monospace kbd-hint strip with a trailing mode indicator on the right.
 from __future__ import annotations
 
 import contextlib
+import sqlite3
+from collections.abc import Callable
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -84,11 +86,9 @@ class AdsbtrackApp(App):
         return self._db
 
     def on_mount(self) -> None:
-        flights_n, aircraft_n, traces_n = 0, 0, 0
-        with contextlib.suppress(Exception):
-            flights_n = count_flights(self.db)
-            aircraft_n = count_aircraft(self.db)
-            traces_n = count_trace_bytes(self.db)
+        flights_n = self._safe_count("flights", count_flights)
+        aircraft_n = self._safe_count("aircraft", count_aircraft)
+        traces_n = self._safe_count("traces", count_trace_bytes)
         self.query_one(StatusStrip).set_counts(flights=flights_n, aircraft=aircraft_n, traces=traces_n)
         self.query_one(Sidebar).set_active("aircraft")
         self.query_one(ActionBar).set_mode(_MODE_NAMES["aircraft"])
@@ -96,8 +96,15 @@ class AdsbtrackApp(App):
 
     def on_unmount(self) -> None:
         if self._db is not None:
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(sqlite3.DatabaseError):
                 self._db.close()
+
+    def _safe_count(self, label: str, fn: Callable[[Database], int]) -> int:
+        try:
+            return fn(self.db)
+        except sqlite3.DatabaseError as exc:
+            self.notify(f"status strip: {label} query failed: {exc}", severity="error")
+            return 0
 
     # --- composition ---
 

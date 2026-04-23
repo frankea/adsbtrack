@@ -166,7 +166,7 @@ class OpsView(Vertical):
                 self._job_cards[idx].update(self._render_job(idx, job))
 
     def _render_job(self, idx: int, job: OpsJob) -> Text:
-        cmd_tail = " ".join(job.cmd[4:] if job.cmd[:4] == ["uv", "run", "python", "-m"] else job.cmd)
+        cmd_tail = " ".join(job.cmd)
         heading = cmd_tail.split(" ", 1)[0] if cmd_tail else "adsbtrack"
         args = cmd_tail[len(heading) :].strip()
         if job.returncode is None:

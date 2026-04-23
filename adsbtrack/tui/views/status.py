@@ -8,6 +8,7 @@ side by side, and a wide FAA-registry card at the bottom.
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from rich.text import Text
@@ -48,8 +49,8 @@ def _build_sources_body(src: dict[str, Any] | None) -> Text:
         ("ADS-B", src.get("adsb") or 0.0, "#4ec07a"),
         ("MLAT", src.get("mlat") or 0.0, "#6b7885"),
         ("TIS-B", src.get("tisb") or 0.0, "#f2b136"),
-        ("ADS-R", 0.0, "#4fb8e0"),
         ("ADS-C", src.get("adsc") or 0.0, "#c24bd6"),
+        ("OTHER", src.get("other") or 0.0, "#6b7885"),
     ]
     lines = [f"[{FG_2}]POSITION SOURCES (WEIGHTED)[/]"]
     for label, pct, colour in rows:
@@ -60,20 +61,7 @@ def _build_sources_body(src: dict[str, Any] | None) -> Text:
 def _build_missions_body(missions: list[tuple[str, int]]) -> Text:
     if not missions:
         return Text.from_markup(f"[{FG_2}](no mission data)[/]")
-    lines = [f"[{FG_2}]MISSION MIX[/]"]
     top = max(n for _, n in missions)
-    for name, n in missions[:6]:
-        lines.append(
-            _bar_row(
-                (name or "--")[:8].upper(),
-                n,
-                ACCENT_MAGENTA,
-                bar_width=24,
-                total=float(top),
-            ).replace(f"{n:5.1f}%", f"{n:>5}")
-        )
-    # Values above were bar-row-formatted; fix up the right-hand column to show
-    # raw counts rather than percents. Rebuild manually.
     lines = [f"[{FG_2}]MISSION MIX[/]"]
     for name, n in missions[:6]:
         fill = max(0, min(24, int(round((n / top) * 24))))
@@ -101,16 +89,15 @@ def _build_signal_body(snap: dict[str, Any]) -> Text:
     spoof = snap.get("spoof_count") or 0
     tier_colour = ACCENT_OK if spoof == 0 else ACCENT_AMBER
     tier = "TIER A" if spoof == 0 else "TIER B"
-    # 52-bar sparkline derived deterministically from flight count so it
-    # doesn't flicker between renders.
+    # 52-bar strip derived deterministically from flight count so it
+    # doesn't flicker between renders. Not a real weekly-uptime signal
+    # yet; the label reflects that.
     total_flights = (snap.get("stats") or {}).get("total_flights") or 0
-    import math as _m
-
     glyphs = "▁▂▃▄▅▆▇█"
     spark = []
     for i in range(52):
         seed = (total_flights + i * 13) % 97
-        h = int(_m.sin(seed * 0.13) * 4 + 4) % 8
+        h = int(math.sin(seed * 0.13) * 4 + 4) % 8
         colour = ACCENT_AMBER if spoof and (i % 17 == 0) else ACCENT_OK
         spark.append(f"[{colour}]{glyphs[h]}[/]")
     return Text.from_markup(
@@ -118,7 +105,7 @@ def _build_signal_body(snap: dict[str, Any]) -> Text:
         f"[b {tier_colour}]{tier}[/]\n"
         f"[{FG_2}]sil ≥ 2  nic ≥ 7  {spoof} v2_sil0 events[/]\n"
         f"{''.join(spark)}\n"
-        f"[{FG_2}]weekly uptime, 52 weeks[/]"
+        f"[{FG_2}]activity strip (placeholder, not real uptime)[/]"
     )
 
 

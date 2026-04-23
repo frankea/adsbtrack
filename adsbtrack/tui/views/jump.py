@@ -88,6 +88,9 @@ class JumpToHex(ModalScreen[str | None]):
 
     def action_accept(self) -> None:
         if not self._matches:
+            query = self._input.value.strip()
+            if query:
+                self.app.notify(f"no aircraft match '{query}'", severity="warning")
             self.dismiss(None)
             return
         idx = self._results.cursor_row or 0

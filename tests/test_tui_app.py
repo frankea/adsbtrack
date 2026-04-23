@@ -68,3 +68,27 @@ async def test_help_overlay_opens_and_dismisses(empty_db):
         await pilot.press("escape")
         await pilot.pause()
         assert not any(isinstance(s, HelpScreen) for s in app.screen_stack)
+
+
+async def test_app_navigates_after_selecting_aircraft(seeded_db):
+    """After an ICAO is picked, the flights/map/status views render."""
+    app = AdsbtrackApp(seeded_db)
+    async with app.run_test() as pilot:
+        from textual.widgets import ContentSwitcher
+
+        app._open_icao("aaa111")
+        await pilot.pause()
+        switcher = app.query_one(ContentSwitcher)
+        # _open_icao routes to flights
+        assert switcher.current == "view-flights"
+        for key, target in (
+            ("5", "view-map"),
+            ("6", "view-status"),
+            ("3", "view-events"),
+            ("4", "view-spoof"),
+            ("1", "view-aircraft"),
+            ("2", "view-flights"),
+        ):
+            await pilot.press(key)
+            await pilot.pause()
+            assert switcher.current == target, f"after pressing {key!r}"

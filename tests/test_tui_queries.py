@@ -8,10 +8,7 @@ migrations and schema stay in the loop.
 
 from __future__ import annotations
 
-import json
 from datetime import UTC, datetime
-
-import pytest
 
 from adsbtrack.db import Database
 from adsbtrack.models import Flight
@@ -28,80 +25,7 @@ from adsbtrack.tui.queries import (
     status_snapshot,
 )
 
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def seeded_db(tmp_path):
-    """DB with two aircraft: one clean, one with a rejected spoof broadcast."""
-    db_path = tmp_path / "tui.db"
-    with Database(db_path) as db:
-        # Clean aircraft
-        db.insert_flight(
-            Flight(
-                icao="aaa111",
-                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
-                takeoff_lat=40.0,
-                takeoff_lon=-74.0,
-                takeoff_date="2026-03-01",
-                landing_time=datetime(2026, 3, 1, 14, 0, tzinfo=UTC),
-                landing_type="confirmed",
-                callsign="UAL1",
-                destination_icao="KBOS",
-                origin_icao="KEWR",
-                duration_minutes=120.0,
-                max_altitude=35000,
-                cruise_gs_kt=430,
-                landing_confidence=0.9,
-                mission_type="transport",
-            )
-        )
-        db.conn.execute(
-            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
-            ("aaa111", "N111AA", "B738", "BOEING 737-800"),
-        )
-        # Rejected-as-spoofed broadcast
-        db.insert_spoofed_broadcast(
-            icao="bbb222",
-            takeoff_time="2026-04-21T00:49:47.580000+00:00",
-            landing_time="2026-04-21T01:41:52.140000+00:00",
-            takeoff_date="2026-04-21",
-            callsign="EK01",
-            takeoff_lat=25.25,
-            takeoff_lon=55.38,
-            landing_lat=27.14,
-            landing_lon=55.55,
-            max_altitude=250,
-            data_points=350,
-            sources="adsbfi,adsbx",
-            origin_icao=None,
-            destination_icao=None,
-            reason="bimodal_integrity",
-            reason_detail=json.dumps(
-                {
-                    "date": "2026-04-21",
-                    "v2_samples": 350,
-                    "v2_sil0_pct": 25.14,
-                    "v2_nic0_pct": 27.14,
-                    "sources": ["adsbfi", "adsbx"],
-                    "source_rates": [["adsbfi", 26.04], ["adsbx", 24.31]],
-                }
-            ),
-        )
-        db.conn.execute(
-            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
-            ("bbb222", "A6-EEN", "A388", "AIRBUS A-380-800"),
-        )
-        db.refresh_aircraft_stats("aaa111")
-        db.commit()
-    return db_path
-
-
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# Fixtures live in tests/conftest.py so the TUI app smoke tests can reuse them.
 
 
 def test_count_helpers(seeded_db):
@@ -231,3 +155,60 @@ def test_status_snapshot_includes_indicators(seeded_db):
     assert stats["signal_lost_landings"] == 0
     assert stats["off_airport_landings"] == 0
     assert stats["days_with_data"] == 0
+
+
+def _flight(icao: str, hour: int, **overrides):
+    base = dict(
+        icao=icao,
+        takeoff_time=datetime(2026, 3, 2, hour, 0, tzinfo=UTC),
+        takeoff_lat=40.0,
+        takeoff_lon=-74.0,
+        takeoff_date="2026-03-02",
+        landing_time=datetime(2026, 3, 2, hour + 1, 0, tzinfo=UTC),
+        landing_type="confirmed",
+        callsign="TEST",
+        destination_icao="KBOS",
+        origin_icao="KEWR",
+        duration_minutes=60.0,
+        max_altitude=35000,
+        cruise_gs_kt=430,
+        landing_confidence=0.9,
+        mission_type="transport",
+    )
+    base.update(overrides)
+    return Flight(**base)
+
+
+def test_status_snapshot_indicator_branches_each_hit_one(tmp_path):
+    db_path = tmp_path / "indicators.db"
+    with Database(db_path) as db:
+        icao = "ccc333"
+        db.insert_flight(_flight(icao, hour=1, emergency_squawk="7700"))
+        db.insert_flight(_flight(icao, hour=3, had_go_around=1))
+        db.insert_flight(_flight(icao, hour=5, max_hover_secs=600))
+        db.insert_flight(_flight(icao, hour=7, landing_type="signal_lost"))
+        db.insert_flight(_flight(icao, hour=9, landing_type="confirmed", destination_icao=None))
+        db.refresh_aircraft_stats(icao)
+        db.commit()
+        snap = status_snapshot(db, icao)
+    stats = snap["stats"]
+    assert stats["emergency_flights"] == 1
+    assert stats["go_around_flights"] == 1
+    assert stats["long_hover_flights"] == 1
+    assert stats["signal_lost_landings"] == 1
+    assert stats["off_airport_landings"] == 1
+    # The _flight default is a confirmed landing with destination_icao set, so
+    # four of the five rows above qualify as confirmed landings (all except
+    # the signal_lost one).
+    assert stats["confirmed_landings"] == 4
+
+
+def test_status_snapshot_unknown_icao(seeded_db):
+    with Database(seeded_db) as db:
+        snap = status_snapshot(db, "ffffff")
+    assert snap["icao"] == "ffffff"
+    assert snap["stats"] is None
+    assert snap["registry"] is None
+    assert snap["sources"] is None
+    assert snap["missions"] == []
+    assert snap["spoof_count"] == 0

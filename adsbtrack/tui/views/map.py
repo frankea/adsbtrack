@@ -157,7 +157,7 @@ class MapLayersStrip(_HudLabel):
 
 
 class MapTraceInfoStrip(_HudLabel):
-    """Top-right: one-line readout of the trace cursor."""
+    """Top-right: one-line readout of the last trace point."""
 
     DEFAULT_CSS = """
     MapTraceInfoStrip {
@@ -171,12 +171,12 @@ class MapTraceInfoStrip(_HudLabel):
     """
 
     def __init__(self) -> None:
-        self._text = Text.from_markup(f"[{FG_2}](no cursor)[/]")
+        self._text = Text.from_markup(f"[{FG_2}](no trace)[/]")
         super().__init__(self._text, id="map-info", classes="map-info")
 
     def set_point(self, point: TracePoint | None, origin_ts: float | None = None) -> None:
         if point is None:
-            self.update(Text.from_markup(f"[{FG_2}](no cursor)[/]"))
+            self.update(Text.from_markup(f"[{FG_2}](no trace)[/]"))
             return
         delta = ""
         if origin_ts is not None:
@@ -190,7 +190,7 @@ class MapTraceInfoStrip(_HudLabel):
         src_colour = _SOURCE_COLOUR.get(point.source, FG_0)
         alt = f"{point.alt_ft:,} ft" if point.alt_ft is not None else "ground"
         parts = [
-            f"[{FG_2}]CURSOR {delta}[/]",
+            f"[{FG_2}]LAST {delta}[/]",
             f"[{FG_2}]src[/] [{src_colour}]{src}[/]",
             f"[{FG_2}]lat[/] [{FG_0}]{point.lat:.4f}[/]",
             f"[{FG_2}]lon[/] [{FG_0}]{point.lon:.4f}[/]",
@@ -222,7 +222,12 @@ class MapScalebarStrip(_HudLabel):
 
 
 class MapScrubberStrip(_HudLabel):
-    """Bottom-right: trace-playback scrubber."""
+    """Bottom-right: static duration readout drawn as a full progress bar.
+
+    The bar always renders at 1.0 progress; there is no playback or scrub
+    input. It exists to show total trace duration in the same corner the
+    design bundle reserved for a future scrubber.
+    """
 
     DEFAULT_CSS = """
     MapScrubberStrip {

@@ -74,21 +74,45 @@ async def test_app_navigates_after_selecting_aircraft(seeded_db):
     """After an ICAO is picked, the flights/map/status views render."""
     app = AdsbtrackApp(seeded_db)
     async with app.run_test() as pilot:
-        from textual.widgets import ContentSwitcher
+        from textual.widgets import ContentSwitcher, DataTable
+
+        from adsbtrack.tui.views.flights import FlightsView
+        from adsbtrack.tui.views.status import StatusView
+        from adsbtrack.tui.widgets import Sidebar
 
         app._open_icao("aaa111")
         await pilot.pause()
         switcher = app.query_one(ContentSwitcher)
-        # _open_icao routes to flights
+        sidebar = app.query_one(Sidebar)
+        # _open_icao routes to flights and tags the sidebar in lockstep.
         assert switcher.current == "view-flights"
-        for key, target in (
-            ("5", "view-map"),
-            ("6", "view-status"),
-            ("3", "view-events"),
-            ("4", "view-spoof"),
-            ("1", "view-aircraft"),
-            ("2", "view-flights"),
+        assert sidebar._active == "flights"
+
+        # The seeded aaa111 has one confirmed flight and a full registry row;
+        # assert both render through to the view content, not just the
+        # switcher toggle, so a silently-swallowed set_icao would fail here.
+        flights_table = app.query_one(FlightsView).query_one(DataTable)
+        assert flights_table.row_count == 1
+
+        for key, target, sidebar_active in (
+            ("5", "view-map", "map"),
+            ("6", "view-status", "status"),
+            ("3", "view-events", "events"),
+            ("4", "view-spoof", "spoof"),
+            ("1", "view-aircraft", "aircraft"),
+            ("2", "view-flights", "flights"),
         ):
             await pilot.press(key)
             await pilot.pause()
             assert switcher.current == target, f"after pressing {key!r}"
+            assert sidebar._active == sidebar_active, f"sidebar after {key!r}"
+
+        # After landing on status (key "6" above will have refreshed the
+        # grid), walk the mounted cards and assert the seeded registration
+        # from aircraft_registry made it through to a rendered card. A
+        # regression that silently dropped registry merge in status_snapshot
+        # would leave "N111AA" out of the grid entirely.
+        await pilot.press("6")
+        await pilot.pause()
+        rendered = "".join(str(child.render()) for child in app.query_one(StatusView)._grid.children)
+        assert "N111AA" in rendered

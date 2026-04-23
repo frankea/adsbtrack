@@ -139,7 +139,7 @@ class MapLayersStrip(_HudLabel):
     """Top-left: colour-coded list of active layers."""
 
     def __init__(self) -> None:
-        super().__init__(self._build(), id="map-layers", classes="map-layers")
+        super().__init__(self._build(), id="map-layers")
 
     def _build(self) -> Text:
         chunks = [
@@ -172,7 +172,7 @@ class MapTraceInfoStrip(_HudLabel):
 
     def __init__(self) -> None:
         self._text = Text.from_markup(f"[{FG_2}](no trace)[/]")
-        super().__init__(self._text, id="map-info", classes="map-info")
+        super().__init__(self._text, id="map-info")
 
     def set_point(self, point: TracePoint | None, origin_ts: float | None = None) -> None:
         if point is None:
@@ -204,7 +204,7 @@ class MapScalebarStrip(_HudLabel):
 
     def __init__(self) -> None:
         self._span_nm = 0.0
-        super().__init__(self._build(), id="map-scalebar", classes="map-scalebar")
+        super().__init__(self._build(), id="map-scalebar")
 
     def set_span(self, nm: float) -> None:
         self._span_nm = nm
@@ -225,8 +225,8 @@ class MapScrubberStrip(_HudLabel):
     """Bottom-right: static duration readout drawn as a full progress bar.
 
     The bar always renders at 1.0 progress; there is no playback or scrub
-    input. It exists to show total trace duration in the same corner the
-    design bundle reserved for a future scrubber.
+    input. It exists to show total trace duration in the bottom-right of
+    the canvas.
     """
 
     DEFAULT_CSS = """
@@ -243,7 +243,7 @@ class MapScrubberStrip(_HudLabel):
     def __init__(self) -> None:
         self._progress = 0.0
         self._label = "--:-- / --:--"
-        super().__init__(self._build(), id="map-scrubber", classes="map-scrubber")
+        super().__init__(self._build(), id="map-scrubber")
 
     def set_progress(self, progress: float, label: str) -> None:
         self._progress = max(0.0, min(1.0, progress))

@@ -95,9 +95,6 @@ def _widget_width(widget, fallback: int = 120) -> int:
     try:
         w = widget.size.width
     except (RuntimeError, NoMatches):
-        # RuntimeError: Textual raises this from DOM resolution when the
-        # widget is not yet attached to a screen (pre-mount ``_build()``).
-        # NoMatches: same, but raised by ``find_widget`` on a detached tree.
         return fallback
     return w if w else fallback
 

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from adsbtrack.db import Database
 from adsbtrack.models import Flight
 from adsbtrack.tui.queries import (
@@ -197,9 +199,10 @@ def test_status_snapshot_indicator_branches_each_hit_one(tmp_path):
     assert stats["long_hover_flights"] == 1
     assert stats["signal_lost_landings"] == 1
     assert stats["off_airport_landings"] == 1
-    # The _flight default is a confirmed landing with destination_icao set, so
-    # four of the five rows above qualify as confirmed landings (all except
-    # the signal_lost one).
+    # Four of the five rows are confirmed landings (all except the
+    # signal_lost one). off_airport_landings is a subset of
+    # confirmed_landings, so the hour=9 row is counted once in each - not a
+    # double-count bug; future readers should not "fix" the 4 to 3.
     assert stats["confirmed_landings"] == 4
 
 
@@ -212,3 +215,62 @@ def test_status_snapshot_unknown_icao(seeded_db):
     assert snap["sources"] is None
     assert snap["missions"] == []
     assert snap["spoof_count"] == 0
+
+
+def test_status_snapshot_days_with_data_counts_trace_days(tmp_path):
+    db_path = tmp_path / "days.db"
+    with Database(db_path) as db:
+        icao = "ddd444"
+        db.insert_flight(_flight(icao, hour=2))
+        db.refresh_aircraft_stats(icao)
+        for date in ("2026-03-02", "2026-03-03", "2026-03-03"):
+            db.insert_trace_day(
+                icao,
+                date,
+                {"timestamp": 1_700_000_000.0, "trace": [[0, 40.0, -74.0, 1000]]},
+                source="adsbx" if date != "2026-03-03" else "airplaneslive",
+            )
+        db.commit()
+        snap = status_snapshot(db, icao)
+    # Two distinct dates seeded (2026-03-03 is inserted twice for different
+    # sources; the UNIQUE(icao, date, source) key keeps both rows but
+    # COUNT(DISTINCT date) collapses them).
+    assert snap["stats"]["days_with_data"] == 2
+
+
+def test_status_snapshot_sources_weighted_average(tmp_path):
+    db_path = tmp_path / "sources.db"
+    with Database(db_path) as db:
+        icao = "eee555"
+        # Two flights, one ADS-B-heavy with many points, one MLAT-heavy
+        # with few. The weighted ADS-B pct should favour the first flight.
+        db.insert_flight(_flight(icao, hour=1, adsb_pct=90.0, mlat_pct=10.0, tisb_pct=0.0, data_points=900))
+        db.insert_flight(_flight(icao, hour=3, adsb_pct=10.0, mlat_pct=90.0, tisb_pct=0.0, data_points=100))
+        db.refresh_aircraft_stats(icao)
+        db.commit()
+        snap = status_snapshot(db, icao)
+    src = snap["sources"]
+    # (90 * 900 + 10 * 100) / (900 + 100) = 82.0
+    assert src["adsb"] == pytest.approx(82.0)
+    assert src["mlat"] == pytest.approx(18.0)
+    assert src["total_points"] == 1000
+
+
+def test_status_snapshot_missions_filters_nulls_and_limits_to_six(tmp_path):
+    db_path = tmp_path / "missions.db"
+    with Database(db_path) as db:
+        icao = "fff666"
+        # Null mission_type should be dropped by the queries layer, not by
+        # the SQL. Seed one null flight plus seven distinct mission types
+        # to confirm the LIMIT 6 clause holds.
+        db.insert_flight(_flight(icao, hour=1, mission_type=None))
+        for hour, name in enumerate(
+            ["training", "transport", "cargo", "medical", "survey", "patrol", "sightseeing"], start=3
+        ):
+            db.insert_flight(_flight(icao, hour=hour, mission_type=name))
+        db.refresh_aircraft_stats(icao)
+        db.commit()
+        snap = status_snapshot(db, icao)
+    names = [m[0] for m in snap["missions"]]
+    assert None not in names, "null mission_type should be filtered out"
+    assert len(snap["missions"]) == 6, "LIMIT 6 not enforced"

@@ -38,7 +38,9 @@ class AircraftRow:
     last_seen: str | None
     spoof_count: int
     is_military: int
-    flags: str  # pre-rendered MIL/SPF/HOVER badge string
+    has_hover: bool
+    has_type_override: bool
+    flags: str  # pre-rendered MIL/SPF/HOVER/TYP badge string
 
     @property
     def display_reg(self) -> str:
@@ -85,7 +87,11 @@ def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int 
                s.home_base_icao AS home_base_icao,
                s.last_seen AS last_seen,
                (SELECT COUNT(*) FROM spoofed_broadcasts sb WHERE sb.icao = s.icao) AS spoof_count,
-               COALESCE(x.is_military, 0) AS is_military
+               COALESCE(x.is_military, 0) AS is_military,
+               EXISTS (SELECT 1 FROM flights f
+                        WHERE f.icao = s.icao AND f.max_hover_secs >= 300) AS has_hover,
+               (x.type_code IS NOT NULL AND r.type_code IS NOT NULL
+                    AND x.type_code != r.type_code) AS has_type_override
           FROM aircraft_stats s
           LEFT JOIN aircraft_registry r ON r.icao = s.icao
           LEFT JOIN hex_crossref x ON x.icao = s.icao
@@ -106,10 +112,13 @@ def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int 
     rows = db.conn.execute(sql, params).fetchall()
     out = []
     for row in rows:
+        has_hover = bool(row["has_hover"])
+        has_type_override = bool(row["has_type_override"])
         flags = _render_flags(
             is_military=row["is_military"],
             spoof_count=row["spoof_count"],
-            type_code=row["type_code"],
+            has_hover=has_hover,
+            has_type_override=has_type_override,
         )
         out.append(
             AircraftRow(
@@ -123,21 +132,37 @@ def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int 
                 last_seen=row["last_seen"],
                 spoof_count=row["spoof_count"],
                 is_military=row["is_military"],
+                has_hover=has_hover,
+                has_type_override=has_type_override,
                 flags=flags,
             )
         )
     return out
 
 
-def _render_flags(*, is_military: int, spoof_count: int, type_code: str | None) -> str:
-    """Render a compact MIL/SPF/TYP badge string for the flags column."""
+def _render_flags(
+    *,
+    is_military: int,
+    spoof_count: int,
+    has_hover: bool,
+    has_type_override: bool,
+) -> str:
+    """Render the MIL / SPF / HOVER / TYP badge string for the flags column.
+
+    Matches the concept in ``design/ui_kits/tui/index.html`` and the README
+    enumeration. HOVER fires when any flight for this aircraft has a hover
+    >= 5 min; TYP fires when the cross-ref type disagrees with the FAA
+    registry type (i.e. a manual override exists).
+    """
     flags: list[str] = []
     if is_military:
         flags.append("MIL")
     if spoof_count:
         flags.append("SPF")
-    if type_code and type_code in {"B407", "B429", "S76", "S92", "H60", "UH60", "EC35", "EC45"}:
-        flags.append("HELI")
+    if has_hover:
+        flags.append("HOVER")
+    if has_type_override:
+        flags.append("TYP")
     return " ".join(flags)
 
 

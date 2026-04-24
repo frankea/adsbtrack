@@ -168,7 +168,9 @@ class StatusStrip(Label):
         self.update(self._build())
 
     def _build(self) -> Text:
-        sep = f" [{FG_2}]{DOT}[/] "
+        # Concept uses flex gap between items (no glyph). We mirror that with
+        # a double-space separator in monospace so items don't visually merge.
+        sep = "  "
         left = sep.join(
             [
                 f"[b {FG_0}]adsbtrack[/]",
@@ -224,10 +226,14 @@ class PageHeader(Label):
         trailing: str | Text = "",
         *,
         widget_id: str | None = None,
+        crumb_prefix: str = DOT,
     ) -> None:
         self._title = title
         self._crumb = crumb
         self._trailing: str | Text = trailing
+        # Concept uses `›` for scope crumbs (aircraft, events, spoof) and
+        # `·` for attribute crumbs (flights, map, status).
+        self._crumb_prefix = crumb_prefix
         super().__init__(self._build(), id=widget_id, classes="page-header")
 
     def on_resize(self) -> None:
@@ -248,7 +254,7 @@ class PageHeader(Label):
     def _build(self) -> Text:
         left_parts: list[str] = [f"[b {FG_0}]{self._title}[/]"]
         if self._crumb:
-            left_parts.append(f"[{FG_2}]{DOT} {self._crumb}[/]")
+            left_parts.append(f"[{FG_2}]{self._crumb_prefix} {self._crumb}[/]")
         left = Text.from_markup("  ".join(left_parts))
         if isinstance(self._trailing, Text):
             right = self._trailing

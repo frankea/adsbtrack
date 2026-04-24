@@ -31,7 +31,7 @@ def _fmt_last_seen(s: str | None) -> Text:
 
 
 def _fmt_flags(row: AircraftRow) -> Text:
-    """Render the trailing FLAGS cell.
+    """Render the trailing FLAGS cell (MIL / SPF / HOVER / TYP per concept).
 
     SPF is a bare badge because the count already has its own column
     to the left; doubling the number would be redundant and noisier
@@ -42,8 +42,10 @@ def _fmt_flags(row: AircraftRow) -> Text:
         parts.append(pill_markup("MIL", ACCENT_VIOLET))
     if row.spoof_count:
         parts.append(pill_markup("SPF", ACCENT_VIOLET))
-    if "HELI" in row.flags.split():
-        parts.append(pill_markup("HELI", ACCENT_AMBER))
+    if row.has_hover:
+        parts.append(pill_markup("HOVER", ACCENT_AMBER))
+    if row.has_type_override:
+        parts.append(pill_markup("TYP", ACCENT_AMBER))
     return Text.from_markup(" ".join(parts)) if parts else dash()
 
 
@@ -67,6 +69,7 @@ class AircraftView(Vertical):
             crumb="all (-)",
             trailing=Text.from_markup(f"[{FG_2}]sort:[/] [{ACCENT_CYAN}]last_seen ↓[/]"),
             widget_id="aircraft-header",
+            crumb_prefix="›",
         )
         self._filter = FilterBar(
             placeholder="filter (fzf)   e.g.  pc-12  or  N512  or  ae6",

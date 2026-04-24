@@ -335,7 +335,12 @@ class MapView(Vertical):
         lats = [p.lat for p in points]
         lons = [p.lon for p in points]
         self._header.set_title(self._icao)
-        self._header.set_crumb(f"{self._date}")
+        route = self._route_for(self._icao, self._date)
+        if route is not None:
+            origin, destination = route
+            self._header.set_crumb(f"{self._date} {DOT} {origin} → {destination}")
+        else:
+            self._header.set_crumb(f"{self._date}")
         self._header.set_trailing(
             f"{len(points):,} points {DOT} bbox ({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
         )
@@ -345,6 +350,37 @@ class MapView(Vertical):
         self._scalebar.set_span(_bbox_span_nm(points))
         dur = tail.ts - origin
         self._scrubber.set_progress(1.0, _fmt_time_range(dur, dur))
+
+    def _route_for(self, icao: str, date: str) -> tuple[str, str] | None:
+        """Return (origin, destination) codes for the first flight on ``date``.
+
+        Used to build the concept's ``KSPG → KHKY`` crumb. Falls back to
+        ``None`` when no flight row exists for that date or when either
+        endpoint is missing/ambiguous (coordinate tuple, ``~`` prefix,
+        ``sig lost``). The caller then omits the route from the crumb.
+        """
+        try:
+            row = self.app.db.conn.execute(
+                "SELECT origin_icao, destination_icao FROM flights "
+                "WHERE icao = ? AND takeoff_date = ? "
+                "ORDER BY takeoff_time ASC LIMIT 1",
+                (icao, date),
+            ).fetchone()
+        except Exception:
+            return None
+        if not row:
+            return None
+        origin = (row["origin_icao"] or "").strip()
+        destination = (row["destination_icao"] or "").strip()
+        if not origin or not destination:
+            return None
+        # Drop rows where either endpoint is a coordinate tuple or a fuzzy
+        # marker — those look noisy in the crumb. Clean ICAO codes only.
+        if origin.startswith(("(", "~")) or destination.startswith(("(", "~")):
+            return None
+        if destination.lower() in {"sig lost", "signal_lost"}:
+            return None
+        return origin, destination
 
 
 def _fmt_time_range(pos_secs: float, total_secs: float) -> str:

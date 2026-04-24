@@ -56,6 +56,7 @@ class EventsView(Vertical):
             "events",
             crumb="all aircraft",
             widget_id="events-header",
+            crumb_prefix="›",
         )
         self._filter = FilterBar(
             placeholder="filter events (type:emergency, icao:ae, since:3d)",
@@ -69,11 +70,13 @@ class EventsView(Vertical):
         yield self._table
 
     def on_mount(self) -> None:
+        # Column order mirrors the concept's event-feed grid
+        # (ts / hex / callsign / pill / summary).
         self._table.cursor_type = "row"
         self._table.add_column("TIME", width=18)
-        self._table.add_column("EVENT", width=14)
         self._table.add_column("ICAO", width=8)
         self._table.add_column("CALLSIGN", width=10)
+        self._table.add_column("EVENT", width=14)
         self._table.add_column("SUMMARY")
 
     def set_icao(self, icao: str | None) -> None:
@@ -116,9 +119,9 @@ class EventsView(Vertical):
             ts_short = e.ts.strftime("%Y-%m-%d %H:%MZ") if getattr(e, "ts", None) else "-"
             self._table.add_row(
                 cell(ts_short, style=FG_1),
-                Text.from_markup(pill_markup(label, colour)),
                 cell(e.icao, style=ACCENT_CYAN),
                 cell(e.callsign or "-", style=FG_0 if e.callsign else FG_2),
+                Text.from_markup(pill_markup(label, colour)),
                 cell(e.summary or "", style=FG_1),
             )
         self._filter.set_counts(matched=matched, total=len(self._rows))

@@ -222,11 +222,11 @@ class MapScalebarStrip(_HudLabel):
 
 
 class MapScrubberStrip(_HudLabel):
-    """Bottom-right: static duration readout drawn as a full progress bar.
+    """Bottom-right: static duration readout drawn as a filled progress bar.
 
-    The bar always renders at 1.0 progress; there is no playback or scrub
-    input. It exists to show total trace duration in the bottom-right of
-    the canvas.
+    There is no playback or scrub input. When a trace is loaded the bar
+    renders at 1.0 progress with the total duration; when no trace is
+    loaded it renders empty with a ``--:-- / --:--`` label.
     """
 
     DEFAULT_CSS = """

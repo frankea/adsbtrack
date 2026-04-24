@@ -84,13 +84,11 @@ async def test_app_navigates_after_selecting_aircraft(seeded_db):
         await pilot.pause()
         switcher = app.query_one(ContentSwitcher)
         sidebar = app.query_one(Sidebar)
-        # _open_icao routes to flights and tags the sidebar in lockstep.
         assert switcher.current == "view-flights"
         assert sidebar._active == "flights"
 
-        # The seeded aaa111 has one confirmed flight and a full registry row;
-        # assert both render through to the view content, not just the
-        # switcher toggle, so a silently-swallowed set_icao would fail here.
+        # Assert view-content (not just the switcher flip) so a silently
+        # swallowed set_icao would fail here.
         flights_table = app.query_one(FlightsView).query_one(DataTable)
         assert flights_table.row_count == 1
 
@@ -107,11 +105,8 @@ async def test_app_navigates_after_selecting_aircraft(seeded_db):
             assert switcher.current == target, f"after pressing {key!r}"
             assert sidebar._active == sidebar_active, f"sidebar after {key!r}"
 
-        # After landing on status (key "6" above will have refreshed the
-        # grid), walk the mounted cards and assert the seeded registration
-        # from aircraft_registry made it through to a rendered card. A
-        # regression that silently dropped registry merge in status_snapshot
-        # would leave "N111AA" out of the grid entirely.
+        # A regression that silently dropped the registry merge in
+        # status_snapshot would leave "N111AA" out of the grid entirely.
         await pilot.press("6")
         await pilot.pause()
         rendered = "".join(str(child.render()) for child in app.query_one(StatusView)._grid.children)

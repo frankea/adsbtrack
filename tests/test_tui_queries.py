@@ -199,10 +199,9 @@ def test_status_snapshot_indicator_branches_each_hit_one(tmp_path):
     assert stats["long_hover_flights"] == 1
     assert stats["signal_lost_landings"] == 1
     assert stats["off_airport_landings"] == 1
-    # Four of the five rows are confirmed landings (all except the
-    # signal_lost one). off_airport_landings is a subset of
-    # confirmed_landings, so the hour=9 row is counted once in each - not a
-    # double-count bug; future readers should not "fix" the 4 to 3.
+    # off_airport is a subset of confirmed (same landing_type='confirmed'
+    # filter plus a null-destination clause), so the hour=9 row counts in
+    # both - do not "fix" 4 to 3.
     assert stats["confirmed_landings"] == 4
 
 
@@ -221,7 +220,9 @@ def test_status_snapshot_days_with_data_counts_trace_days(tmp_path):
     db_path = tmp_path / "days.db"
     with Database(db_path) as db:
         icao = "ddd444"
+        other = "ddd445"
         db.insert_flight(_flight(icao, hour=2))
+        db.insert_flight(_flight(other, hour=2))
         db.refresh_aircraft_stats(icao)
         for date in ("2026-03-02", "2026-03-03", "2026-03-03"):
             db.insert_trace_day(
@@ -230,11 +231,19 @@ def test_status_snapshot_days_with_data_counts_trace_days(tmp_path):
                 {"timestamp": 1_700_000_000.0, "trace": [[0, 40.0, -74.0, 1000]]},
                 source="adsbx" if date != "2026-03-03" else "airplaneslive",
             )
+        # Seed a trace_day for the other ICAO on a date not shared with icao.
+        # A regression that drops the WHERE icao = ? predicate in queries.py
+        # would incorrectly count this row and push days_with_data to 3.
+        db.insert_trace_day(
+            other,
+            "2026-03-04",
+            {"timestamp": 1_700_000_000.0, "trace": [[0, 40.0, -74.0, 1000]]},
+            source="adsbx",
+        )
         db.commit()
         snap = status_snapshot(db, icao)
-    # Two distinct dates seeded (2026-03-03 is inserted twice for different
-    # sources; the UNIQUE(icao, date, source) key keeps both rows but
-    # COUNT(DISTINCT date) collapses them).
+    # 2026-03-02 and 2026-03-03; the second date is inserted twice across
+    # different sources but COUNT(DISTINCT date) collapses them.
     assert snap["stats"]["days_with_data"] == 2
 
 
@@ -260,10 +269,13 @@ def test_status_snapshot_missions_filters_nulls_and_limits_to_six(tmp_path):
     db_path = tmp_path / "missions.db"
     with Database(db_path) as db:
         icao = "fff666"
-        # Null mission_type should be dropped by the queries layer, not by
-        # the SQL. Seed one null flight plus seven distinct mission types
-        # to confirm the LIMIT 6 clause holds.
+        # Null mission_type is dropped by the queries layer. Seed one null
+        # plus seven distinct missions (to exercise LIMIT 6); seed the
+        # "training" mission twice so its count is 2, pinning the ORDER BY
+        # n DESC head of the list and avoiding unspecified tie-break
+        # ordering when every bucket has n=1.
         db.insert_flight(_flight(icao, hour=1, mission_type=None))
+        db.insert_flight(_flight(icao, hour=2, mission_type="training"))
         for hour, name in enumerate(
             ["training", "transport", "cargo", "medical", "survey", "patrol", "sightseeing"], start=3
         ):
@@ -274,3 +286,20 @@ def test_status_snapshot_missions_filters_nulls_and_limits_to_six(tmp_path):
     names = [m[0] for m in snap["missions"]]
     assert None not in names, "null mission_type should be filtered out"
     assert len(snap["missions"]) == 6, "LIMIT 6 not enforced"
+    assert snap["missions"][0] == ("training", 2), "ORDER BY n DESC head not pinned"
+
+
+def test_status_snapshot_sources_returns_none_when_all_points_zero(tmp_path):
+    db_path = tmp_path / "zero_points.db"
+    with Database(db_path) as db:
+        icao = "ggg777"
+        # Every flight has data_points=0 so the `WHERE data_points > 0`
+        # predicate in queries.py filters everything out; the status_snapshot
+        # sources key should collapse to None rather than crashing or
+        # returning a zero-denominator result.
+        db.insert_flight(_flight(icao, hour=1, adsb_pct=50.0, mlat_pct=50.0, data_points=0))
+        db.insert_flight(_flight(icao, hour=3, adsb_pct=50.0, mlat_pct=50.0, data_points=0))
+        db.refresh_aircraft_stats(icao)
+        db.commit()
+        snap = status_snapshot(db, icao)
+    assert snap["sources"] is None

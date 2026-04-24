@@ -14,7 +14,6 @@ from ..widgets import (
     ACCENT_CYAN,
     ACCENT_VIOLET,
     FG_0,
-    FG_1,
     FG_2,
     FilterBar,
     PageHeader,
@@ -28,7 +27,7 @@ from ..widgets import (
 def _fmt_last_seen(s: str | None) -> Text:
     if not s:
         return dash()
-    return cell(s, style=FG_1)
+    return cell(s, style=FG_2)
 
 
 def _fmt_flags(row: AircraftRow) -> Text:
@@ -66,7 +65,7 @@ class AircraftView(Vertical):
         self._header = PageHeader(
             "aircraft",
             crumb="all (-)",
-            trailing="sort: last_seen desc",
+            trailing=Text.from_markup(f"[{FG_2}]sort:[/] [{ACCENT_CYAN}]last_seen ↓[/]"),
             widget_id="aircraft-header",
         )
         self._filter = FilterBar(
@@ -103,16 +102,18 @@ class AircraftView(Vertical):
         self._matched = rows
         self._table.clear()
         for row in rows:
+            type_display = row.description or row.type_code or "(unknown)"
             self._table.add_row(
                 cell(row.icao, style=ACCENT_CYAN),
                 cell(row.display_reg, style=FG_0),
-                cell(row.display_type, style=FG_1),
+                cell(type_display, style=FG_2),
                 num_cell(f"{row.total_flights:,}", style=FG_0),
                 num_cell(f"{row.total_hours:.1f}", style=FG_0),
                 cell(row.display_home, style=FG_0),
                 _fmt_last_seen(row.last_seen),
                 num_cell(
-                    str(row.spoof_count) if row.spoof_count else "-", style=ACCENT_VIOLET if row.spoof_count else FG_2
+                    str(row.spoof_count) if row.spoof_count else "--",
+                    style=ACCENT_VIOLET if row.spoof_count else FG_2,
                 ),
                 _fmt_flags(row),
                 key=row.icao,

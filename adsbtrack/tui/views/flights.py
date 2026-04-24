@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -11,8 +13,10 @@ from ..queries import FlightRow, list_flights
 from ..widgets import (
     ACCENT_AMBER,
     ACCENT_CYAN,
+    ACCENT_MAGENTA,
     ACCENT_OK,
     ACCENT_RED,
+    DOT,
     FG_0,
     FG_1,
     FG_2,
@@ -26,11 +30,13 @@ from ..widgets import (
 
 _LANDING_SHORT = {
     "confirmed": ("OK", ACCENT_OK),
-    "signal_lost": ("SIG LOST", FG_2),
+    "signal_lost": ("SIG LOST", ACCENT_RED),
     "dropped_on_approach": ("DROP", ACCENT_AMBER),
     "uncertain": ("UNCERT", ACCENT_AMBER),
     "altitude_error": ("ALT ERR", ACCENT_RED),
 }
+
+_ICAO_RE = re.compile(r"^[A-Z]{3,4}$")
 
 
 def _fmt_time(iso: str) -> str:
@@ -41,6 +47,28 @@ def _fmt_time(iso: str) -> str:
         return f"{date_part} {rest[:5]}Z"
     except ValueError:
         return iso
+
+
+def _airport_cell(code: str | None, *, fallback_style: str = FG_2) -> Text:
+    """Colour an origin/destination code per the concept's table.
+
+    - Clean 3/4-letter ICAO: c-ok (green).
+    - `~PREFIX`: amber (uncertain / off-airport approximation).
+    - Literal `sig lost`: red.
+    - Coordinate tuple `(lat, lon)` or missing: dim.
+    """
+    if not code:
+        return dash()
+    low = code.lower()
+    if low == "sig lost" or low == "signal_lost":
+        return cell("sig lost", style=ACCENT_RED)
+    if code.startswith("~"):
+        return cell(code, style=ACCENT_AMBER)
+    if code.startswith("("):
+        return cell(code, style=fallback_style)
+    if _ICAO_RE.match(code.upper()):
+        return cell(code, style=ACCENT_OK)
+    return cell(code, style=FG_0)
 
 
 def _fmt_landing(row: FlightRow) -> Text:
@@ -57,7 +85,7 @@ def _fmt_conf(row: FlightRow) -> Text:
     elif pct >= 50:
         style = ACCENT_AMBER
     else:
-        style = FG_2
+        style = ACCENT_RED
     return num_cell(f"{pct}%", style=style)
 
 
@@ -101,14 +129,14 @@ class FlightsView(Vertical):
         self._table.cursor_type = "row"
         self._table.add_column("DATE", width=18)
         self._table.add_column("FROM", width=6)
-        self._table.add_column("TO", width=6)
+        self._table.add_column("TO", width=10)
         self._table.add_column(Text("DUR", justify="right"), width=6)
         self._table.add_column("CALLSIGN", width=10)
         self._table.add_column("MISSION", width=8)
         self._table.add_column(Text("ALT", justify="right"), width=8)
         self._table.add_column(Text("GS", justify="right"), width=6)
         self._table.add_column(Text("CONF", justify="right"), width=6)
-        self._table.add_column("LAND", width=9)
+        self._table.add_column("TYPE", width=9)
         self._table.add_column("FLAGS")
 
     # --- public API ---
@@ -137,11 +165,11 @@ class FlightsView(Vertical):
             matched.append(r)
             self._table.add_row(
                 cell(_fmt_time(r.takeoff_time), style=FG_1),
-                cell(r.origin_icao or "-", style=FG_0 if r.origin_icao else FG_2),
-                cell(r.destination_icao or "-", style=FG_0 if r.destination_icao else FG_2),
+                _airport_cell(r.origin_icao),
+                _airport_cell(r.destination_icao),
                 num_cell(f"{r.duration_minutes:.0f}" if r.duration_minutes is not None else "-", style=FG_0),
                 cell(r.callsign or "-", style=ACCENT_CYAN if r.callsign else FG_2),
-                cell((r.mission_type or "-").upper()[:7], style=FG_1),
+                cell((r.mission_type or "-").upper()[:7], style=ACCENT_MAGENTA if r.mission_type else FG_2),
                 num_cell(f"{r.max_altitude:,}" if r.max_altitude is not None else "-", style=FG_0),
                 num_cell(f"{r.cruise_gs_kt:,}" if r.cruise_gs_kt is not None else "-", style=FG_0),
                 _fmt_conf(r),
@@ -152,8 +180,8 @@ class FlightsView(Vertical):
         total_hours = sum((r.duration_minutes or 0) for r in self._rows) / 60
         reg_desc = self._registry_line(self._icao)
         self._header.set_title(self._icao)
-        self._header.set_crumb(reg_desc)
-        self._header.set_trailing(f"{len(self._rows):,} flights / {total_hours:,.1f} hrs")
+        self._header.set_crumb(reg_desc or "")
+        self._header.set_trailing(f"{len(self._rows):,} flights {DOT} {total_hours:,.1f} hrs")
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input is self._filter.input_widget:
@@ -182,4 +210,4 @@ class FlightsView(Vertical):
         if not row:
             return ""
         parts = [b for b in (row["registration"], row["type_code"], row["description"]) if b]
-        return " / ".join(parts)
+        return f" {DOT} ".join(parts)

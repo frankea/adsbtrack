@@ -1472,7 +1472,7 @@ def tui(db_path):
     commands. Requires the 'tui' extra: `uv sync --extra tui`.
     """
     try:
-        from .tui import AdsbtrackApp
+        from .tui.app import AdsbtrackApp
     except ImportError as e:
         raise click.ClickException("TUI extra is not installed. Run `uv sync --extra tui` to add textual.") from e
 

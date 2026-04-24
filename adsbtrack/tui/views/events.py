@@ -13,25 +13,36 @@ from ..widgets import (
     ACCENT_CYAN,
     ACCENT_RED,
     ACCENT_VIOLET,
+    DOT,
     FG_0,
     FG_1,
     FG_2,
     FilterBar,
     PageHeader,
     cell,
-    pill_solid,
+    pill_markup,
 )
 
-_SEV_STYLE = {
-    "emergency": (ACCENT_RED, "EMERG"),
-    "unusual": (ACCENT_AMBER, "UNUSL"),
+# Concept-specified pill label per event_type.
+_EVENT_PILLS: dict[str, tuple[str, str]] = {
+    "emergency_squawk": ("EMERGENCY", ACCENT_RED),
+    "emergency_flag": ("EMERGENCY", ACCENT_RED),
+    "off_airport_landing": ("OFF-AIRPORT", ACCENT_AMBER),
+    "long_hover": ("LONG HOVER", ACCENT_AMBER),
+    "multiple_go_arounds": ("GO-AROUND", ACCENT_AMBER),
 }
 
 
-def _sev_for(event_type: str, severity: str) -> tuple[str, str]:
+def _pill_for(event_type: str, severity: str) -> tuple[str, str]:
     if event_type.startswith("spoof"):
-        return ACCENT_VIOLET, "SPOOF"
-    return _SEV_STYLE.get(severity, (FG_2, "INFO"))
+        return "SPOOF", ACCENT_VIOLET
+    if event_type in _EVENT_PILLS:
+        return _EVENT_PILLS[event_type]
+    if severity == "emergency":
+        return "EMERGENCY", ACCENT_RED
+    if severity == "unusual":
+        return "UNUSUAL", ACCENT_AMBER
+    return event_type.upper(), FG_2
 
 
 class EventsView(Vertical):
@@ -47,7 +58,7 @@ class EventsView(Vertical):
             widget_id="events-header",
         )
         self._filter = FilterBar(
-            placeholder="filter events (type, icao, callsign)",
+            placeholder="filter events (type:emergency, icao:ae, since:3d)",
             widget_id="events-filter",
         )
         self._table = DataTable(id="events-table", zebra_stripes=True)
@@ -60,8 +71,7 @@ class EventsView(Vertical):
     def on_mount(self) -> None:
         self._table.cursor_type = "row"
         self._table.add_column("TIME", width=18)
-        self._table.add_column("SEV", width=8)
-        self._table.add_column("TYPE", width=24)
+        self._table.add_column("EVENT", width=14)
         self._table.add_column("ICAO", width=8)
         self._table.add_column("CALLSIGN", width=10)
         self._table.add_column("SUMMARY")
@@ -81,10 +91,19 @@ class EventsView(Vertical):
                 counts["emergency"] += 1
             else:
                 counts["unusual"] += 1
-        self._header.set_crumb("all aircraft" if self._icao is None else self._icao)
-        self._header.set_trailing(
-            f"emergency {counts['emergency']}   unusual {counts['unusual']}   spoof {counts['spoof']}"
+        crumb = "all aircraft" if self._icao is None else self._icao
+        self._header.set_crumb(f"{crumb} {DOT} last 7d")
+        # Build the trailing severity-pills line (outlined pills, per concept).
+        trailing = Text.from_markup(
+            " ".join(
+                [
+                    pill_markup(f"emergency {counts['emergency']}", ACCENT_RED),
+                    pill_markup(f"unusual {counts['unusual']}", ACCENT_AMBER),
+                    pill_markup(f"spoof {counts['spoof']}", ACCENT_VIOLET),
+                ]
+            )
         )
+        self._header.set_trailing(trailing)
 
         needle_low = needle.lower() if needle else ""
         self._table.clear()
@@ -93,12 +112,11 @@ class EventsView(Vertical):
             if needle_low and not self._matches(e, needle_low):
                 continue
             matched += 1
-            colour, label = _sev_for(e.event_type, e.severity)
+            label, colour = _pill_for(e.event_type, e.severity)
             ts_short = e.ts.strftime("%Y-%m-%d %H:%MZ") if getattr(e, "ts", None) else "-"
             self._table.add_row(
                 cell(ts_short, style=FG_1),
-                Text.from_markup(pill_solid(label, colour)),
-                cell(e.event_type, style=FG_0),
+                Text.from_markup(pill_markup(label, colour)),
                 cell(e.icao, style=ACCENT_CYAN),
                 cell(e.callsign or "-", style=FG_0 if e.callsign else FG_2),
                 cell(e.summary or "", style=FG_1),

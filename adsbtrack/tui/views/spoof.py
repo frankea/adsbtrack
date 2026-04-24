@@ -146,8 +146,10 @@ class SpoofView(Vertical):
     def _rerender(self, needle: str) -> None:
         self._last_needle = needle
         cursor_icao = None
-        if 0 <= (self._table.cursor_row or -1) < len(self._matched):
-            cursor_icao = (self._matched[self._table.cursor_row].icao, self._matched[self._table.cursor_row].takeoff_date)
+        idx = self._table.cursor_row
+        if idx is not None and 0 <= idx < len(self._matched):
+            cursor = self._matched[idx]
+            cursor_icao = (cursor.icao, cursor.takeoff_date)
         self._table.clear()
         needle_low = needle.lower() if needle else ""
         self._matched = []

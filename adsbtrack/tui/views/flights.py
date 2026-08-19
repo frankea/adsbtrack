@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -74,6 +76,27 @@ def _fmt_flags(row: FlightRow) -> Text:
     return Text.from_markup(" ".join(parts)) if parts else dash()
 
 
+def filter_flights(rows: Sequence[FlightRow], needle: str) -> list[FlightRow]:
+    """Return the flights matching ``needle`` (case-insensitive substring).
+
+    Pure function, no Textual/DB dependency, so the filter bar's re-filter
+    path can be exercised without a running app. Matches origin,
+    destination, callsign, takeoff date, and mission type -- the same
+    fields the old in-view ``_matches`` helper checked.
+    """
+    needle_low = needle.lower() if needle else ""
+    if not needle_low:
+        return list(rows)
+    return [r for r in rows if _flight_matches(r, needle_low)]
+
+
+def _flight_matches(row: FlightRow, needle_low: str) -> bool:
+    return any(
+        hay and needle_low in hay.lower()
+        for hay in (row.origin_icao, row.destination_icao, row.callsign, row.takeoff_date, row.mission_type)
+    )
+
+
 class FlightsView(Vertical):
     """Reverse-chronological flight list for one aircraft."""
 
@@ -115,26 +138,35 @@ class FlightsView(Vertical):
 
     def set_icao(self, icao: str) -> None:
         self._icao = icao
-        self.refresh_data("")
+        self.refresh_data()
 
-    def refresh_data(self, needle: str) -> None:
+    def refresh_data(self) -> None:
+        """Query flights for the current aircraft and cache them.
+
+        This is the only path that re-queries the DB; the filter bar
+        re-filters the cached ``self._rows`` via ``_apply_filter`` without
+        touching the DB again (Task 14).
+        """
         db = self.app.db
         if self._icao is None:
             self._rows = []
-            self._table.clear()
-            self._filter.set_counts(0, 0)
+            self._apply_filter("")
             self._header.set_crumb("select an aircraft first")
             self._header.set_trailing("")
             return
 
         self._rows = list_flights(db, self._icao)
-        needle_low = needle.lower() if needle else ""
-        matched: list[FlightRow] = []
+        total_hours = sum((r.duration_minutes or 0) for r in self._rows) / 60
+        reg_desc = self._registry_line(self._icao)
+        self._header.set_title(self._icao)
+        self._header.set_crumb(reg_desc)
+        self._header.set_trailing(f"{len(self._rows):,} flights / {total_hours:,.1f} hrs")
+        self._apply_filter("")
+
+    def _apply_filter(self, needle: str) -> None:
+        rows = filter_flights(self._rows, needle)
         self._table.clear()
-        for r in self._rows:
-            if needle_low and not self._matches(r, needle_low):
-                continue
-            matched.append(r)
+        for r in rows:
             self._table.add_row(
                 cell(_fmt_time(r.takeoff_time), style=FG_1),
                 cell(r.origin_icao or "-", style=FG_0 if r.origin_icao else FG_2),
@@ -148,28 +180,16 @@ class FlightsView(Vertical):
                 _fmt_landing(r),
                 _fmt_flags(r),
             )
-        self._filter.set_counts(matched=len(matched), total=len(self._rows))
-        total_hours = sum((r.duration_minutes or 0) for r in self._rows) / 60
-        reg_desc = self._registry_line(self._icao)
-        self._header.set_title(self._icao)
-        self._header.set_crumb(reg_desc)
-        self._header.set_trailing(f"{len(self._rows):,} flights / {total_hours:,.1f} hrs")
+        self._filter.set_counts(matched=len(rows), total=len(self._rows))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input is self._filter.input_widget:
-            self.refresh_data(event.value or "")
+            self._apply_filter(event.value or "")
 
     def focus_filter(self) -> None:
         self._filter.input_widget.focus()
 
     # --- helpers ---
-
-    @staticmethod
-    def _matches(row: FlightRow, needle: str) -> bool:
-        return any(
-            hay and needle in hay.lower()
-            for hay in (row.origin_icao, row.destination_icao, row.callsign, row.takeoff_date, row.mission_type)
-        )
 
     def _registry_line(self, icao: str) -> str:
         try:

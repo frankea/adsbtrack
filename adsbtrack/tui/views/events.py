@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -32,6 +35,28 @@ def _sev_for(event_type: str, severity: str) -> tuple[str, str]:
     if event_type.startswith("spoof"):
         return ACCENT_VIOLET, "SPOOF"
     return _SEV_STYLE.get(severity, (FG_2, "INFO"))
+
+
+def filter_events(rows: Iterable[Any], needle: str) -> list[Any]:
+    """Return the events matching ``needle`` (case-insensitive substring).
+
+    Pure function, no Textual/DB dependency, so the filter bar's re-filter
+    path can be exercised without a running app. Matches ``event_type``,
+    ``icao``, ``callsign``, and ``summary`` -- the same fields the old
+    in-view ``_matches`` helper checked.
+    """
+    needle_low = needle.lower() if needle else ""
+    if not needle_low:
+        return list(rows)
+    return [e for e in rows if _event_matches(e, needle_low)]
+
+
+def _event_matches(event: Any, needle_low: str) -> bool:
+    for field in ("event_type", "icao", "callsign", "summary"):
+        v = getattr(event, field, None)
+        if v and needle_low in str(v).lower():
+            return True
+    return False
 
 
 class EventsView(Vertical):
@@ -68,9 +93,15 @@ class EventsView(Vertical):
 
     def set_icao(self, icao: str | None) -> None:
         self._icao = icao
-        self.refresh_data("")
+        self.refresh_data()
 
-    def refresh_data(self, needle: str) -> None:
+    def refresh_data(self) -> None:
+        """Query events for the current scope and cache them.
+
+        This is the only path that re-queries the DB; the filter bar
+        re-filters the cached ``self._rows`` via ``_apply_filter`` without
+        touching the DB again (Task 14).
+        """
         db = self.app.db
         self._rows = list_events(db, self._icao, include_spoof_checks=True)
         counts = {"emergency": 0, "unusual": 0, "spoof": 0}
@@ -85,14 +116,12 @@ class EventsView(Vertical):
         self._header.set_trailing(
             f"emergency {counts['emergency']}   unusual {counts['unusual']}   spoof {counts['spoof']}"
         )
+        self._apply_filter("")
 
-        needle_low = needle.lower() if needle else ""
+    def _apply_filter(self, needle: str) -> None:
+        rows = filter_events(self._rows, needle)
         self._table.clear()
-        matched = 0
-        for e in self._rows:
-            if needle_low and not self._matches(e, needle_low):
-                continue
-            matched += 1
+        for e in rows:
             colour, label = _sev_for(e.event_type, e.severity)
             ts_short = e.ts.strftime("%Y-%m-%d %H:%MZ") if getattr(e, "ts", None) else "-"
             self._table.add_row(
@@ -103,19 +132,11 @@ class EventsView(Vertical):
                 cell(e.callsign or "-", style=FG_0 if e.callsign else FG_2),
                 cell(e.summary or "", style=FG_1),
             )
-        self._filter.set_counts(matched=matched, total=len(self._rows))
+        self._filter.set_counts(matched=len(rows), total=len(self._rows))
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input is self._filter.input_widget:
-            self.refresh_data(event.value or "")
+            self._apply_filter(event.value or "")
 
     def focus_filter(self) -> None:
         self._filter.input_widget.focus()
-
-    @staticmethod
-    def _matches(event, needle: str) -> bool:
-        for field in ("event_type", "icao", "callsign", "summary"):
-            v = getattr(event, field, None)
-            if v and needle in str(v).lower():
-                return True
-        return False

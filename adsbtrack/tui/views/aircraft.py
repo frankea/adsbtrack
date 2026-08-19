@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Vertical
@@ -46,6 +48,28 @@ def _fmt_flags(row: AircraftRow) -> Text:
     if "HELI" in row.flags.split():
         parts.append(pill_markup("HELI", ACCENT_AMBER))
     return Text.from_markup(" ".join(parts)) if parts else dash()
+
+
+def filter_aircraft(rows: Sequence[AircraftRow], needle: str) -> list[AircraftRow]:
+    """Return the aircraft matching ``needle`` (case-insensitive substring).
+
+    Pure function, no Textual/DB dependency, so the filter bar's re-filter
+    path can be exercised without a running app. Matches ICAO hex,
+    registration, type code, and home-base ICAO -- the same four columns
+    ``queries.list_aircraft``'s SQL ``LIKE`` clause used to match before
+    Task 14 moved filtering out of the query.
+    """
+    needle_low = needle.lower() if needle else ""
+    if not needle_low:
+        return list(rows)
+    return [r for r in rows if _aircraft_matches(r, needle_low)]
+
+
+def _aircraft_matches(row: AircraftRow, needle_low: str) -> bool:
+    return any(
+        hay and needle_low in str(hay).lower()
+        for hay in (row.icao, row.registration, row.type_code, row.home_base_icao)
+    )
 
 
 class AircraftOpenFlights(Message):
@@ -95,11 +119,19 @@ class AircraftView(Vertical):
 
     # --- public API ---
 
-    def refresh_data(self, *, filter_substr: str | None = None) -> None:
+    def refresh_data(self) -> None:
+        """Query the full aircraft list and cache it.
+
+        This is the only path that re-queries the DB; the filter bar
+        re-filters the cached ``self._rows`` via ``_apply_filter`` without
+        touching the DB again (Task 14).
+        """
         db = self.app.db
-        rows = list_aircraft(db, filter_substr=filter_substr)
-        if filter_substr is None:
-            self._rows = rows
+        self._rows = list_aircraft(db)
+        self._apply_filter("")
+
+    def _apply_filter(self, needle: str) -> None:
+        rows = filter_aircraft(self._rows, needle)
         self._matched = rows
         self._table.clear()
         for row in rows:
@@ -117,7 +149,7 @@ class AircraftView(Vertical):
                 _fmt_flags(row),
                 key=row.icao,
             )
-        total_all = len(self._rows) if self._rows else len(rows)
+        total_all = len(self._rows)
         self._filter.set_counts(matched=len(rows), total=total_all)
         self._header.set_crumb(f"all ({total_all:,})")
 
@@ -125,7 +157,7 @@ class AircraftView(Vertical):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input is self._filter.input_widget:
-            self.refresh_data(filter_substr=event.value or None)
+            self._apply_filter(event.value or "")
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.row_key is None:

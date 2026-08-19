@@ -1,14 +1,18 @@
 """Tests for adsbtrack.registry - FAA aircraft registry import and lookup."""
 
 import io
+import os
+import time
 import zipfile
 from pathlib import Path
 
 import pytest
 
+from adsbtrack import registry
 from adsbtrack.config import Config
 from adsbtrack.db import Database
 from adsbtrack.registry import (
+    download_faa_zip,
     import_acftref_from_path,
     import_dereg_from_path,
     import_master_from_path,
@@ -344,6 +348,91 @@ def test_refresh_faa_registry_from_nested_zip(tmp_path):
     assert stats == {"master": 1, "dereg": 1, "acftref": 1}
     with Database(cfg.db_path) as db:
         assert db.get_faa_registry_by_hex("a66ad3") is not None
+
+
+def test_refresh_faa_registry_broken_master_header_leaves_prior_rows(tmp_path):
+    """A zip whose MASTER.txt is missing a required header column must
+    raise and must NOT truncate the existing registry. Header validation
+    for all three files has to happen before anything is written, so the
+    previously imported row survives untouched."""
+    broken_master_header = _MASTER_HEADER.replace("NAME,", "", 1)
+    master_body = _faa_file_bytes(broken_master_header, _MASTER_ROWS)
+    dereg_body = _faa_file_bytes(_DEREG_HEADER, _DEREG_ROWS)
+    acftref_body = _faa_file_bytes(
+        "CODE,MFR,MODEL,TYPE-ACFT,TYPE-ENG,AC-CAT,BUILD-CERT-IND,NO-ENG,NO-SEATS,AC-WEIGHT,SPEED",
+        ["1152015,CESSNA,172,4,1,1,,1,4,CLASS 1,140"],
+    )
+    zip_path = tmp_path / "ReleasableAircraft.zip"
+    zip_path.write_bytes(_build_releasable_zip(master_body, dereg_body, acftref_body))
+
+    cfg = Config(db_path=tmp_path / "t.db", faa_registry_cache_path=zip_path)
+    with Database(cfg.db_path) as db:
+        stale = ["X"] * 29
+        stale[0] = "OLD"
+        stale[6] = "STALE"
+        stale[-1] = "deadbe"
+        db.insert_faa_registry([tuple(stale)])
+        db.commit()
+
+        with pytest.raises(ValueError):
+            refresh_faa_registry(db, cfg, local_zip=zip_path)
+
+        # Prior row must survive on the live connection...
+        assert db.get_faa_registry_by_hex("deadbe") is not None
+
+    # ...and must actually be committed to disk, not just visible on the
+    # same in-memory connection.
+    with Database(cfg.db_path) as db:
+        row = db.get_faa_registry_by_hex("deadbe")
+        assert row is not None
+        assert row["name"] == "STALE"
+
+
+def test_download_faa_zip_fresh_cache_short_circuits(tmp_path, monkeypatch):
+    """A cache file younger than faa_registry_cache_max_age_hours must be
+    used as-is, with no download attempted at all."""
+    cache_path = tmp_path / "ReleasableAircraft.zip"
+    cache_path.write_bytes(b"fresh-cache-bytes")
+
+    def _boom(*_args, **_kwargs):
+        raise AssertionError("download should not be attempted for a fresh cache")
+
+    monkeypatch.setattr(registry, "_download_with_curl_cffi", _boom)
+    monkeypatch.setattr(registry, "_download_with_httpx", _boom)
+
+    cfg = Config(faa_registry_cache_path=cache_path, faa_registry_cache_max_age_hours=24.0)
+    result = download_faa_zip(cfg)
+
+    assert result == cache_path
+    assert cache_path.read_bytes() == b"fresh-cache-bytes"
+
+
+def test_download_faa_zip_stale_cache_redownloads(tmp_path, monkeypatch):
+    """A cache file older than faa_registry_cache_max_age_hours must be
+    treated as stale and re-downloaded."""
+    cache_path = tmp_path / "ReleasableAircraft.zip"
+    cache_path.write_bytes(b"stale-cache-bytes")
+    stale_time = time.time() - 100 * 3600  # 100h old, past the 24h default
+    os.utime(cache_path, (stale_time, stale_time))
+
+    calls = []
+
+    def _fake_curl_cffi(_url, _dest):
+        raise ImportError("curl_cffi not installed")
+
+    def _fake_httpx(url, dest):
+        calls.append((url, dest))
+        dest.write_bytes(b"fresh-download-bytes")
+
+    monkeypatch.setattr(registry, "_download_with_curl_cffi", _fake_curl_cffi)
+    monkeypatch.setattr(registry, "_download_with_httpx", _fake_httpx)
+
+    cfg = Config(faa_registry_cache_path=cache_path, faa_registry_cache_max_age_hours=24.0)
+    result = download_faa_zip(cfg)
+
+    assert result == cache_path
+    assert calls == [(cfg.faa_registry_url, cache_path)]
+    assert cache_path.read_bytes() == b"fresh-download-bytes"
 
 
 def test_end_to_end_update_lookup_owner(tmp_path):

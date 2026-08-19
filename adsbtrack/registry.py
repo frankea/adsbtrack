@@ -22,6 +22,7 @@ default Python TLS fingerprints, so curl_cffi is strongly recommended.
 from __future__ import annotations
 
 import csv
+import time
 import zipfile
 from collections.abc import Callable
 from pathlib import Path
@@ -303,8 +304,15 @@ def _import_rows(
     parse_fn: Callable[[dict], tuple],
     insert_fn: Callable[[list[tuple]], None],
 ) -> int:
-    """Shared body: read every row, skip malformed, bulk-insert in one
-    transaction. Returns rows successfully inserted."""
+    """Shared body: read every row, skip malformed, bulk-insert. Returns
+    rows successfully inserted.
+
+    Does NOT commit -- transaction boundaries are the caller's
+    responsibility so refresh_faa_registry can truncate + import all
+    three files as one atomic unit. Callers that want the write durable
+    on its own (e.g. tests calling this directly) should use it inside a
+    `with Database(...) as db:` block, which commits on clean exit.
+    """
     parsed: list[tuple] = []
     skipped = 0
     for row in _iter_faa_rows(path):
@@ -312,8 +320,7 @@ def _import_rows(
             parsed.append(parse_fn(row))
         except (ValueError, KeyError):
             skipped += 1
-    with db.conn:
-        insert_fn(parsed)
+    insert_fn(parsed)
     if skipped:
         print(f"  skipped {skipped} malformed rows from {path.name}")
     return len(parsed)
@@ -342,16 +349,26 @@ _TARGET_FILES = ("MASTER.txt", "DEREG.txt", "ACFTREF.txt")
 
 
 def download_faa_zip(cfg: Config, destination: Path | None = None) -> Path:
-    """Download the FAA ReleasableAircraft.zip.
+    """Download the FAA ReleasableAircraft.zip, or reuse a fresh cache.
 
     Prefers ``curl_cffi`` with a Chrome TLS fingerprint when available,
     which bypasses the Akamai Bot Manager on registry.faa.gov. Falls
     back to ``httpx`` when curl_cffi is not installed (download will
     probably 503 in that case; instruct the user to install curl_cffi
     or download the zip manually and pass --zip).
+
+    The zip is a large bulk download, so if a file already sits at the
+    destination and is younger than ``cfg.faa_registry_cache_max_age_hours``,
+    it's reused as-is with no request made at all. There's no --force
+    bypass; pass an explicit ``--zip`` at the CLI to skip the download
+    entirely, or delete the cache file to force a re-download.
     """
     dest = destination or cfg.faa_registry_cache_path
     dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        age_hours = (time.time() - dest.stat().st_mtime) / 3600.0
+        if age_hours < cfg.faa_registry_cache_max_age_hours:
+            return dest
     try:
         _download_with_curl_cffi(cfg.faa_registry_url, dest)
     except ImportError:
@@ -409,6 +426,12 @@ def refresh_faa_registry(
     """Download (or use local_zip) the FAA bundle, extract the three files,
     truncate the local tables, and bulk-import the fresh data.
 
+    All three files' headers are validated BEFORE anything is truncated,
+    and the truncate + import runs as one transaction with no commit
+    until the very end. A drifted/broken file (bad header, or any error
+    raised partway through the import) therefore leaves the previous
+    registry intact instead of wiping it out.
+
     Returns a stats dict {master, dereg, acftref} with the row counts inserted.
     """
     zip_path = local_zip or download_faa_zip(cfg)
@@ -431,13 +454,24 @@ def refresh_faa_registry(
                     raise FileNotFoundError(f"{target} missing from {zip_path}")
                 zf.extract(members_by_base[target.upper()], tmp_root)
 
-        # Clear out prior data so re-runs don't accumulate stale rows.
-        db.truncate_faa_tables()
-        db.commit()
+        master_path = _resolve_case(tmp_root, "MASTER.txt")
+        dereg_path = _resolve_case(tmp_root, "DEREG.txt")
+        acftref_path = _resolve_case(tmp_root, "ACFTREF.txt")
 
-        stats["master"] = import_master_from_path(db, _resolve_case(tmp_root, "MASTER.txt"))
-        stats["dereg"] = import_dereg_from_path(db, _resolve_case(tmp_root, "DEREG.txt"))
-        stats["acftref"] = import_acftref_from_path(db, _resolve_case(tmp_root, "ACFTREF.txt"))
+        # Validate every file's header before touching the database. A
+        # schema-drifted file must never truncate the existing registry.
+        _require_headers(master_path, required=("N-NUMBER", "MODE S CODE", "NAME"))
+        _require_headers(dereg_path, required=("N-NUMBER", "MODE-S-CODE", "NAME"))
+        _require_headers(acftref_path, required=("CODE", "MFR", "MODEL"))
+
+        # Truncate + import as one transaction: nothing commits until the
+        # final db.commit() below, so a mid-import failure rolls the whole
+        # thing back and the previous registry survives untouched.
+        db.truncate_faa_tables()
+        stats["master"] = import_master_from_path(db, master_path)
+        stats["dereg"] = import_dereg_from_path(db, dereg_path)
+        stats["acftref"] = import_acftref_from_path(db, acftref_path)
+        db.commit()
     return stats
 
 

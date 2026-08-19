@@ -279,6 +279,7 @@ class Config:
     ourairports_cache_max_age_hours: float = 168.0  # 7 days
     faa_registry_url: str = "https://registry.faa.gov/database/ReleasableAircraft.zip"
     faa_registry_cache_path: Path = Path(".cache/ReleasableAircraft.zip")
+    faa_registry_cache_max_age_hours: float = 24.0
     mictronics_base_url: str = "https://raw.githubusercontent.com/Mictronics/readsb-protobuf/dev/webapp/src/db"
     mictronics_cache_dir: Path = Path(".cache/mictronics")
     hexdb_base_url: str = "https://hexdb.io"

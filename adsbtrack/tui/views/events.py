@@ -19,25 +19,36 @@ from ..widgets import (
     ACCENT_CYAN,
     ACCENT_RED,
     ACCENT_VIOLET,
+    DOT,
     FG_0,
     FG_1,
     FG_2,
     FilterBar,
     PageHeader,
     cell,
-    pill_solid,
+    pill_markup,
 )
 
-_SEV_STYLE = {
-    "emergency": (ACCENT_RED, "EMERG"),
-    "unusual": (ACCENT_AMBER, "UNUSL"),
+# Concept-specified pill label per event_type.
+_EVENT_PILLS: dict[str, tuple[str, str]] = {
+    "emergency_squawk": ("EMERGENCY", ACCENT_RED),
+    "emergency_flag": ("EMERGENCY", ACCENT_RED),
+    "off_airport_landing": ("OFF-AIRPORT", ACCENT_AMBER),
+    "long_hover": ("LONG HOVER", ACCENT_AMBER),
+    "multiple_go_arounds": ("GO-AROUND", ACCENT_AMBER),
 }
 
 
-def _sev_for(event_type: str, severity: str) -> tuple[str, str]:
+def _pill_for(event_type: str, severity: str) -> tuple[str, str]:
     if event_type.startswith("spoof"):
-        return ACCENT_VIOLET, "SPOOF"
-    return _SEV_STYLE.get(severity, (FG_2, "INFO"))
+        return "SPOOF", ACCENT_VIOLET
+    if event_type in _EVENT_PILLS:
+        return _EVENT_PILLS[event_type]
+    if severity == "emergency":
+        return "EMERGENCY", ACCENT_RED
+    if severity == "unusual":
+        return "UNUSUAL", ACCENT_AMBER
+    return event_type.upper(), FG_2
 
 
 def filter_events(rows: Iterable[Any], needle: str) -> list[Any]:
@@ -84,7 +95,7 @@ class EventsView(Vertical):
             widget_id="events-header",
         )
         self._filter = FilterBar(
-            placeholder="filter events (type, icao, callsign)",
+            placeholder="filter events (type:emergency, icao:ae, since:3d)",
             widget_id="events-filter",
         )
         self._table = DataTable(id="events-table", zebra_stripes=True)
@@ -97,8 +108,7 @@ class EventsView(Vertical):
     def on_mount(self) -> None:
         self._table.cursor_type = "row"
         self._table.add_column("TIME", width=18)
-        self._table.add_column("SEV", width=8)
-        self._table.add_column("TYPE", width=24)
+        self._table.add_column("EVENT", width=14)
         self._table.add_column("ICAO", width=8)
         self._table.add_column("CALLSIGN", width=10)
         self._table.add_column("SUMMARY")
@@ -153,10 +163,19 @@ class EventsView(Vertical):
             result = event.worker.result
             assert result is not None  # a SUCCESS worker always has a result
             self._rows = result.rows
-            self._header.set_crumb("all aircraft" if result.icao is None else result.icao)
+            crumb = "all aircraft" if result.icao is None else result.icao
+            self._header.set_crumb(f"{crumb} {DOT} last 7d")
+            # Trailing severity-pills line (tinted pills, per concept).
             self._header.set_trailing(
-                f"emergency {result.counts['emergency']}   unusual {result.counts['unusual']}   "
-                f"spoof {result.counts['spoof']}"
+                Text.from_markup(
+                    " ".join(
+                        [
+                            pill_markup(f"emergency {result.counts['emergency']}", ACCENT_RED),
+                            pill_markup(f"unusual {result.counts['unusual']}", ACCENT_AMBER),
+                            pill_markup(f"spoof {result.counts['spoof']}", ACCENT_VIOLET),
+                        ]
+                    )
+                )
             )
             self._apply_filter("")
             self.loading = False
@@ -168,12 +187,11 @@ class EventsView(Vertical):
         rows = filter_events(self._rows, needle)
         self._table.clear()
         for e in rows:
-            colour, label = _sev_for(e.event_type, e.severity)
+            label, colour = _pill_for(e.event_type, e.severity)
             ts_short = e.ts.strftime("%Y-%m-%d %H:%MZ") if getattr(e, "ts", None) else "-"
             self._table.add_row(
                 cell(ts_short, style=FG_1),
-                Text.from_markup(pill_solid(label, colour)),
-                cell(e.event_type, style=FG_0),
+                Text.from_markup(pill_markup(label, colour)),
                 cell(e.icao, style=ACCENT_CYAN),
                 cell(e.callsign or "-", style=FG_0 if e.callsign else FG_2),
                 cell(e.summary or "", style=FG_1),

@@ -37,6 +37,7 @@ adsbtrack = "adsbtrack.cli:cli"
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
     "ruff>=0.4",
     "mypy>=1.10",
 ]
@@ -73,3 +74,7 @@ disallow_untyped_defs = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# test_tui_app.py opts into pytest-asyncio via an explicit pytestmark;
+# other tests stay sync. Strict mode keeps async tests from sneaking in
+# unmarked.
+asyncio_mode = "strict"

@@ -47,6 +47,7 @@ from ..widgets import (
     ACCENT_OK,
     ACCENT_VIOLET,
     BD_0,
+    DOT,
     FG_0,
     FG_1,
     FG_2,
@@ -651,15 +652,13 @@ class MapView(Vertical):
                 date = dates[0]
             points = load_trace_points(db, icao, date)
             if not points:
-                return _MapLoadResult(
-                    icao=icao, date=date, ctx=None, crumb=f"map / {date} (no trace points)", trailing=""
-                )
+                return _MapLoadResult(icao=icao, date=date, ctx=None, crumb=f"{date} (no trace points)", trailing="")
             start_label = self._airport_or_coords(db, points[0])
             end_label = self._airport_or_coords(db, points[-1])
             ctx = _build_ctx(points, date, start_label, end_label, self._cfg.map_trace_gap_secs)
-            crumb = f"map / {date}   {start_label} > {end_label}"
+            crumb = f"{date} {DOT} {start_label} > {end_label}"
             trailing = (
-                f"{len(points):,} points   "
+                f"{len(points):,} points {DOT} "
                 f"bbox ({ctx.lat_min:.3f},{ctx.lon_min:.3f})-({ctx.lat_max:.3f},{ctx.lon_max:.3f})"
             )
             return _MapLoadResult(icao=icao, date=date, ctx=ctx, crumb=crumb, trailing=trailing)

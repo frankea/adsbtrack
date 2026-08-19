@@ -46,3 +46,6 @@ notes/
 
 # Ad-hoc analysis outputs / report drafts
 deliverables/
+
+# Local-only plan (kept out of the repo)
+docs/superpowers/plans/2026-04-16-faa-registry.md

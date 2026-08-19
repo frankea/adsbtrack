@@ -1,14 +1,25 @@
 """Textual Pilot smoke tests for the whole TUI app.
 
-test_tui_workers.py already covers the worker error-handling path in
-detail (and explains why no pytest-asyncio-style plugin is needed: no
-such plugin is installed in this project, so async Pilot sessions are
-driven with ``asyncio.run()`` from a plain sync test). This module
-reuses that same harness pattern to answer a different question: does
-the app actually boot, and can a user reach every view through its
-real keybinding without the app raising or getting stuck?
+This module holds two suites that grew on separate branches and are
+kept side by side deliberately, because they answer different
+questions and use different async harnesses:
 
-Two scenarios:
+* The ``test_pilot_*`` / ``test_events_filter_*`` pair drives async
+  Pilot sessions from plain sync tests via ``asyncio.run()``. They lean
+  on ``_settle()`` because every data view now fetches through a thread
+  worker, so a keypress does not finish painting within one
+  ``pilot.pause()``.
+* The ``test_app_*`` / ``test_jump_*`` / ``test_help_*`` group uses
+  native ``async def`` tests marked with ``@pytest.mark.asyncio``
+  (pytest-asyncio, ``asyncio_mode = "strict"`` in pyproject). These
+  cover the chrome added with the jump palette and help overlay.
+
+The marker is applied per-test rather than through a module-level
+``pytestmark`` so it does not also get stamped onto the sync tests
+above, which do not need (and must not get) an event loop from the
+plugin.
+
+Scenario coverage:
 
 * ``test_pilot_visits_all_six_views`` -- boots against a seeded tmp DB,
   selects an aircraft (unlocking the ICAO-scoped views), then presses
@@ -20,6 +31,12 @@ Two scenarios:
   no aircraft selection), and drives the filter Input via real
   keypresses to prove Task 14/15's filter-then-worker wiring still
   narrows the visible row count.
+* ``test_app_mounts_and_switches_views`` -- the same tour against an
+  empty DB, where the ICAO-scoped views bounce off the selection guard.
+* ``test_jump_overlay_opens_and_dismisses`` /
+  ``test_help_overlay_opens_and_dismisses`` -- the `:` and `?` modals.
+* ``test_app_navigates_after_selecting_aircraft`` -- asserts view
+  *content* (not just the switcher flip) after a selection.
 """
 
 from __future__ import annotations
@@ -31,7 +48,8 @@ import pytest
 
 pytest.importorskip("textual")  # tui extra: pyproject [project.optional-dependencies].tui
 
-from textual.widgets import ContentSwitcher, DataTable, Static  # noqa: E402
+from textual.containers import Grid  # noqa: E402
+from textual.widgets import ContentSwitcher, DataTable  # noqa: E402
 
 from adsbtrack.db import Database  # noqa: E402
 from adsbtrack.models import Flight  # noqa: E402
@@ -39,9 +57,11 @@ from adsbtrack.tui.app import AdsbtrackApp  # noqa: E402
 from adsbtrack.tui.views.aircraft import AircraftOpenFlights, AircraftView  # noqa: E402
 from adsbtrack.tui.views.events import EventsView  # noqa: E402
 from adsbtrack.tui.views.flights import FlightsView  # noqa: E402
+from adsbtrack.tui.views.jump import HelpScreen, JumpToHex  # noqa: E402
 from adsbtrack.tui.views.map import MapCanvas, MapView  # noqa: E402
 from adsbtrack.tui.views.spoof import SpoofView  # noqa: E402
 from adsbtrack.tui.views.status import StatusView  # noqa: E402
+from adsbtrack.tui.widgets import Sidebar  # noqa: E402
 
 
 async def _settle(app, pilot) -> None:
@@ -60,6 +80,14 @@ async def _settle(app, pilot) -> None:
         await pilot.pause()
         await asyncio.sleep(0.01)
     raise AssertionError("workers did not settle in time")
+
+
+@pytest.fixture
+def empty_db(tmp_path):
+    db_path = tmp_path / "tui.db"
+    with Database(db_path) as db:
+        db.commit()
+    return db_path
 
 
 def _seed_one_aircraft(db_path) -> None:
@@ -136,6 +164,11 @@ def _seed_two_emergency_aircraft(db_path) -> None:
         db.commit()
 
 
+# ---------------------------------------------------------------------------
+# asyncio.run()-driven Pilot tours (worker-aware).
+# ---------------------------------------------------------------------------
+
+
 def test_pilot_visits_all_six_views(tmp_path):
     """Boot the app and reach every one of the six main views by pressing
     its real keybinding, asserting no crash and that each view's main
@@ -204,12 +237,14 @@ def test_pilot_visits_all_six_views(tmp_path):
             assert app.query_one(MapView) is not None
             assert app.query_one(MapCanvas) is not None
 
-            # 6: status
+            # 6: status. The dashboard is a Grid of Cards (the merged
+            # chrome replaced the single #status-body Static), so the
+            # mounted-widget assertion targets the grid.
             await pilot.press("6")
             await _settle(app, pilot)
             assert switcher.current == "view-status"
             assert app.query_one(StatusView) is not None
-            assert app.query_one("#status-body", Static) is not None
+            assert app.query_one("#status-grid", Grid) is not None
 
             # App is still alive and responsive after the full tour.
             await pilot.press("1")
@@ -259,3 +294,86 @@ def test_events_filter_narrows_row_count(tmp_path):
             assert table.row_count == unfiltered_count
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# pytest-asyncio Pilot tests covering the jump/help chrome.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_app_mounts_and_switches_views(empty_db):
+    app = AdsbtrackApp(empty_db)
+    async with app.run_test() as pilot:
+        # ContentSwitcher default lands on aircraft
+        assert app.query_one(ContentSwitcher).current == "view-aircraft"
+
+        # Cycle through every view keyboard shortcut without crashing.
+        # The ones scoped to an ICAO are skipped when no aircraft is selected
+        # (a warning notification is emitted instead; not an exception).
+        for key in ("3", "4", "5", "6", "f", "1"):
+            await pilot.press(key)
+            await _settle(app, pilot)
+
+
+@pytest.mark.asyncio
+async def test_jump_overlay_opens_and_dismisses(empty_db):
+    app = AdsbtrackApp(empty_db)
+    async with app.run_test() as pilot:
+        # Trigger the binding directly so the test is keymap-independent.
+        await app.run_action("jump")
+        await pilot.pause()
+        assert any(isinstance(s, JumpToHex) for s in app.screen_stack)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not any(isinstance(s, JumpToHex) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_help_overlay_opens_and_dismisses(empty_db):
+    app = AdsbtrackApp(empty_db)
+    async with app.run_test() as pilot:
+        await app.run_action("help")
+        await pilot.pause()
+        assert any(isinstance(s, HelpScreen) for s in app.screen_stack)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not any(isinstance(s, HelpScreen) for s in app.screen_stack)
+
+
+@pytest.mark.asyncio
+async def test_app_navigates_after_selecting_aircraft(seeded_db):
+    """After an ICAO is picked, the flights/map/status views render."""
+    app = AdsbtrackApp(seeded_db)
+    async with app.run_test() as pilot:
+        app._open_icao("aaa111")
+        await _settle(app, pilot)
+        switcher = app.query_one(ContentSwitcher)
+        sidebar = app.query_one(Sidebar)
+        assert switcher.current == "view-flights"
+        assert sidebar._active == "flights"
+
+        # Assert view-content (not just the switcher flip) so a silently
+        # swallowed set_icao would fail here.
+        flights_table = app.query_one(FlightsView).query_one(DataTable)
+        assert flights_table.row_count == 1
+
+        for key, target, sidebar_active in (
+            ("5", "view-map", "map"),
+            ("6", "view-status", "status"),
+            ("3", "view-events", "events"),
+            ("4", "view-spoof", "spoof"),
+            ("1", "view-aircraft", "aircraft"),
+            ("2", "view-flights", "flights"),
+        ):
+            await pilot.press(key)
+            await _settle(app, pilot)
+            assert switcher.current == target, f"after pressing {key!r}"
+            assert sidebar._active == sidebar_active, f"sidebar after {key!r}"
+
+        # A regression that silently dropped the registry merge in
+        # status_snapshot would leave "N111AA" out of the grid entirely.
+        await pilot.press("6")
+        await _settle(app, pilot)
+        rendered = "".join(str(child.render()) for child in app.query_one(StatusView)._grid.children)
+        assert "N111AA" in rendered

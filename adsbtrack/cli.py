@@ -1,4 +1,5 @@
 import os
+import re
 from datetime import date
 from importlib.metadata import version as pkg_version
 from pathlib import Path
@@ -42,31 +43,38 @@ def ensure_airports(db: Database, config: Config):
         console.print(f"[green]Loaded {count} airports[/]")
 
 
-def _resolve_hex(hex_code: str | None, tail_number: str | None) -> str:
-    """Resolve an ICAO hex code from --hex or --tail options.
+_HEX_RE = re.compile(r"[0-9a-f]{6}")
 
-    Exactly one of hex_code or tail_number must be provided.
-    """
-    if hex_code and tail_number:
-        raise click.UsageError("Provide either --hex or --tail, not both.")
-    if not hex_code and not tail_number:
-        raise click.UsageError("Provide either --hex or --tail.")
-    if tail_number:
-        try:
-            hex_code = nnumber_to_icao(tail_number)
-        except ValueError as e:
-            raise click.BadParameter(str(e), param_hint="--tail") from e
-        console.print(f"[dim]Converted {tail_number} to hex {hex_code}[/]")
-    return hex_code.lower()
+TAIL_HELP = (
+    "Tail/registration. FAA N-numbers are converted algorithmically; "
+    "other registrations (G-, D-, VP-*) are resolved via aircraft_registry "
+    "or hex_crossref if the aircraft has been observed or cross-referenced."
+)
+
+
+def _validate_hex(ctx: click.Context, param: click.Parameter, value: str | None) -> str | None:
+    """Click callback for every --hex option: lowercase, strip, and validate
+    it's 6 hex digits. Applied uniformly so no command can accept a
+    malformed hex code and fail later with a confusing DB-level error."""
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if not _HEX_RE.fullmatch(normalized):
+        raise click.BadParameter(
+            f"{value!r} is not a valid ICAO hex code; expected exactly 6 hex digits (0-9, a-f), e.g. adf64f."
+        )
+    return normalized
 
 
 def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None) -> str:
-    """Resolve an ICAO hex code from --hex or --tail, with DB fallback.
+    """Resolve an ICAO hex code from --hex or --tail options.
 
-    Like _resolve_hex but falls back through aircraft_registry then
-    hex_crossref when the tail isn't a valid FAA N-number. Useful for
-    non-US registrations (G-, D-, VP-*) once the aircraft has been
-    observed or the cross-reference tables have been populated.
+    Exactly one of hex_code or tail_number must be provided. --tail first
+    tries algorithmic FAA N-number conversion, then falls back through
+    aircraft_registry then hex_crossref when the tail isn't a valid FAA
+    N-number. Useful for non-US registrations (G-, D-, VP-*) once the
+    aircraft has been observed or the cross-reference tables have been
+    populated.
 
     Multi-match: if a tail appears on multiple ICAO hexes (reg
     reassigned across aircraft over time), pick the row with the
@@ -138,15 +146,8 @@ def cli():
 
 
 @cli.command()
-@click.option("--hex", "hex_code", default=None, help="ICAO hex code (e.g. adf64f)")
-@click.option(
-    "--tail",
-    "tail_number",
-    default=None,
-    help="Tail/registration. FAA N-numbers are converted algorithmically; "
-    "other registrations (G-, D-, VP-*) are resolved via aircraft_registry "
-    "or hex_crossref if the aircraft has been observed or cross-referenced.",
-)
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code (e.g. adf64f)")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option(
     "--source",
     type=click.Choice(ALL_SOURCES_WITH_ALL),
@@ -280,13 +281,14 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
 
 
 @cli.command()
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--reprocess", is_flag=True, help="Clear and rebuild all flights")
 @click.option("--db", "db_path", default="adsbtrack.db")
-def extract(hex_code, reprocess, db_path):
+def extract(hex_code, tail_number, reprocess, db_path):
     """Process raw traces into flights."""
-    hex_code = hex_code.lower()
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         config = Config(db_path=Path(db_path))
         ensure_airports(db, config)
         count = extract_flights(db, config, hex_code, reprocess=reprocess)
@@ -324,7 +326,7 @@ def _load_airframes_api_key(config: Config) -> str:
 
 
 @cli.command()
-@click.option("--hex", "hex_code", default=None, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="Tail/registration (resolved via aircraft_registry)")
 @click.option("--start", "start_date", required=True, help="Start date (YYYY-MM-DD)")
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
@@ -370,7 +372,8 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
 
 
 @cli.command()
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--from", "from_date", default=None, help="Filter from date (YYYY-MM-DD)")
 @click.option("--to", "to_date", default=None, help="Filter to date (YYYY-MM-DD)")
 @click.option("--airport", default=None, help="Filter by airport ICAO code")
@@ -390,10 +393,10 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     help="Show the primary squawk code held by each flight.",
 )
 @click.option("--db", "db_path", default="adsbtrack.db")
-def trips(hex_code, from_date, to_date, airport, show_alignment, show_squawk, db_path):
+def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, show_squawk, db_path):
     """Show flight history."""
-    hex_code = hex_code.lower()
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         flights = db.get_flights(hex_code, from_date, to_date, airport)
 
         if not flights:
@@ -548,16 +551,16 @@ def trips(hex_code, from_date, to_date, airport, show_alignment, show_squawk, db
 
 
 @cli.command()
-@click.option("--hex", "hex_code", help="ICAO hex code (6 chars)")
-@click.option("--tail", "tail_number", help="Tail number; resolved to hex")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code (6 chars)")
+@click.option("--tail", "tail_number", default=None, help="Tail number; resolved to hex")
 @click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
 def route(hex_code, tail_number, db_path):
     """Print the navaid track fingerprint for each flight of an aircraft."""
     import json as _json
 
-    resolved = _resolve_hex(hex_code, tail_number)
     cfg = Config(db_path=Path(db_path))
     with Database(cfg.db_path) as db:
+        resolved = _resolve_hex_db(db, hex_code, tail_number)
         rows = db.conn.execute(
             "SELECT takeoff_date, origin_icao, destination_icao,"
             "       nearest_origin_icao, nearest_destination_icao, navaid_track"
@@ -593,12 +596,13 @@ def route(hex_code, tail_number, db_path):
 
 
 @cli.command()
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--db", "db_path", default="adsbtrack.db")
-def status(hex_code, db_path):
+def status(hex_code, tail_number, db_path):
     """Show database statistics."""
-    hex_code = hex_code.lower()
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         total_fetched = db.get_total_days_fetched(hex_code)
         days_with_data = db.get_days_with_data(hex_code)
         flight_count = db.get_flight_count(hex_code)
@@ -849,7 +853,7 @@ def lookup(tail_number):
 
 
 @cli.command()
-@click.option("--hex", "hex_code", default=None, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number")
 @click.option("--db", "db_path", default="adsbtrack.db")
 @click.option(
@@ -863,8 +867,8 @@ def lookup(tail_number):
 )
 def links(hex_code, tail_number, db_path, urls_only):
     """Generate ADS-B Exchange trace URLs for each flight."""
-    hex_code = _resolve_hex(hex_code, tail_number)
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         flights = db.get_flights(hex_code)
 
         if not flights:
@@ -967,7 +971,7 @@ def _print_faa_registry_row(row, *, deregistered: bool) -> None:
 
 
 @registry.command("lookup")
-@click.option("--hex", "hex_code", default=None, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number (with or without leading N)")
 @click.option("--db", "db_path", default="adsbtrack.db")
 def registry_lookup(hex_code, tail_number, db_path):
@@ -1154,7 +1158,7 @@ def enrich():
 
 
 @enrich.command("hex")
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", required=True, callback=_validate_hex, help="ICAO hex code")
 @click.option("--db", "db_path", default="adsbtrack.db")
 @click.option(
     "--mictronics-dir",
@@ -1246,7 +1250,7 @@ def mil():
 
 
 @mil.command("hex")
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", required=True, callback=_validate_hex, help="ICAO hex code")
 @click.option("--db", "db_path", default="adsbtrack.db")
 def mil_hex_cmd(hex_code, db_path):
     """Check whether a single hex falls into a known military range."""
@@ -1298,7 +1302,8 @@ def mil_scan_cmd(db_path):
 
 
 @cli.command()
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--db", "db_path", default="adsbtrack.db")
 @click.option(
     "--min-gap-secs",
@@ -1314,7 +1319,7 @@ def mil_scan_cmd(db_path):
     show_default=True,
     help="Filter output by classification bucket.",
 )
-def gaps(hex_code, db_path, min_gap_secs, classification):
+def gaps(hex_code, tail_number, db_path, min_gap_secs, classification):
     """Find within-flight ADS-B signal gaps and classify each.
 
     A gap is only tagged as likely_transponder_off when all of:
@@ -1322,8 +1327,8 @@ def gaps(hex_code, db_path, min_gap_secs, classification):
     position is within 200 nm of a known airport. Ambiguous gaps
     default to "unknown" rather than a confident mislabel.
     """
-    hex_code = hex_code.lower()
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         all_gaps = detect_gaps(db, hex_code, min_gap_secs=float(min_gap_secs))
 
     filtered = [g for g in all_gaps if g.classification == classification] if classification != "all" else all_gaps
@@ -1382,7 +1387,8 @@ def _pct(mix: dict, key: str) -> str:
 
 
 @cli.command()
-@click.option("--hex", "hex_code", required=True, help="ICAO hex code")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--db", "db_path", default="adsbtrack.db")
 @click.option(
     "--since",
@@ -1397,7 +1403,7 @@ def _pct(mix: dict, key: str) -> str:
     show_default=True,
     help="Filter by severity tier.",
 )
-def events(hex_code, db_path, since_str, severity):
+def events(hex_code, tail_number, db_path, since_str, severity):
     """Show a chronological event log for an aircraft.
 
     Surfaces: emergency squawks (7500/7600/7700), emergency flags,
@@ -1408,7 +1414,6 @@ def events(hex_code, db_path, since_str, severity):
     from datetime import UTC
     from datetime import datetime as dt_cls
 
-    hex_code = hex_code.lower()
     since = None
     if since_str:
         try:
@@ -1418,6 +1423,7 @@ def events(hex_code, db_path, since_str, severity):
             return
 
     with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         evts = collect_events(db, hex_code, since=since, severity=severity)
 
     if not evts:
@@ -1496,7 +1502,9 @@ def tui(db_path):
     default="gui-export",
     help="Output directory for the static GUI bundle (overwritten on each run).",
 )
-@click.option("--hex", "hex_code", default=None, help="Focus the initial view on one ICAO hex (optional).")
+@click.option(
+    "--hex", "hex_code", default=None, callback=_validate_hex, help="Focus the initial view on one ICAO hex (optional)."
+)
 def gui(db_path, out_dir, hex_code):
     """Write a static three-column HTML explorer backed by a JSON data snapshot.
 

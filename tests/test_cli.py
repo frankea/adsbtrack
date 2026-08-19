@@ -469,18 +469,43 @@ def test_acars_cli_fetches_and_stores_messages(tmp_path, monkeypatch):
         assert flt["message_count"] == 1
 
 
-def test_acars_cli_errors_without_api_key(tmp_path, monkeypatch):
-    """With no env var and no credentials file, the CLI should exit non-zero with a clear error."""
-    db_path = tmp_path / "a.db"
-    Database(db_path).close()
+def test_acars_cli_errors_without_api_key(monkeypatch):
+    """With no env var and no credentials file, the CLI should exit non-zero with a clear error.
+
+    Config.credentials_path defaults to a relative "credentials.json", resolved
+    against the CWD. Without isolating the CWD, this test would silently pass or
+    fail depending on whether the machine running it happens to have a real
+    credentials.json sitting in the repo root -- so it runs inside
+    runner.isolated_filesystem() to guarantee no such file is visible.
+    """
     monkeypatch.delenv("AIRFRAMES_API_KEY", raising=False)
     runner = CliRunner()
-    result = runner.invoke(
-        cli,
-        ["acars", "--hex", "06a0a5", "--start", "2026-04-01", "--db", str(db_path)],
-    )
+    with runner.isolated_filesystem():
+        Database(Path("a.db")).close()
+        result = runner.invoke(
+            cli,
+            ["acars", "--hex", "06a0a5", "--start", "2026-04-01", "--db", "a.db"],
+        )
     assert result.exit_code != 0
     assert "AIRFRAMES_API_KEY" in result.output or "api key" in result.output.lower()
+
+
+def test_load_airframes_api_key_reads_credentials_json(monkeypatch):
+    """Inverse of the above: with the env var unset and an isolated CWD that
+    *does* have a credentials.json carrying airframesApiKey, the loader
+    returns that key. Proves the CWD-relative fallback path actually works,
+    not just that it fails safely when absent."""
+    import json
+
+    from adsbtrack.cli import _load_airframes_api_key
+    from adsbtrack.config import Config
+
+    monkeypatch.delenv("AIRFRAMES_API_KEY", raising=False)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        Path("credentials.json").write_text(json.dumps({"airframesApiKey": "k"}))
+        config = Config(db_path=Path("a.db"))
+        assert _load_airframes_api_key(config) == "k"
 
 
 def _seed_flight_with_acars(db_path, msg_count: int, oooi: bool = False):
@@ -918,7 +943,7 @@ def test_status_shows_emergency_breakdown_and_avg_squawk_changes(tmp_path, monke
         ]
         for i, (em, changes) in enumerate(seed):
             f = Flight(
-                icao="aaaeme",
+                icao="aaaeee",
                 takeoff_time=datetime(2024, 6, 1, 10 + i, 0),
                 takeoff_lat=27.76,
                 takeoff_lon=-82.63,
@@ -939,7 +964,7 @@ def test_status_shows_emergency_breakdown_and_avg_squawk_changes(tmp_path, monke
             db.insert_flight(f)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["status", "--hex", "aaaeme", "--db", str(db_path)])
+    result = runner.invoke(cli, ["status", "--hex", "aaaeee", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "Emergencies:" in result.output
     # Use regex: "2 (7700)" for the two 7700 flights
@@ -955,7 +980,7 @@ def test_trips_show_squawk_renders_primary_column(tmp_path, monkeypatch) -> None
     db_path = tmp_path / "a.db"
     with Database(db_path) as db:
         f = Flight(
-            icao="sqwk01",
+            icao="aab001",
             takeoff_time=datetime(2024, 6, 1, 10, 0),
             takeoff_lat=27.76,
             takeoff_lon=-82.63,
@@ -976,7 +1001,7 @@ def test_trips_show_squawk_renders_primary_column(tmp_path, monkeypatch) -> None
     runner = CliRunner()
     result = runner.invoke(
         cli,
-        ["trips", "--hex", "sqwk01", "--db", str(db_path), "--show-squawk"],
+        ["trips", "--hex", "aab001", "--db", str(db_path), "--show-squawk"],
     )
     assert result.exit_code == 0, result.output
     assert "Squawk" in result.output
@@ -989,7 +1014,7 @@ def test_trips_no_squawk_column_by_default(tmp_path, monkeypatch) -> None:
     db_path = tmp_path / "a.db"
     with Database(db_path) as db:
         f = Flight(
-            icao="sqwk02",
+            icao="aab002",
             takeoff_time=datetime(2024, 6, 1, 10, 0),
             takeoff_lat=27.76,
             takeoff_lon=-82.63,
@@ -1008,7 +1033,7 @@ def test_trips_no_squawk_column_by_default(tmp_path, monkeypatch) -> None:
         db.insert_flight(f)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["trips", "--hex", "sqwk02", "--db", str(db_path)])
+    result = runner.invoke(cli, ["trips", "--hex", "aab002", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "Squawk" not in result.output  # column hidden by default
 
@@ -1314,3 +1339,162 @@ def test_fetch_cli_omits_failed_days_header_when_empty(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert "Failed days" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# _validate_hex: --hex format validation on every command (A9)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_cli_rejects_invalid_hex_format(tmp_path):
+    """--hex must be 6 hex digits; an invalid value fails fast with a message
+    naming the expected format, before any DB/network work happens."""
+    db_path = tmp_path / "adsbtrack.db"
+    result = CliRunner().invoke(cli, ["fetch", "--hex", "zzz999", "--db", str(db_path)])
+    assert result.exit_code != 0
+    assert "zzz999" in result.output
+    assert "hex" in result.output.lower()
+
+
+def test_trips_cli_rejects_invalid_hex_format(tmp_path):
+    """Same validation applies to every other --hex option, not just fetch."""
+    db_path = tmp_path / "adsbtrack.db"
+    result = CliRunner().invoke(cli, ["trips", "--hex", "abc12", "--db", str(db_path)])
+    assert result.exit_code != 0
+    assert "abc12" in result.output
+    assert "hex" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# --tail on every command that previously required --hex (U1)
+# ---------------------------------------------------------------------------
+
+
+def test_trips_cli_tail_resolves_nnumber(tmp_path):
+    """`trips --tail N512WB` resolves through _resolve_hex_db exactly like fetch."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="a66ad3",
+                takeoff_time=datetime(2022, 6, 16, 12, 43, 27, tzinfo=UTC),
+                takeoff_lat=35.035,
+                takeoff_lon=-117.932,
+                takeoff_date="2022-06-16",
+                origin_icao="K9L2",
+                origin_name="Edwards Aux",
+            )
+        )
+
+    result = CliRunner().invoke(cli, ["trips", "--tail", "N512WB", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "a66ad3" in result.output
+    assert "K9L2" in result.output
+
+
+def test_status_cli_tail_resolves_nnumber(tmp_path):
+    """`status --tail N512WB` resolves through _resolve_hex_db exactly like fetch."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "a66ad3",
+            "2024-01-01",
+            {
+                "r": "N512WB",
+                "t": "C172",
+                "desc": "Cessna 172",
+                "ownOp": "unknown",
+                "year": "1966",
+                "timestamp": datetime(2024, 1, 1, tzinfo=UTC).timestamp(),
+                "trace": [],
+            },
+        )
+
+    result = CliRunner().invoke(cli, ["status", "--tail", "N512WB", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "a66ad3" in result.output
+
+
+def test_extract_cli_accepts_tail(tmp_path):
+    """`extract` gains --tail like fetch and resolves through _resolve_hex_db."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path) as db:
+        # Seed one airport so ensure_airports() doesn't try to download.
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(cli, ["extract", "--tail", "N512WB", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Extracted" in result.output
+
+
+def test_gaps_cli_accepts_tail(tmp_path):
+    """`gaps` gains --tail like fetch and resolves through _resolve_hex_db."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path):
+        pass  # empty DB, schema only
+
+    result = CliRunner().invoke(cli, ["gaps", "--tail", "N512WB", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "a66ad3" in result.output
+
+
+def test_events_cli_accepts_tail(tmp_path):
+    """`events` gains --tail like fetch and resolves through _resolve_hex_db."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path):
+        pass  # empty DB, schema only
+
+    result = CliRunner().invoke(cli, ["events", "--tail", "N512WB", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "a66ad3" in result.output
+
+
+def test_links_cli_tail_resolves_via_aircraft_registry(tmp_path):
+    """`links` switches from _resolve_hex to _resolve_hex_db, so a non-N-number
+    registration now resolves via aircraft_registry instead of only algorithmic
+    FAA N-numbers."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_flights(db_path)  # icao='ae07b3'
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+            ("ae07b3", "G-XYZA", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(cli, ["links", "--tail", "G-XYZA", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "ae07b3" in result.output
+
+
+def test_route_cli_tail_resolves_via_aircraft_registry(tmp_path, monkeypatch):
+    """`route` switches from _resolve_hex to _resolve_hex_db likewise."""
+    import json
+
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "r.db"
+    track = json.dumps([{"navaid_ident": "NDB1", "start_ts": 0.0, "end_ts": 40.0, "min_distance_nm": 5.0}])
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="abc123",
+                takeoff_time=datetime(2026, 3, 27, 14, 0, 0),
+                takeoff_lat=35.0,
+                takeoff_lon=-80.0,
+                takeoff_date="2026-03-27",
+                navaid_track=track,
+            )
+        )
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+            ("abc123", "G-XYZA", "2026-04-10T00:00:00Z"),
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(cli, ["route", "--tail", "G-XYZA", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "NDB1 (<1m)" in result.output

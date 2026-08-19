@@ -246,6 +246,14 @@ class FlightMetrics:
     # --- v3 accumulators ---
 
     # Squawk tracking
+    # squawk_first: coalesce_first (earlier fragment's own value wins
+    # whenever it has one) - a deliberate divergence from the old
+    # hand-written stitch merge, which was coalesce_last
+    # (`if next_metrics.squawk_first is None: ... = metrics.squawk_first`,
+    # i.e. later-wins-unless-None). "First squawk of the whole flight"
+    # should come from whichever fragment was chronologically first; the old
+    # later-wins behavior was itself a latent wrong-fragment bug, the same
+    # class this task fixes for the takeoff-side keep_first fields.
     squawk_first: str | None = field(default=None, metadata={"merge": _MERGE_COALESCE_FIRST})
     squawk_last: str | None = field(default=None, metadata={"merge": _MERGE_COALESCE_LAST})
     squawk_changes: int = field(default=0, metadata={"merge": _MERGE_SUM})

@@ -608,6 +608,36 @@ def test_merge_sums_unions_and_keeps_takeoff_side_from_earlier() -> None:
     assert earlier.last_point_ts == 600.0
 
 
+def test_merge_squawk_first_prefers_earlier_fragment_over_later() -> None:
+    """squawk_first is "coalesce_first": the earlier fragment's own value
+    wins whenever it has one, even when the later fragment saw a different
+    squawk first. This is a deliberate divergence from the old hand-written
+    stitch merge (`if next_metrics.squawk_first is None: ... =
+    metrics.squawk_first`, i.e. later-wins-unless-None) - "first squawk of
+    the whole flight" should come from whichever fragment was chronologically
+    first; the old later-wins behavior was itself a latent wrong-fragment
+    bug, the same class this task fixes for the takeoff-side fields.
+    """
+    earlier = FlightMetrics()
+    earlier.squawk_first = "1200"
+    later = FlightMetrics()
+    later.squawk_first = "4567"
+
+    earlier.merge(later)
+
+    assert earlier.squawk_first == "1200"
+
+    # Fallback: when the earlier fragment never saw a squawk at all, the
+    # later fragment's value is used (coalesce, not a bare keep-first).
+    earlier_no_squawk = FlightMetrics()
+    later_with_squawk = FlightMetrics()
+    later_with_squawk.squawk_first = "7700"
+
+    earlier_no_squawk.merge(later_with_squawk)
+
+    assert earlier_no_squawk.squawk_first == "7700"
+
+
 def test_merge_flushes_dangling_open_squawk_run_across_the_stitch_boundary() -> None:
     """squawk_durations is a "sum_dict" merge, but the currently-open squawk
     run at the moment of merge needs custom handling: self (the earlier

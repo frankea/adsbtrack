@@ -1,11 +1,13 @@
 """Tests for adsbtrack.registry - FAA aircraft registry import and lookup."""
 
+import contextlib
 import io
 import os
 import time
 import zipfile
 from pathlib import Path
 
+import httpx
 import pytest
 
 from adsbtrack import registry
@@ -433,6 +435,75 @@ def test_download_faa_zip_stale_cache_redownloads(tmp_path, monkeypatch):
     assert result == cache_path
     assert calls == [(cfg.faa_registry_url, cache_path)]
     assert cache_path.read_bytes() == b"fresh-download-bytes"
+
+
+def test_download_with_httpx_mid_stream_failure_leaves_no_partial_file(tmp_path, monkeypatch):
+    """A connection drop partway through the body must not leave a
+    partial/corrupt file at the destination -- that file would get a
+    fresh mtime and download_faa_zip's cache check would treat it as
+    valid forever, failing on zipfile.BadZipFile on every future run."""
+    dest = tmp_path / "ReleasableAircraft.zip"
+
+    class _FakeStreamResponse:
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self, chunk_size=1 << 16):
+            yield b"partial-bytes-that-never-complete"
+            raise httpx.ReadError("connection reset mid-stream")
+
+    @contextlib.contextmanager
+    def _fake_stream(_method, _url, follow_redirects=True, timeout=300):
+        yield _FakeStreamResponse()
+
+    monkeypatch.setattr(httpx, "stream", _fake_stream)
+
+    with pytest.raises(httpx.ReadError):
+        registry._download_with_httpx("https://example.com/fake.zip", dest)
+
+    assert not dest.exists()
+    # No leftover temp file either.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_download_faa_zip_mid_stream_failure_leaves_no_corrupt_cache(tmp_path, monkeypatch):
+    """End-to-end: a download interrupted mid-stream must not leave a
+    corrupt fresh-mtime file at the cache path, so the very next refresh
+    attempt re-downloads instead of reusing garbage."""
+    cache_path = tmp_path / "ReleasableAircraft.zip"
+
+    class _FakeStreamResponse:
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self, chunk_size=1 << 16):
+            yield b"partial-bytes"
+            raise httpx.ReadError("connection reset mid-stream")
+
+    call_count = {"n": 0}
+
+    @contextlib.contextmanager
+    def _fake_stream(_method, _url, follow_redirects=True, timeout=300):
+        call_count["n"] += 1
+        yield _FakeStreamResponse()
+
+    def _fake_curl_cffi(_url, _dest):
+        raise ImportError("curl_cffi not installed")
+
+    monkeypatch.setattr(registry, "_download_with_curl_cffi", _fake_curl_cffi)
+    monkeypatch.setattr(httpx, "stream", _fake_stream)
+
+    cfg = Config(faa_registry_cache_path=cache_path, faa_registry_cache_max_age_hours=24.0)
+
+    with pytest.raises(httpx.ReadError):
+        download_faa_zip(cfg)
+    assert not cache_path.exists()
+
+    # A second call must actually retry the download rather than silently
+    # treating a leftover corrupt file as a valid fresh cache.
+    with pytest.raises(httpx.ReadError):
+        download_faa_zip(cfg)
+    assert call_count["n"] == 2
 
 
 def test_end_to_end_update_lookup_owner(tmp_path):

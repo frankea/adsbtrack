@@ -22,6 +22,7 @@ default Python TLS fingerprints, so curl_cffi is strongly recommended.
 from __future__ import annotations
 
 import csv
+import os
 import time
 import zipfile
 from collections.abc import Callable
@@ -376,6 +377,28 @@ def download_faa_zip(cfg: Config, destination: Path | None = None) -> Path:
     return dest
 
 
+def _atomic_download_write(dest: Path, write_body: Callable[[object], None]) -> None:
+    """Stream a download body to a temp file beside ``dest``, then
+    atomically rename onto ``dest`` only once ``write_body`` returns
+    without raising.
+
+    Without this, a connection drop partway through the body would leave
+    a partial/corrupt file sitting at ``dest`` with a fresh mtime --
+    download_faa_zip's cache-freshness check would treat that garbage as
+    a valid cache and never retry, failing on zipfile.BadZipFile on every
+    subsequent run until someone manually deletes the file. On failure
+    the temp file is removed so no trace is left behind.
+    """
+    tmp_path = dest.with_name(dest.name + ".tmp")
+    try:
+        with tmp_path.open("wb") as fh:
+            write_body(fh)
+        os.replace(tmp_path, dest)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
 def _download_with_curl_cffi(url: str, dest: Path) -> None:
     """Download via curl_cffi impersonating Chrome. Raises ImportError
     when curl_cffi is not installed so the caller can fall back.
@@ -393,10 +416,13 @@ def _download_with_curl_cffi(url: str, dest: Path) -> None:
         resp = cffi_requests.get(url, impersonate="chrome", stream=True, timeout=300)
         try:
             resp.raise_for_status()
-            with dest.open("wb") as fh:
+
+            def _write(fh: object) -> None:
                 for chunk in resp.iter_content(chunk_size=1 << 16):
                     if chunk:
-                        fh.write(chunk)
+                        fh.write(chunk)  # type: ignore[attr-defined]
+
+            _atomic_download_write(dest, _write)
         finally:
             resp.close()
         progress.update(task, completed=100)
@@ -411,9 +437,12 @@ def _download_with_httpx(url: str, dest: Path) -> None:
         task = progress.add_task("Downloading FAA ReleasableAircraft.zip (httpx fallback)...", total=None)
         with httpx.stream("GET", url, follow_redirects=True, timeout=300) as resp:
             resp.raise_for_status()
-            with dest.open("wb") as fh:
+
+            def _write(fh: object) -> None:
                 for chunk in resp.iter_bytes(chunk_size=1 << 16):
-                    fh.write(chunk)
+                    fh.write(chunk)  # type: ignore[attr-defined]
+
+            _atomic_download_write(dest, _write)
         progress.update(task, completed=100)
 
 

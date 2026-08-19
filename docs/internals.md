@@ -206,14 +206,21 @@ reuse the same queries to build its JSON snapshot. Styling is in
 by hand and should be kept in lockstep when the palette changes.
 
 **GUI export (`adsbtrack gui`).** Writes a self-contained static HTML bundle into an
-output directory: `index.html`, `app.js`, `app.css`, `data.json`, plus the design
+output directory: `index.html`, `app.js`, `app.css`, `data.js`, plus the design
 tokens and logo copied from `design/`. No server, no build step; the user opens
-`index.html` directly in a browser, which loads `data.json` and renders a
-three-column explorer with a Leaflet trace map in the center. Rerun the command to
-refresh the snapshot. The JS never writes untrusted strings through `innerHTML` and
-instead builds every DOM node via `createElement` + `textContent`, because
-callsigns and registrations arrive from spoofable ADS-B broadcasts - a pytest guards
-this rule (`tests/test_gui_export.py::test_export_app_js_uses_safe_dom_construction`).
+`index.html` directly in a browser, including over `file://` - `data.js` assigns
+the snapshot to `window.ADSB_DATA` via a plain `<script>` tag rather than `fetch`,
+which every browser blocks on `file://`. The snapshot keys flights, events, spoofed
+broadcasts, and the status dashboard per ICAO hex (`flights_by_icao` etc.) so
+picking a different aircraft in the left rail renders that aircraft's own data;
+only the trace map stays scoped to the export's focus aircraft, to keep the bundle
+small. Rerun the command to refresh. The map uses Leaflet's canvas renderer
+(`preferCanvas`) and decimates hover-tooltip markers to a fixed cap, since a busy
+trace day can have ~100K points and one DOM element per point locks the browser.
+The JS never writes untrusted strings through `innerHTML` and instead builds every
+DOM node via `createElement` + `textContent`, because callsigns and registrations
+arrive from spoofable ADS-B broadcasts - a pytest guards this rule
+(`tests/test_gui_export.py::test_export_app_js_uses_safe_dom_construction`).
 
 The design system itself lives in `design/`. Provenance and rules are documented in
 `design/README.md`; the tokens CSS lives in `design/colors_and_type.css` and is

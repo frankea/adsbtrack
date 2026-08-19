@@ -35,40 +35,131 @@ def exported_bundle(tmp_path):
                 mission_type="transport",
             )
         )
+        db.insert_flight(
+            Flight(
+                icao="bbb222",
+                takeoff_time=datetime(2026, 3, 2, 9, 0, tzinfo=UTC),
+                takeoff_lat=33.9,
+                takeoff_lon=-118.4,
+                takeoff_date="2026-03-02",
+                landing_time=datetime(2026, 3, 2, 15, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="SWA200",
+                origin_icao="KLAX",
+                destination_icao="KJFK",
+                duration_minutes=360.0,
+                max_altitude=39000,
+                cruise_gs_kt=460,
+                landing_confidence=0.95,
+                mission_type="transport",
+            )
+        )
         db.conn.execute(
             "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
             ("aaa111", "N111AA", "B738", "BOEING 737-800"),
         )
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
+            ("bbb222", "N222BB", "A320", "AIRBUS A320"),
+        )
         db.refresh_aircraft_stats("aaa111")
+        db.refresh_aircraft_stats("bbb222")
         db.commit()
     out_dir = tmp_path / "gui"
     written = export_gui(db_path, out_dir, focus_hex="aaa111")
     return out_dir, written
 
 
+def _load_snapshot(out_dir):
+    """Parse the ``window.ADSB_DATA = <json>;`` payload out of data.js."""
+    text = (out_dir / "data.js").read_text()
+    prefix = "window.ADSB_DATA = "
+    assert text.startswith(prefix), "data.js does not start with the expected assignment"
+    payload = text[len(prefix) :].rstrip("\n")
+    assert payload.endswith(";"), "data.js assignment is not statement-terminated"
+    return json.loads(payload[:-1])
+
+
 def test_export_writes_core_files(exported_bundle):
     out_dir, _ = exported_bundle
-    for name in ("index.html", "app.js", "app.css", "data.json"):
+    for name in ("index.html", "app.js", "app.css", "data.js"):
         assert (out_dir / name).exists(), name
+    # data.json is gone entirely - the fetch('data.json') flow is what
+    # broke file:// in every browser (A4).
+    assert not (out_dir / "data.json").exists()
 
 
-def test_export_data_json_has_focus_and_counts(exported_bundle):
+def test_index_html_loads_data_js_before_app_js(exported_bundle):
     out_dir, _ = exported_bundle
-    data = json.loads((out_dir / "data.json").read_text())
+    html = (out_dir / "index.html").read_text()
+    data_pos = html.index('<script src="data.js">')
+    app_pos = html.index('<script src="app.js">')
+    assert data_pos < app_pos, "data.js must load before app.js so window.ADSB_DATA is set first"
+
+
+def test_app_js_has_no_fetch(exported_bundle):
+    out_dir, _ = exported_bundle
+    text = (out_dir / "app.js").read_text()
+    assert "fetch(" not in text, "app.js must read window.ADSB_DATA, not fetch a file (blocked on file://)"
+
+
+def test_data_js_defines_window_adsb_data(exported_bundle):
+    out_dir, _ = exported_bundle
+    data = _load_snapshot(out_dir)
     assert data["focus"] == "aaa111"
-    assert data["counts"]["aircraft"] >= 1
-    assert data["counts"]["flights"] >= 1
+    assert data["counts"]["aircraft"] >= 2
+    assert data["counts"]["flights"] >= 2
     assert any(a["icao"] == "aaa111" for a in data["aircraft"])
 
 
-def test_export_includes_flight_details(exported_bundle):
+def test_data_js_escapes_closing_script_tags(exported_bundle):
     out_dir, _ = exported_bundle
-    data = json.loads((out_dir / "data.json").read_text())
-    assert data["flights"], "expected one flight"
-    f = data["flights"][0]
-    assert f["origin_icao"] == "KEWR"
-    assert f["destination_icao"] == "KBOS"
-    assert f["callsign"] == "UAL1"
+    text = (out_dir / "data.js").read_text()
+    assert "</script" not in text, "an unescaped </script> in the payload would truncate the page"
+
+
+def test_flights_by_icao_keyed_per_aircraft(exported_bundle):
+    """U8: the snapshot must carry every aircraft's own flights, not just
+    the focus aircraft's, keyed so selecting another aircraft in the left
+    rail renders that aircraft's data instead of the focus aircraft's."""
+    out_dir, _ = exported_bundle
+    data = _load_snapshot(out_dir)
+    assert set(data["flights_by_icao"]) >= {"aaa111", "bbb222"}
+
+    aaa = data["flights_by_icao"]["aaa111"]
+    assert aaa, "expected aaa111's own flight"
+    assert aaa[0]["origin_icao"] == "KEWR"
+    assert aaa[0]["destination_icao"] == "KBOS"
+    assert aaa[0]["callsign"] == "UAL1"
+
+    bbb = data["flights_by_icao"]["bbb222"]
+    assert bbb, "expected bbb222's own flight"
+    assert bbb[0]["origin_icao"] == "KLAX"
+    assert bbb[0]["destination_icao"] == "KJFK"
+    assert bbb[0]["callsign"] == "SWA200"
+
+
+def test_events_status_spoofs_keyed_per_aircraft(exported_bundle):
+    out_dir, _ = exported_bundle
+    data = _load_snapshot(out_dir)
+    for key in ("events_by_icao", "status_by_icao", "spoofs_by_icao"):
+        assert set(data[key]) >= {"aaa111", "bbb222"}, key
+    assert data["status_by_icao"]["aaa111"]["icao"] == "aaa111"
+    assert data["status_by_icao"]["bbb222"]["icao"] == "bbb222"
+
+
+def test_trace_stays_focus_only(exported_bundle):
+    out_dir, _ = exported_bundle
+    data = _load_snapshot(out_dir)
+    # Trace is still a single top-level array (not keyed per aircraft) -
+    # shipping every aircraft's full trace history would be enormous.
+    assert isinstance(data["trace"], list)
+
+
+def test_app_js_shows_rerun_note_for_non_focus_trace(exported_bundle):
+    out_dir, _ = exported_bundle
+    text = (out_dir / "app.js").read_text()
+    assert "adsbtrack gui" in text
 
 
 def test_export_app_js_uses_safe_dom_construction(exported_bundle):
@@ -87,6 +178,27 @@ def test_export_app_js_uses_safe_dom_construction(exported_bundle):
     # Structure-building helpers we do rely on should be present.
     assert "createElement" in text
     assert "textContent" in text
+
+
+def test_map_uses_canvas_renderer_and_bounded_markers(exported_bundle):
+    """P10: preferCanvas must be on, and per-point circleMarker tooltips
+    must be decimated to a bounded count rather than one per trace point
+    (a busy day can have ~100K points)."""
+    out_dir, _ = exported_bundle
+    text = (out_dir / "app.js").read_text()
+    assert "preferCanvas: true" in text
+
+    # The old unbounded "one circleMarker per point" loop is gone: no
+    # bare `for (const p of trace)` feeding circleMarker directly.
+    assert "for (const p of trace)" not in text
+
+    # The trace line itself is drawn as polyline segments now.
+    assert "L.polyline(" in text
+
+    # circleMarker is still used, but only for the decimated tooltip
+    # layer - bounded by an explicit constant, not trace.length.
+    assert "circleMarker" in text
+    assert "MAX_TOOLTIP_MARKERS" in text
 
 
 def test_export_copies_design_tokens(exported_bundle):

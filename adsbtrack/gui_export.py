@@ -1,9 +1,11 @@
 """Static GUI exporter.
 
 Writes a self-contained three-column HTML explorer into an output
-directory. The HTML loads a ``data.json`` snapshot of the local SQLite
-database and renders the aircraft list, flight timeline, event feed,
-spoofed-broadcasts audit, and a Leaflet-backed trace map.
+directory. ``data.js`` assigns the SQLite snapshot to ``window.ADSB_DATA``
+and is loaded via a plain ``<script>`` tag (not ``fetch``), so the bundle
+renders the aircraft list, flight timeline, event feed, spoofed-broadcasts
+audit, and a Leaflet-backed trace map with no server involved - opening
+``index.html`` directly over ``file://`` works in every browser.
 
 Single-page, vanilla JS. No server, no auth, no build step. Users open
 ``index.html`` directly in their browser; to refresh the view they
@@ -32,10 +34,10 @@ from pathlib import Path
 from typing import Any
 
 from .db import Database
+from .events import bulk_detect_spoof_events, collect_events
 from .tui.queries import (
     SpoofedBroadcast,
     list_aircraft,
-    list_events,
     list_flights,
     list_spoofed_broadcasts,
     load_trace_points,
@@ -62,8 +64,14 @@ def export_gui(db_path: Path, out_dir: Path, *, focus_hex: str | None = None) ->
     with Database(db_path) as db:
         data = _build_data_snapshot(db, focus_hex=focus_hex)
 
-    data_path = out_dir / "data.json"
-    data_path.write_text(json.dumps(data, indent=2, default=_json_default))
+    payload = json.dumps(data, default=_json_default)
+    # A lone "</script>" inside untrusted string data (e.g. a spoofed
+    # callsign) would otherwise close the surrounding <script> tag early
+    # and truncate the page's JS - escaping "</" keeps the JSON valid
+    # while making that impossible.
+    payload = payload.replace("</", "<\\/")
+    data_path = out_dir / "data.js"
+    data_path.write_text(f"window.ADSB_DATA = {payload};\n")
     written.append(data_path)
 
     index_path = out_dir / "index.html"
@@ -100,27 +108,38 @@ def export_gui(db_path: Path, out_dir: Path, *, focus_hex: str | None = None) ->
 # ---------------------------------------------------------------------------
 
 
+# Per-aircraft caps mirroring the defaults `list_flights` / `list_events` /
+# `list_spoofed_broadcasts` already apply to a single-icao call, so the
+# keyed maps below carry the same amount of history per aircraft that a
+# focused export always has.
+_EVENTS_PER_AIRCRAFT_LIMIT = 500
+_SPOOFS_PER_AIRCRAFT_LIMIT = 500
+# Effectively "no limit" for the one bulk spoofed_broadcasts read below;
+# the table is small and indexed either way, so this just avoids SQLite's
+# mandatory LIMIT truncating results before they're grouped by ICAO.
+_SPOOF_TABLE_BULK_LIMIT = 10_000_000
+
+
 def _build_data_snapshot(db: Database, *, focus_hex: str | None = None) -> dict[str, Any]:
     """Build the JSON payload the GUI's JS layer consumes."""
     aircraft_rows = list_aircraft(db)
     aircraft = [_aircraft_row_to_json(r) for r in aircraft_rows]
+    icaos = [r.icao for r in aircraft_rows]
 
     # Default focus: first aircraft in list (sorted by last_seen desc).
     if focus_hex is None and aircraft_rows:
         focus_hex = aircraft_rows[0].icao
 
-    flights: list[dict[str, Any]] = []
-    spoofs: list[dict[str, Any]] = []
-    trace: list[dict[str, Any]] = []
-    status: dict[str, Any] = {}
-    events_for_focus: list[dict[str, Any]] = []
-    if focus_hex:
-        flights = [_flight_row_to_json(f) for f in list_flights(db, focus_hex)]
-        spoofs = [_spoof_to_json(s) for s in list_spoofed_broadcasts(db, icao=focus_hex)]
-        status = status_snapshot(db, focus_hex)
-        events_for_focus = [_event_to_json(e) for e in list_events(db, focus_hex)]
+    flights_by_icao = {icao: [_flight_row_to_json(f) for f in list_flights(db, icao)] for icao in icaos}
+    status_by_icao = {icao: status_snapshot(db, icao) for icao in icaos}
+    events_by_icao = _events_by_icao(db, icaos)
+    spoofs_by_icao = _spoofs_by_icao(db, icaos)
 
-        # Ship trace for the most recent date we have data on.
+    trace: list[dict[str, Any]] = []
+    if focus_hex:
+        # Traces stay focus-aircraft-only: shipping every aircraft's full
+        # trace history would make the bundle unusably large. The other
+        # aircraft's map tab points the user back at `adsbtrack gui`.
         last_date = db.conn.execute(
             "SELECT MAX(date) AS d FROM trace_days WHERE icao = ?",
             (focus_hex,),
@@ -137,12 +156,51 @@ def _build_data_snapshot(db: Database, *, focus_hex: str | None = None) -> dict[
         },
         "focus": focus_hex,
         "aircraft": aircraft,
-        "flights": flights,
-        "events": events_for_focus,
-        "spoofed_broadcasts": spoofs,
+        "flights_by_icao": flights_by_icao,
+        "events_by_icao": events_by_icao,
+        "spoofs_by_icao": spoofs_by_icao,
+        "status_by_icao": status_by_icao,
         "trace": trace,
-        "status": status,
     }
+
+
+def _events_by_icao(db: Database, icaos: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Per-aircraft event feed, capped like a single-icao `list_events` call.
+
+    Built from the same cheap primitives `list_events(icao=None)` uses
+    (Task 12): flight-derived events per aircraft (no trace decode) plus
+    one grouped spoof-detection scan across every hex, so exporting a DB
+    with many aircraft doesn't mean decoding each one's full trace
+    history. Unlike `list_events`, nothing is truncated until after
+    grouping by ICAO - cutting the merged, globally-sorted list down to
+    a fixed size *before* grouping could starve a quiet aircraft of even
+    its own top events if a busy aircraft's recent activity fills the
+    whole global window.
+    """
+    grouped: dict[str, list[Any]] = {icao: [] for icao in icaos}
+    for icao in icaos:
+        grouped[icao].extend(collect_events(db, icao, include_spoof_checks=False))
+    for event in bulk_detect_spoof_events(db, icaos):
+        grouped.setdefault(event.icao, []).append(event)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for icao, events in grouped.items():
+        events.sort(key=lambda e: e.ts, reverse=True)
+        out[icao] = [_event_to_json(e) for e in events[:_EVENTS_PER_AIRCRAFT_LIMIT]]
+    return out
+
+
+def _spoofs_by_icao(db: Database, icaos: list[str]) -> dict[str, list[dict[str, Any]]]:
+    """Per-aircraft spoofed-broadcast feed, capped like a single-icao
+    `list_spoofed_broadcasts` call. Reading the whole table once and
+    grouping in Python (rather than looping one query per aircraft) is
+    cheap either way since spoofed_broadcasts is small and indexed.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {icao: [] for icao in icaos}
+    for row in list_spoofed_broadcasts(db, limit=_SPOOF_TABLE_BULK_LIMIT):
+        bucket = grouped.setdefault(row.icao, [])
+        if len(bucket) < _SPOOFS_PER_AIRCRAFT_LIMIT:
+            bucket.append(_spoof_to_json(row))
+    return grouped
 
 
 def _aircraft_row_to_json(row) -> dict[str, Any]:  # type: ignore[no-untyped-def]
@@ -312,6 +370,7 @@ _INDEX_HTML = """<!doctype html>
 </div>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
         integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script src="data.js"></script>
 <script src="app.js"></script>
 </body>
 </html>
@@ -468,7 +527,10 @@ body { font-family: var(--font-sans); font-size: 13px; color: var(--fg-0); }
 """
 
 
-_APP_JS = r"""// adsbtrack static GUI - vanilla JS, consumes data.json next to index.html.
+_APP_JS = r"""// adsbtrack static GUI - vanilla JS, reads window.ADSB_DATA (set by
+// data.js, loaded before this file) rather than fetching a JSON file, so
+// the bundle also works when opened directly over file:// - every
+// browser blocks the Fetch API on file:// URLs.
 //
 // Every DOM node is assembled via createElement / textContent; no innerHTML
 // writes happen anywhere in this file. Callsigns, registrations, and owner
@@ -491,6 +553,10 @@ const LANDING_SHORT = {
   uncertain: 'UNCERT',
   altitude_error: 'ALT ERR',
 };
+
+// A busy day can have ~100K trace points; hover tooltips are informational
+// only, so they're decimated to this many markers instead of one per point.
+const MAX_TOOLTIP_MARKERS = 500;
 
 const state = {
   data: null,
@@ -537,9 +603,8 @@ function clearChildren(node) {
 
 // --- boot ---
 
-async function boot() {
-  const res = await fetch('data.json');
-  state.data = await res.json();
+function boot() {
+  state.data = window.ADSB_DATA;
   state.filtered = [...state.data.aircraft];
   state.selected = state.data.focus || (state.data.aircraft[0] && state.data.aircraft[0].icao);
   renderHeader();
@@ -638,14 +703,6 @@ function selectAircraft(icao) {
     const hex = rowEl.querySelector('.hex');
     rowEl.classList.toggle('selected', hex && hex.textContent === icao);
   }
-  if (state.data.focus && icao !== state.data.focus) {
-    const body = document.getElementById('status-body');
-    if (body) {
-      body.textContent =
-        `Selected ${icao}, but this static bundle was exported with focus = ${state.data.focus}.\n` +
-        `Rerun "adsbtrack gui --hex ${icao}" to refresh.`;
-    }
-  }
   renderFlightsTable();
   renderEventsTable();
   renderSpoofTable();
@@ -654,11 +711,16 @@ function selectAircraft(icao) {
 }
 
 // --- tables ---
+//
+// Each render function pulls the *selected* aircraft's own slice out of
+// the snapshot's per-ICAO maps - every aircraft carries its full flights /
+// events / spoofs / status, so clicking another aircraft in the left rail
+// renders that aircraft's data instead of the focus aircraft's.
 
 function renderFlightsTable() {
   const tbody = document.querySelector('#flights-table tbody');
   clearChildren(tbody);
-  const flights = state.data.flights || [];
+  const flights = (state.data.flights_by_icao && state.data.flights_by_icao[state.selected]) || [];
   for (const f of flights) {
     const tr = el('tr', {}, [
       el('td', { text: (f.takeoff_time || '').slice(0, 16).replace('T', ' ') + 'Z' }),
@@ -701,7 +763,7 @@ function flightFlagsCell(f) {
 function renderEventsTable() {
   const tbody = document.querySelector('#events-table tbody');
   clearChildren(tbody);
-  const events = state.data.events || [];
+  const events = (state.data.events_by_icao && state.data.events_by_icao[state.selected]) || [];
   for (const e of events) {
     const isSpoof = (e.event_type || '').startsWith('spoof');
     const sevClass = isSpoof ? 'c-violet' : e.severity === 'emergency' ? 'c-red' : 'c-amber';
@@ -720,7 +782,7 @@ function renderEventsTable() {
 function renderSpoofTable() {
   const tbody = document.querySelector('#spoof-table tbody');
   clearChildren(tbody);
-  const rows = state.data.spoofed_broadcasts || [];
+  const rows = (state.data.spoofs_by_icao && state.data.spoofs_by_icao[state.selected]) || [];
   for (const r of rows) {
     const d = r.reason_detail || {};
     const tr = el('tr', {}, [
@@ -738,7 +800,7 @@ function renderSpoofTable() {
 
 function renderStatus() {
   const body = document.getElementById('status-body');
-  const snap = state.data.status;
+  const snap = state.data.status_by_icao && state.data.status_by_icao[state.selected];
   if (!snap || !snap.icao) {
     body.textContent = 'no status snapshot available';
     return;
@@ -792,10 +854,33 @@ function renderStatus() {
 
 // --- map ---
 
+function teardownMap() {
+  if (state.map) state.map.remove();
+  state.map = null;
+  state.mapLayer = null;
+}
+
 function renderMap() {
-  const trace = state.data.trace || [];
   const host = document.getElementById('leaflet-map');
+
+  // Traces only ship for the export's focus aircraft (size); other
+  // aircraft point back at the CLI instead of silently showing the wrong
+  // aircraft's trace under the right name.
+  if (state.selected !== state.data.focus) {
+    teardownMap();
+    clearChildren(host);
+    host.appendChild(el('div', {
+      style: { padding: '16px', color: 'var(--fg-2)', fontFamily: 'var(--font-mono)' },
+      text:
+        `Trace map only ships for the export's focus aircraft (${state.data.focus || '-'}). ` +
+        `Rerun "adsbtrack gui --hex ${state.selected}" to view ${state.selected}'s trace.`,
+    }));
+    return;
+  }
+
+  const trace = state.data.trace || [];
   if (!trace.length) {
+    teardownMap();
     clearChildren(host);
     host.appendChild(el('div', {
       style: { padding: '16px', color: 'var(--fg-2)', fontFamily: 'var(--font-mono)' },
@@ -804,7 +889,10 @@ function renderMap() {
     return;
   }
   if (!state.map) {
-    state.map = L.map('leaflet-map', { zoomControl: true });
+    // preferCanvas: a canvas renderer batches every shape into one <canvas>
+    // element instead of one SVG node per shape - required to stay
+    // responsive once the tooltip layer below has hundreds of markers.
+    state.map = L.map('leaflet-map', { zoomControl: true, preferCanvas: true });
     L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png', {
       attribution: '&copy; CARTO &copy; OpenStreetMap contributors',
       subdomains: 'abcd',
@@ -813,7 +901,27 @@ function renderMap() {
   }
   if (state.mapLayer) state.mapLayer.remove();
   const group = L.layerGroup();
-  for (const p of trace) {
+
+  // Draw the trace itself as per-source-coloured polyline segments rather
+  // than one circleMarker per point - a busy day can have ~100K points,
+  // and one element per point locks the browser up long before it renders.
+  let segStart = 0;
+  for (let i = 1; i <= trace.length; i++) {
+    const atBoundary = i === trace.length || trace[i].source !== trace[segStart].source;
+    if (!atBoundary) continue;
+    const seg = trace.slice(segStart, i);
+    if (seg.length > 1) {
+      const colour = SOURCE_COLOUR[seg[0].source] || '#e4ecf3';
+      L.polyline(seg.map((p) => [p.lat, p.lon]), { color: colour, weight: 2, opacity: 0.85 }).addTo(group);
+    }
+    segStart = i;
+  }
+
+  // Hover tooltips are informational only, so they're decimated to a fixed
+  // cap instead of one circleMarker per point.
+  const step = Math.max(1, Math.ceil(trace.length / MAX_TOOLTIP_MARKERS));
+  for (let i = 0; i < trace.length; i += step) {
+    const p = trace[i];
     const colour = SOURCE_COLOUR[p.source] || '#e4ecf3';
     const tooltip =
       `${new Date(p.ts * 1000).toISOString().slice(11, 19)}Z  ` +
@@ -829,6 +937,7 @@ function renderMap() {
       .bindTooltip(tooltip)
       .addTo(group);
   }
+
   group.addTo(state.map);
   state.mapLayer = group;
   const bounds = L.latLngBounds(trace.map((p) => [p.lat, p.lon]));

@@ -1848,10 +1848,12 @@ def tui(db_path):
 def gui(db_path, out_dir, hex_code):
     """Write a static three-column HTML explorer backed by a JSON data snapshot.
 
-    Produces `index.html`, `data.json`, and the design tokens CSS into
-    ``--out``. Open `index.html` in any modern browser; the page loads
-    `data.json` and renders the aircraft list, flight timeline, events,
-    and spoofed-broadcasts audit. Read-only; rerun the command to refresh.
+    Produces `index.html`, `data.js`, and the design tokens CSS into
+    ``--out``. Open `index.html` directly in any modern browser, including
+    via `file://` - `data.js` assigns the snapshot to `window.ADSB_DATA`
+    via a plain `<script>` tag rather than `fetch`, so no local server is
+    needed. Renders the aircraft list, flight timeline, events, and
+    spoofed-broadcasts audit. Read-only; rerun the command to refresh.
     """
     from .gui_export import export_gui
 

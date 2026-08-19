@@ -654,20 +654,19 @@ def _load_and_merge(
     return merged_days, all_sources, spoof_scores_by_date
 
 
-def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
-    if reprocess:
-        db.clear_flights(hex_code)
+def _scan_state_machine(
+    merged_days: list[tuple[str, float, list]],
+    config: Config,
+    *,
+    hex_code: str,
+    all_sources: set[str],
+) -> tuple[list[Flight], list[FlightMetrics]]:
+    """Walk the merged days point by point through the ground/airborne state
+    machine, emitting one (Flight, FlightMetrics) pair per detected fragment.
 
-    # get_trace_days is a generator (P7); materialize it here since the
-    # stages below make multiple passes over trace_days (registry upsert,
-    # type_code/owner_operator fallback scans, iter_parsed_trace_days).
-    trace_days = list(db.get_trace_days(hex_code))
-    if not trace_days:
-        return 0
-
-    type_code, owner_operator = _resolve_registry_metadata(db, hex_code, trace_days)
-    merged_days, all_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
-
+    Fragments come out raw: no duration, no noise filtering and no
+    stitching - _run_state_machine layers those on top.
+    """
     max_day_gap = timedelta(days=config.max_day_gap_days)
     max_point_gap_secs = config.max_point_gap_minutes * 60.0
     post_landing_window_secs = config.post_landing_window_secs
@@ -945,6 +944,31 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         flights.append(pending_flight)
         metrics_list.append(pending_metrics or FlightMetrics())
 
+    return flights, metrics_list
+
+
+def _run_state_machine(
+    merged_days: list[tuple[str, float, list]],
+    config: Config,
+    *,
+    hex_code: str,
+    all_sources: set[str],
+    type_code: str | None,
+) -> list[tuple[Flight, FlightMetrics]]:
+    """Turn merged trace days into the flight fragments enrichment will see.
+
+    The sequence is load-bearing: fragments get a duration first because the
+    noise filter reads it, the filter runs before last_seen backfill and
+    stitching so dropped slivers can never be stitched onto a real flight,
+    and _stitch_fragments refreshes duration on any pair it merges.
+    """
+    flights, metrics_list = _scan_state_machine(
+        merged_days,
+        config,
+        hex_code=hex_code,
+        all_sources=all_sources,
+    )
+
     # Compute durations for every flight from first/last trace point.
     # Previously duration was only set on flights with a landing transition;
     # signal_lost / dropped_on_approach flights got NULL. Now every flight
@@ -990,6 +1014,30 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # 90-min window.
     valid_flights, valid_metrics = _stitch_fragments(valid_flights, valid_metrics, config, type_code=type_code)
 
+    return list(zip(valid_flights, valid_metrics, strict=True))
+
+
+def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
+    if reprocess:
+        db.clear_flights(hex_code)
+
+    # get_trace_days is a generator (P7); materialize it here since the
+    # stages below make multiple passes over trace_days (registry upsert,
+    # type_code/owner_operator fallback scans, iter_parsed_trace_days).
+    trace_days = list(db.get_trace_days(hex_code))
+    if not trace_days:
+        return 0
+
+    type_code, owner_operator = _resolve_registry_metadata(db, hex_code, trace_days)
+    merged_days, all_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
+    pairs = _run_state_machine(
+        merged_days,
+        config,
+        hex_code=hex_code,
+        all_sources=all_sources,
+        type_code=type_code,
+    )
+
     # Classify, score confidence, match airports, and save.
     # Order of operations (v5 plan):
     #   classify_landing -> B7/B8 filter -> airport (D1) -> B1 duration
@@ -1004,7 +1052,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     airport_elev_cache: dict[str, int | None] = {}
     runway_cache: dict[str, list] = {}
     navaid_cache: dict[tuple[int, int, int, int], list] = {}
-    for flight, metrics in zip(valid_flights, valid_metrics, strict=True):
+    for flight, metrics in pairs:
         has_landing = flight.landing_lat is not None
 
         flight.takeoff_type = metrics.takeoff_type

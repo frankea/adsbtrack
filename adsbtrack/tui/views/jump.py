@@ -134,7 +134,9 @@ class JumpToHex(ModalScreen[str | None]):
             self.loading = False
         elif event.state == WorkerState.ERROR:
             self.loading = False
-            self.app.notify(f"failed to load aircraft: {event.worker.error}", severity="error")  # type: ignore[attr-defined]
+            self.app.notify(  # type: ignore[attr-defined]
+                f"failed to load aircraft: {event.worker.error}", severity="error"
+            )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input is self._input:

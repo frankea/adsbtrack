@@ -64,7 +64,11 @@ target-version = "py312"
 line-length = 120
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+# E501 is redundant with "E" (confirmed via `ruff check --show-settings`:
+# line-too-long is already in the resolved rule set) but is named
+# explicitly so the 120-char limit stays enforced even if a future ruff
+# version narrows what "E" implies.
+select = ["E", "E501", "F", "W", "I", "UP", "B", "SIM"]
 
 [tool.mypy]
 python_version = "3.12"

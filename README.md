@@ -236,7 +236,7 @@ Launches a Textual TUI over the local database: aircraft list, flight timeline, 
 uv run python -m adsbtrack.cli gui --hex a66ad3
 ```
 
-Writes a static three-column HTML explorer (`index.html` + a JSON data snapshot) to `--out` (default `gui-export`) that renders the aircraft list, flight timeline, events, and spoofed-broadcasts audit. Open `index.html` directly in a browser via `file://` - no local server needed. Read-only; rerun the command to refresh the snapshot. Options: `--out`, `--hex` (focus the initial view on one aircraft).
+Writes a static three-column HTML explorer to `--out` (default `gui-export`): `index.html` plus a small JS/CSS bundle, including a `data.js` snapshot loaded via a plain `<script>` tag (not `fetch`) so it works from `file://`. Renders the aircraft list, flight timeline, events, and spoofed-broadcasts audit. Open `index.html` directly in a browser - no local server needed. Read-only; rerun the command to refresh the snapshot. Options: `--out`, `--hex` (focus the initial view on one aircraft).
 
 ### MCP server
 

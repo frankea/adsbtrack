@@ -155,7 +155,7 @@ class EventsView(Vertical):
         """
         db = self.app.db_factory()
         try:
-            rows = list_events(db, icao, include_spoof_checks=True)
+            rows = list_events(db, icao, include_spoof_checks=True, config=self.app.config)
         finally:
             db.close()
         counts = {"emergency": 0, "unusual": 0, "spoof": 0}

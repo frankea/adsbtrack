@@ -148,6 +148,93 @@ def test_events_status_spoofs_keyed_per_aircraft(exported_bundle):
     assert data["status_by_icao"]["bbb222"]["icao"] == "bbb222"
 
 
+# ---------------------------------------------------------------------------
+# export_gui(config=...) must reach the spoof-event detection path, the same
+# way Config.load() overrides reach every CLI command via _load_config.
+# ---------------------------------------------------------------------------
+
+
+def _make_sample(version, nic, sil, *, t=0.0, lat=25.25, lon=55.38, alt="ground"):
+    """Construct a 14-element readsb trace sample for tests."""
+    ac = {"version": version, "nic": nic, "sil": sil, "flight": "EK01    ", "category": "A5"}
+    return [t, lat, lon, alt, 0.5, 30.9, 0, None, ac, "adsb_icao", None, None, None, None]
+
+
+def _insert_trace_day(db, icao, date, samples, source="adsbx"):
+    """Direct-insert a trace_day with synthetic readsb samples, leaving the
+    materialized v2_samples/v2_sil0/v2_nic0 stat columns NULL so the spoof
+    detector takes its decode-fallback path."""
+    db.conn.execute(
+        """INSERT INTO trace_days
+           (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            icao,
+            date,
+            source,
+            1776600000.0,
+            json.dumps(samples),
+            len(samples),
+            datetime(2026, 4, 21, tzinfo=UTC).isoformat(),
+        ),
+    )
+
+
+def test_export_gui_threads_config_to_spoof_detection(tmp_path):
+    """A 33% v2 sil=0 rate clears the default spoof_v2_sil0_pct (10%) but
+    not a caller-relaxed threshold of 50% -- so whether the exported
+    events feed carries a spoof_bimodal_integrity event proves whether
+    export_gui's config= argument actually reached collect_events /
+    bulk_detect_spoof_events, not just that some Config got used somewhere."""
+    from adsbtrack.config import Config
+
+    db_path = tmp_path / "spoof_gui.db"
+    with Database(db_path) as db:
+        # list_aircraft (and so the GUI export's per-icao scan) is keyed off
+        # aircraft_stats, which refresh_aircraft_stats rolls up from the
+        # flights table -- a trace_day alone doesn't put this hex in scope.
+        db.insert_flight(
+            Flight(
+                icao="89618d",
+                takeoff_time=datetime(2026, 4, 21, 0, 49, 47, tzinfo=UTC),
+                takeoff_lat=25.25,
+                takeoff_lon=55.38,
+                takeoff_date="2026-04-21",
+                landing_time=datetime(2026, 4, 21, 1, 41, 52, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="EK01",
+                origin_icao=None,
+                destination_icao=None,
+                duration_minutes=52.0,
+            )
+        )
+        samples = (
+            [_make_sample(2, 8, 3) for _ in range(40)]  # 40 realistic v2
+            + [_make_sample(2, 0, 0) for _ in range(20)]  # 20 garbage v2 (33% sil0)
+        )
+        _insert_trace_day(db, "89618d", "2026-04-21", samples)
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
+            ("89618d", "A6-EEN", "A388", "AIRBUS A-380-800"),
+        )
+        db.refresh_aircraft_stats("89618d")
+        db.commit()
+
+    default_dir = tmp_path / "gui_default"
+    export_gui(db_path, default_dir, focus_hex="89618d")
+    default_events = _load_snapshot(default_dir)["events_by_icao"].get("89618d", [])
+    assert any(e["event_type"] == "spoof_bimodal_integrity" for e in default_events), (
+        "sanity check: default Config (10% threshold) should flag a 33% sil0 rate"
+    )
+
+    relaxed_dir = tmp_path / "gui_relaxed"
+    export_gui(db_path, relaxed_dir, focus_hex="89618d", config=Config(spoof_v2_sil0_pct=50.0))
+    relaxed_events = _load_snapshot(relaxed_dir)["events_by_icao"].get("89618d", [])
+    assert not any(e["event_type"] == "spoof_bimodal_integrity" for e in relaxed_events), (
+        "export_gui(config=...) must thread its Config into spoof detection"
+    )
+
+
 def test_trace_stays_focus_only(exported_bundle):
     out_dir, _ = exported_bundle
     data = _load_snapshot(out_dir)

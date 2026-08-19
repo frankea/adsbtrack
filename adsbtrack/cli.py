@@ -1904,7 +1904,8 @@ def tui(db_path):
     except ImportError as e:
         raise click.ClickException("TUI extra is not installed. Run `uv sync --extra tui` to add textual.") from e
 
-    AdsbtrackApp(Path(db_path)).run()
+    config = _load_config(db_path)
+    AdsbtrackApp(Path(db_path), config=config).run()
 
 
 @cli.command("gui")
@@ -1930,7 +1931,8 @@ def gui(db_path, out_dir, hex_code):
     """
     from .gui_export import export_gui
 
-    written = export_gui(Path(db_path), Path(out_dir), focus_hex=hex_code)
+    config = _load_config(db_path)
+    written = export_gui(Path(db_path), Path(out_dir), focus_hex=hex_code, config=config)
     console.print(f"[green]Wrote {len(written)} files to {out_dir}[/]")
     console.print(f"[dim]Open {out_dir}/index.html in your browser.[/]")
 

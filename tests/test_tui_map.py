@@ -175,12 +175,20 @@ def test_draw_endpoint_out_of_bounds_row_is_noop():
 # ---------------------------------------------------------------------------
 
 
-class _StandInSelf:
-    """Duck-typed stand-in for MapView -- _airport_or_coords only reads
-    self._cfg, so a full Widget/App isn't needed to unit test it."""
+class _StandInApp:
+    """Duck-typed stand-in for the app object -- only its .config attribute
+    is read by _airport_or_coords."""
 
     def __init__(self) -> None:
-        self._cfg = Config()
+        self.config = Config()
+
+
+class _StandInSelf:
+    """Duck-typed stand-in for MapView -- _airport_or_coords only reads
+    self.app.config, so a full Widget/App isn't needed to unit test it."""
+
+    def __init__(self) -> None:
+        self.app = _StandInApp()
 
 
 def test_airport_or_coords_falls_back_on_sqlite_error(tmp_path, monkeypatch):
@@ -420,5 +428,38 @@ def test_map_view_renders_after_f7_refactor(tmp_path):
             # LAYERS/TRACE panel text should show up somewhere once the
             # pane is wide enough (Pilot's default test size is 80x24).
             assert "LAYERS" in plain or "TRACE" in plain
+
+    asyncio.run(scenario())
+
+
+def test_map_view_uses_app_config_for_trace_gap_secs(tmp_path):
+    """MapView must read map_trace_gap_secs off ``app.config`` -- the Config
+    the `tui` command loads from config.toml -- instead of constructing its
+    own default Config(). Otherwise a config.toml override to
+    map_trace_gap_secs never reaches the map's dashed-gap rendering."""
+    db_path = tmp_path / "map_config.db"
+    _seed_map_aircraft(db_path)
+
+    custom_gap = 12.5
+    assert custom_gap != Config().map_trace_gap_secs, "sanity: must actually be an override"
+
+    async def scenario() -> None:
+        from adsbtrack.tui.views.aircraft import AircraftOpenFlights
+        from adsbtrack.tui.views.map import MapCanvas
+
+        app = AdsbtrackApp(db_path, config=Config(map_trace_gap_secs=custom_gap))
+        async with app.run_test() as pilot:
+            await _settle(app, pilot)
+            aircraft_view = app.query_one("#view-aircraft")
+            aircraft_view.post_message(AircraftOpenFlights("aaa111"))
+            await pilot.pause()
+            await _settle(app, pilot)
+
+            await pilot.press("5")
+            await _settle(app, pilot)
+
+            canvas = app.query_one(MapCanvas)
+            assert canvas._ctx is not None
+            assert canvas._ctx.gap_secs == custom_gap
 
     asyncio.run(scenario())

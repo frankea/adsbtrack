@@ -37,7 +37,6 @@ from textual.widget import Widget
 from textual.worker import Worker, WorkerState
 
 from ...airports import find_nearest_airport
-from ...config import Config
 from ...db import Database
 from ..braille import BrailleCanvas
 from ..queries import TracePoint, distinct_dates_for_icao, load_trace_points
@@ -606,7 +605,6 @@ class MapView(Vertical):
         super().__init__(id="view-map")
         self._icao: str | None = None
         self._date: str | None = None
-        self._cfg = Config()
         self._header = PageHeader("map", crumb="select an aircraft first", widget_id="map-header")
         self._canvas = MapCanvas()
 
@@ -641,7 +639,9 @@ class MapView(Vertical):
         widget -- only DB reads and pure computation happen here.
         ``exit_on_error=False`` on the decorator keeps a raised exception
         from crashing the whole app before the ``ERROR`` branch in
-        ``on_worker_state_changed`` runs.
+        ``on_worker_state_changed`` runs. ``self.app.config`` is read
+        (not ``self.app.db``) -- it's immutable in practice once the app
+        is built, so sharing it into a worker thread is safe.
         """
         db = self.app.db_factory()
         try:
@@ -655,7 +655,7 @@ class MapView(Vertical):
                 return _MapLoadResult(icao=icao, date=date, ctx=None, crumb=f"{date} (no trace points)", trailing="")
             start_label = self._airport_or_coords(db, points[0])
             end_label = self._airport_or_coords(db, points[-1])
-            ctx = _build_ctx(points, date, start_label, end_label, self._cfg.map_trace_gap_secs)
+            ctx = _build_ctx(points, date, start_label, end_label, self.app.config.map_trace_gap_secs)
             crumb = f"{date} {DOT} {start_label} > {end_label}"
             trailing = (
                 f"{len(points):,} points {DOT} "
@@ -688,7 +688,7 @@ class MapView(Vertical):
         should surface as a crash, not silently fall back to raw coords.
         """
         try:
-            match = find_nearest_airport(db, point.lat, point.lon, self._cfg)
+            match = find_nearest_airport(db, point.lat, point.lon, self.app.config)
         except sqlite3.Error:
             match = None
         if match and match.ident:

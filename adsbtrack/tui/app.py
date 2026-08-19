@@ -24,6 +24,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import ContentSwitcher
 
+from ..config import Config
 from ..db import Database
 from .queries import count_aircraft, count_flights, count_trace_bytes
 from .views.aircraft import AircraftOpenFlights, AircraftView
@@ -78,12 +79,18 @@ class AdsbtrackApp(App):
         Binding("question_mark", "help", "Help"),
     ]
 
-    def __init__(self, db_path: Path, *, project_root: Path | None = None) -> None:
+    def __init__(self, db_path: Path, *, project_root: Path | None = None, config: Config | None = None) -> None:
         super().__init__()
         self._db_path = db_path
         self._db: Database | None = None
         self.project_root = project_root or Path.cwd()
         self._current_icao: str | None = None
+        # The config the `tui` CLI command loaded from config.toml (see
+        # cli._load_config), or a plain default for direct construction
+        # (tests, `adsbtrack tui` calling this without going through the
+        # config-loading path). Views read this instead of building their
+        # own Config() so a config.toml override reaches every view.
+        self.config = config or Config()
 
     # --- lifecycle ---
 

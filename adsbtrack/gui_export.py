@@ -33,6 +33,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .config import Config
 from .db import Database
 from .events import bulk_detect_spoof_events, collect_events
 from .tui.queries import (
@@ -52,8 +53,16 @@ _DESIGN_DIR = Path(__file__).resolve().parent.parent / "design"
 # ---------------------------------------------------------------------------
 
 
-def export_gui(db_path: Path, out_dir: Path, *, focus_hex: str | None = None) -> list[Path]:
+def export_gui(
+    db_path: Path, out_dir: Path, *, focus_hex: str | None = None, config: Config | None = None
+) -> list[Path]:
     """Render a standalone static GUI bundle from ``db_path`` into ``out_dir``.
+
+    ``config`` carries the spoof-detection thresholds through to the event
+    feed's spoof-detection pass (see ``_events_by_icao``); the CLI's `gui`
+    command passes the config.toml-loaded Config through here so an
+    override actually reaches the export, same as every other command.
+    Defaults to ``Config()`` for library/test callers that don't need one.
 
     Returns the list of files written. Overwrites existing files in
     ``out_dir`` but does not clear unknown content.
@@ -62,7 +71,7 @@ def export_gui(db_path: Path, out_dir: Path, *, focus_hex: str | None = None) ->
 
     written: list[Path] = []
     with Database(db_path) as db:
-        data = _build_data_snapshot(db, focus_hex=focus_hex)
+        data = _build_data_snapshot(db, focus_hex=focus_hex, config=config)
 
     payload = json.dumps(data, default=_json_default)
     # A lone "</script>" inside untrusted string data (e.g. a spoofed
@@ -121,7 +130,7 @@ _SPOOFS_PER_AIRCRAFT_LIMIT = 500
 _SPOOF_TABLE_BULK_LIMIT = 10_000_000
 
 
-def _build_data_snapshot(db: Database, *, focus_hex: str | None = None) -> dict[str, Any]:
+def _build_data_snapshot(db: Database, *, focus_hex: str | None = None, config: Config | None = None) -> dict[str, Any]:
     """Build the JSON payload the GUI's JS layer consumes."""
     aircraft_rows = list_aircraft(db)
     aircraft = [_aircraft_row_to_json(r) for r in aircraft_rows]
@@ -133,7 +142,7 @@ def _build_data_snapshot(db: Database, *, focus_hex: str | None = None) -> dict[
 
     flights_by_icao = {icao: [_flight_row_to_json(f) for f in list_flights(db, icao)] for icao in icaos}
     status_by_icao = {icao: status_snapshot(db, icao) for icao in icaos}
-    events_by_icao = _events_by_icao(db, icaos)
+    events_by_icao = _events_by_icao(db, icaos, config)
     spoofs_by_icao = _spoofs_by_icao(db, icaos)
 
     trace: list[dict[str, Any]] = []
@@ -165,7 +174,7 @@ def _build_data_snapshot(db: Database, *, focus_hex: str | None = None) -> dict[
     }
 
 
-def _events_by_icao(db: Database, icaos: list[str]) -> dict[str, list[dict[str, Any]]]:
+def _events_by_icao(db: Database, icaos: list[str], config: Config | None = None) -> dict[str, list[dict[str, Any]]]:
     """Per-aircraft event feed, capped like a single-icao `list_events` call.
 
     Built from the same cheap primitives `list_events(icao=None)` uses
@@ -176,12 +185,13 @@ def _events_by_icao(db: Database, icaos: list[str]) -> dict[str, list[dict[str, 
     grouping by ICAO - cutting the merged, globally-sorted list down to
     a fixed size *before* grouping could starve a quiet aircraft of even
     its own top events if a busy aircraft's recent activity fills the
-    whole global window.
+    whole global window. ``config`` threads the spoof-detection
+    thresholds into the grouped scan below.
     """
     grouped: dict[str, list[Any]] = {icao: [] for icao in icaos}
     for icao in icaos:
-        grouped[icao].extend(collect_events(db, icao, include_spoof_checks=False))
-    for event in bulk_detect_spoof_events(db, icaos):
+        grouped[icao].extend(collect_events(db, icao, include_spoof_checks=False, config=config))
+    for event in bulk_detect_spoof_events(db, icaos, config=config):
         grouped.setdefault(event.icao, []).append(event)
     out: dict[str, list[dict[str, Any]]] = {}
     for icao, events in grouped.items():

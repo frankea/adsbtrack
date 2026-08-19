@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+from ..config import Config
 from ..db import Database, decode_trace_json
 from ..events import bulk_detect_spoof_events, collect_events
 
@@ -278,6 +279,7 @@ def list_events(
     *,
     include_spoof_checks: bool = True,
     limit: int = 500,
+    config: Config | None = None,
 ) -> list[Any]:
     """Return recent events, optionally scoped to one ICAO.
 
@@ -286,9 +288,14 @@ def list_events(
     pass (``events.bulk_detect_spoof_events``, Task 12) instead of
     decoding each aircraft's full trace history in turn. When scoped to
     one hex we delegate directly to ``events.collect_events``.
+
+    ``config`` carries the spoof-detection thresholds (spoof_v2_sil0_pct,
+    spoof_min_v2_samples) through to both call sites below; callers pass
+    the app's loaded Config so a config.toml override actually reaches
+    the detector instead of it falling back to Config() defaults.
     """
     if icao is not None:
-        events = collect_events(db, icao, include_spoof_checks=include_spoof_checks)
+        events = collect_events(db, icao, include_spoof_checks=include_spoof_checks, config=config)
         return events[:limit]
 
     hexes = [r["icao"] for r in db.conn.execute("SELECT DISTINCT icao FROM flights").fetchall()]
@@ -296,9 +303,9 @@ def list_events(
     for hex_code in hexes:
         # Spoof checks are handled below in one grouped pass across every
         # hex, so they're always skipped in this per-hex loop.
-        out.extend(collect_events(db, hex_code, include_spoof_checks=False))
+        out.extend(collect_events(db, hex_code, include_spoof_checks=False, config=config))
     if include_spoof_checks:
-        out.extend(bulk_detect_spoof_events(db, hexes))
+        out.extend(bulk_detect_spoof_events(db, hexes, config=config))
     out.sort(key=lambda e: e.ts, reverse=True)
     return out[:limit]
 

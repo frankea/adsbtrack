@@ -95,7 +95,7 @@ Extracted flights with airport matching, quality classification, confidence scor
 | heavy_signal_gap | INTEGER | 1 if active_minutes / duration_minutes < 0.5 (advisory: exclude from speed analyses) |
 | peak_climb_fpm / peak_descent_fpm | INTEGER | Best 60-s rolling-window mean climb / descent rate |
 | takeoff_is_night / landing_is_night | INTEGER | 1 if sun was below -6 degrees |
-| night_flight | INTEGER | 1 if >= 50% of in-flight points were at night |
+| night_flight | INTEGER | 1 if either endpoint (takeoff or landing) is night, per FAR 91.205(c) |
 | callsigns | TEXT | JSON array of distinct callsigns seen |
 | callsign_changes | INTEGER | Transitions between distinct callsigns (capped at distinct - 1) |
 | probable_destination_icao | TEXT | Inferred destination for dropped/signal-lost flights |
@@ -190,7 +190,9 @@ UNIQUE(icao, takeoff_time) mirrors the `flights` table so the two are keyed comp
 
 ## fetch_log
 
-Tracks which dates have been fetched per source.
+Tracks which dates have been fetched per source. A date whose only fetch_log rows carry retryable
+statuses (403, 429, or >= 500) does not count as fetched and will be retried by the next fetch (see
+RETRYABLE_FETCH_STATUSES in config.py).
 
 | Column | Type | Description |
 |--------|------|-------------|

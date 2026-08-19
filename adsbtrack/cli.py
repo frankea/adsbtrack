@@ -847,8 +847,8 @@ def status(hex_code, tail_number, output_json, db_path):
         # FAA registry block: show registrant, address, cert info when
         # we have FAA data loaded. Also flag deregistered hexes so the
         # user knows the aircraft was pulled from the registry (common
-        # in the ghost-helicopter pattern). Not part of the --json payload
-        # (see task-4-brief.md); table-only.
+        # in the ghost-helicopter pattern). Table-only; not part of the
+        # --json payload by design.
         faa_reg = db.get_faa_registry_by_hex(hex_code)
         faa_dereg = db.get_faa_deregistered_by_hex(hex_code)
         if (faa_reg or faa_dereg) and not output_json:
@@ -1062,7 +1062,7 @@ def status(hex_code, tail_number, output_json, db_path):
                     console.print(f"  Top labels: {top}")
 
         # v3: emergency / night indicators. Table-only; not part of the
-        # --json payload (see task-4-brief.md).
+        # --json payload by design.
         night_count = db.conn.execute(
             "SELECT COUNT(*) FROM flights WHERE icao = ? AND night_flight = 1", (hex_code,)
         ).fetchone()[0]

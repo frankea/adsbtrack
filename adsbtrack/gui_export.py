@@ -115,8 +115,9 @@ def export_gui(db_path: Path, out_dir: Path, *, focus_hex: str | None = None) ->
 _EVENTS_PER_AIRCRAFT_LIMIT = 500
 _SPOOFS_PER_AIRCRAFT_LIMIT = 500
 # Effectively "no limit" for the one bulk spoofed_broadcasts read below;
-# the table is small and indexed either way, so this just avoids SQLite's
-# mandatory LIMIT truncating results before they're grouped by ICAO.
+# the table is small and indexed either way, so this just overrides
+# list_spoofed_broadcasts's default limit=500 to avoid truncating results
+# before they're grouped by ICAO.
 _SPOOF_TABLE_BULK_LIMIT = 10_000_000
 
 

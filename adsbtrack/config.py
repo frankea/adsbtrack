@@ -1,4 +1,6 @@
-from dataclasses import dataclass, field
+import os
+import tomllib
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
 SOURCE_URLS = {
@@ -236,6 +238,34 @@ EMERGENCY_SQUAWK_PRIORITY: dict[str, int] = {
     "7700": 2,  # General emergency
     "7600": 1,  # Radio/comm failure
 }
+
+
+def _coerce_config_value(key: str, field_type: type, value: object) -> object:
+    """Type-check and normalize one TOML value against a Config field's
+    declared type. Path fields accept a plain string and get expanduser()
+    applied; bool is checked before int (bool is an int subclass in Python)
+    and a bare TOML integer is accepted for a float field."""
+    if field_type is Path:
+        if not isinstance(value, str):
+            raise ValueError(f"Config key {key!r} expects a path string, got {type(value).__name__}")
+        return Path(value).expanduser()
+    if field_type is bool:
+        if not isinstance(value, bool):
+            raise ValueError(f"Config key {key!r} expects a bool, got {type(value).__name__}")
+        return value
+    if field_type is int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"Config key {key!r} expects an int, got {type(value).__name__}")
+        return value
+    if field_type is float:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"Config key {key!r} expects a float, got {type(value).__name__}")
+        return float(value)
+    if field_type is str:
+        if not isinstance(value, str):
+            raise ValueError(f"Config key {key!r} expects a str, got {type(value).__name__}")
+        return value
+    raise ValueError(f"Config key {key!r} has unsupported type {field_type!r} for config-file loading")
 
 
 @dataclass
@@ -494,3 +524,40 @@ class Config:
     callsign_prefix_missions: dict[str, str] = field(default_factory=lambda: dict(CALLSIGN_PREFIX_MISSIONS))
     emergency_squawk_priority: dict[str, int] = field(default_factory=lambda: dict(EMERGENCY_SQUAWK_PRIORITY))
     offshore_operator_keywords: tuple[str, ...] = field(default_factory=lambda: tuple(OFFSHORE_OPERATOR_KEYWORDS))
+
+    _CONFIG_ENV_VAR = "ADSBTRACK_CONFIG"
+    _DEFAULT_CONFIG_PATH = Path("~/.config/adsbtrack/config.toml")
+
+    @classmethod
+    def load(cls, path: Path | None = None) -> "Config":
+        """Build a Config from a TOML file, defaulting any field the file
+        doesn't mention. Resolution order: explicit `path` arg >
+        $ADSBTRACK_CONFIG > ~/.config/adsbtrack/config.toml > pure defaults
+        (no file needed for the last case, or when the resolved path
+        doesn't exist).
+
+        TOML keys must match Config field names 1:1 -- an unrecognized key
+        raises ValueError naming it. Values are type-checked against the
+        field's annotation (int/float/str/bool/Path); Path fields accept
+        plain strings and get expanduser() applied.
+        """
+        if path is not None:
+            resolved = Path(path).expanduser()
+        else:
+            env_value = os.environ.get(cls._CONFIG_ENV_VAR)
+            resolved = Path(env_value).expanduser() if env_value else cls._DEFAULT_CONFIG_PATH.expanduser()
+
+        if not resolved.is_file():
+            return cls()
+
+        with resolved.open("rb") as toml_file:
+            data = tomllib.load(toml_file)
+
+        field_map = {fld.name: fld for fld in fields(cls)}
+        overrides = {}
+        for key, value in data.items():
+            matched = field_map.get(key)
+            if matched is None:
+                raise ValueError(f"Unknown config key: {key!r}")
+            overrides[key] = _coerce_config_value(key, matched.type, value)
+        return cls(**overrides)

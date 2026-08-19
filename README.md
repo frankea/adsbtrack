@@ -180,6 +180,16 @@ Traces from multiple sources are automatically merged during extraction.
 | [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
 
+## Configuration file
+
+`Config` thresholds (rate limits, match distances, endurance caps, etc.) can be overridden with a TOML file instead of editing `adsbtrack/config.py`. The CLI resolves the file in this order: an explicit path > `$ADSBTRACK_CONFIG` > `~/.config/adsbtrack/config.toml` > built-in defaults if none of those exist. Keys map 1:1 onto `Config` field names; an unrecognized key is rejected.
+
+```toml
+# ~/.config/adsbtrack/config.toml
+airport_match_threshold_km = 15.0
+rate_limit = 1.0
+```
+
 ## Documentation
 
 Detailed reference docs for contributors and analysts:

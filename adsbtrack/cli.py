@@ -34,7 +34,12 @@ console = Console()
 
 
 def get_db_and_config(db_path: str) -> tuple[Database, Config]:
-    config = Config(db_path=Path(db_path))
+    """Load Config from an on-disk config file (see Config.load), then apply
+    the CLI's --db/$ADSBTRACK_DB path on top -- that flag is always explicit
+    (it has its own default and envvar via _db_option), so it takes
+    precedence over whatever db_path a config file names."""
+    config = Config.load()
+    config.db_path = Path(db_path)
     db = Database(config.db_path)
     return db, config
 

@@ -33,15 +33,16 @@ ALL_SOURCES_WITH_ALL = ["all"] + ALL_SOURCES
 console = Console()
 
 
-def get_db_and_config(db_path: str) -> tuple[Database, Config]:
+def _load_config(db_path: str) -> Config:
     """Load Config from an on-disk config file (see Config.load), then apply
     the CLI's --db/$ADSBTRACK_DB path on top -- that flag is always explicit
     (it has its own default and envvar via _db_option), so it takes
-    precedence over whatever db_path a config file names."""
+    precedence over whatever db_path a config file names. Every CLI command
+    builds its Config through this one function so a config file's overrides
+    apply uniformly instead of only to whichever command happens to call it."""
     config = Config.load()
     config.db_path = Path(db_path)
-    db = Database(config.db_path)
-    return db, config
+    return config
 
 
 def ensure_airports(db: Database, config: Config):
@@ -224,7 +225,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
     """Download trace data from ADS-B data sources."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
-        config = Config(db_path=Path(db_path))
+        config = _load_config(db_path)
         config.rate_limit = rate
         config.fetch_concurrency = concurrency
 
@@ -326,7 +327,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
 
                 def _fetch_one(src: str) -> None:
                     with Database(Path(db_path)) as thread_db:
-                        thread_config = Config(db_path=Path(db_path))
+                        thread_config = _load_config(db_path)
                         thread_config.rate_limit = rate
                         thread_config.fetch_concurrency = concurrency
                         if src == "opensky":
@@ -392,7 +393,7 @@ def extract(hex_code, tail_number, reprocess, db_path):
     """Process raw traces into flights."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
-        config = Config(db_path=Path(db_path))
+        config = _load_config(db_path)
         ensure_airports(db, config)
         count = extract_flights(db, config, hex_code, reprocess=reprocess)
         console.print(f"[green]Extracted {count} flights[/]")
@@ -446,7 +447,7 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     start = date.fromisoformat(start_date)
     end = date.fromisoformat(end_date) if end_date else date.today()
 
-    config = Config(db_path=Path(db_path))
+    config = _load_config(db_path)
     api_key = _load_airframes_api_key(config)
 
     with Database(Path(db_path)) as db:
@@ -727,7 +728,7 @@ def route(hex_code, tail_number, db_path):
     """Print the navaid track fingerprint for each flight of an aircraft."""
     import json as _json
 
-    cfg = Config(db_path=Path(db_path))
+    cfg = _load_config(db_path)
     with Database(cfg.db_path) as db:
         resolved = _resolve_hex_db(db, hex_code, tail_number)
         rows = db.conn.execute(
@@ -1131,7 +1132,7 @@ def registry_update(zip_path, db_path):
 
     from .registry import refresh_faa_registry
 
-    cfg = Config(db_path=Path(db_path))
+    cfg = _load_config(db_path)
     try:
         with Database(cfg.db_path) as db:
             stats = refresh_faa_registry(db, cfg, local_zip=zip_path)
@@ -1302,7 +1303,7 @@ def runways_refresh(csv_path, db_path):
     """
     import httpx
 
-    cfg = Config(db_path=Path(db_path))
+    cfg = _load_config(db_path)
     try:
         with Database(cfg.db_path) as db:
             count = refresh_runways(db, cfg, local_csv=csv_path)
@@ -1336,7 +1337,7 @@ def navaids_refresh(csv_path, db_path):
     """
     import httpx
 
-    cfg = Config(db_path=Path(db_path))
+    cfg = _load_config(db_path)
     try:
         with Database(cfg.db_path) as db:
             count = _refresh_navaids(db, cfg, local_csv=csv_path)
@@ -1391,7 +1392,7 @@ def enrich_hex_cmd(hex_code, db_path, mictronics_dir, no_hexdb):
     """Enrich a single ICAO hex. Prefers FAA registry, then Mictronics, then hexdb.io."""
     from .hex_crossref import HexdbClient, _load_mictronics_files, enrich_hex
 
-    cfg = Config(db_path=Path(db_path))
+    cfg = _load_config(db_path)
     resolved_mictronics = mictronics_dir or cfg.mictronics_cache_dir
     mictronics_cache = None
     if (resolved_mictronics / "aircrafts.json").exists():
@@ -1439,7 +1440,7 @@ def enrich_all_cmd(db_path, mictronics_dir, no_hexdb, download_mictronics):
     from .hex_crossref import download_mictronics as dl_mictronics
     from .hex_crossref import enrich_all
 
-    cfg = Config(db_path=Path(db_path))
+    cfg = _load_config(db_path)
     resolved_mictronics = mictronics_dir or cfg.mictronics_cache_dir
     if download_mictronics:
         console.print(f"Downloading Mictronics DB into {resolved_mictronics}...")

@@ -535,6 +535,35 @@ def test_acars_cli_errors_without_api_key(monkeypatch):
     assert "AIRFRAMES_API_KEY" in result.output or "api key" in result.output.lower()
 
 
+def test_acars_cli_honors_config_file_via_adsbtrack_config(tmp_path, monkeypatch):
+    """A real CLI command builds its Config through the shared config-file
+    loader (adsbtrack.cli._load_config), not a bare Config(db_path=...) --
+    every command must pick up $ADSBTRACK_CONFIG overrides, not just
+    Config.load() when called directly.
+
+    Point $ADSBTRACK_CONFIG at a TOML file overriding credentials_path, then
+    invoke `acars` (no API key set, so it fails fast before touching the
+    database) and confirm the resulting error message -- which embeds
+    config.credentials_path -- names the overridden path rather than the
+    hardcoded "credentials.json" default.
+    """
+    custom_creds = tmp_path / "custom-creds.json"
+    config_toml = tmp_path / "adsbtrack.toml"
+    config_toml.write_text(f'credentials_path = "{custom_creds}"\n')
+    monkeypatch.delenv("AIRFRAMES_API_KEY", raising=False)
+    monkeypatch.setenv("ADSBTRACK_CONFIG", str(config_toml))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        Database(Path("a.db")).close()
+        result = runner.invoke(
+            cli,
+            ["acars", "--hex", "06a0a5", "--start", "2026-04-01", "--db", "a.db"],
+        )
+    assert result.exit_code != 0
+    assert str(custom_creds) in result.output
+
+
 def test_load_airframes_api_key_reads_credentials_json(monkeypatch):
     """Inverse of the above: with the env var unset and an isolated CWD that
     *does* have a credentials.json carrying airframesApiKey, the loader

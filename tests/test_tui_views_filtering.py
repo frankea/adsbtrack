@@ -12,10 +12,11 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from adsbtrack.events import Event
-from adsbtrack.tui.queries import AircraftRow, FlightRow
+from adsbtrack.tui.queries import AircraftRow, FlightRow, JumpMatch
 from adsbtrack.tui.views.aircraft import filter_aircraft
 from adsbtrack.tui.views.events import filter_events
 from adsbtrack.tui.views.flights import filter_flights
+from adsbtrack.tui.views.jump import filter_jump_matches
 
 # ---------------------------------------------------------------------------
 # events
@@ -215,3 +216,62 @@ def test_filter_aircraft_skips_none_home_base():
 def test_filter_aircraft_no_match_returns_empty():
     rows = [_aircraft()]
     assert filter_aircraft(rows, "zzzzzz") == []
+
+
+# ---------------------------------------------------------------------------
+# jump-to-hex palette
+# ---------------------------------------------------------------------------
+
+
+def _jump_match(**overrides) -> JumpMatch:
+    fields = dict(
+        icao="aaa111",
+        registration="N111AA",
+        type_code="B738",
+        description="BOEING 737-800",
+    )
+    fields.update(overrides)
+    return JumpMatch(**fields)
+
+
+def test_filter_jump_matches_empty_needle_returns_all():
+    rows = [_jump_match(), _jump_match(icao="bbb222")]
+    assert filter_jump_matches(rows, "") == rows
+
+
+def test_filter_jump_matches_matches_icao():
+    rows = [_jump_match(icao="aaa111"), _jump_match(icao="bbb222")]
+    result = filter_jump_matches(rows, "bbb")
+    assert [r.icao for r in result] == ["bbb222"]
+
+
+def test_filter_jump_matches_matches_registration_case_insensitive():
+    rows = [_jump_match(registration="N111AA"), _jump_match(registration="A6-EEN")]
+    result = filter_jump_matches(rows, "111aa")
+    assert [r.registration for r in result] == ["N111AA"]
+
+
+def test_filter_jump_matches_matches_type_code():
+    rows = [_jump_match(type_code="B738"), _jump_match(type_code="A388")]
+    result = filter_jump_matches(rows, "a388")
+    assert [r.type_code for r in result] == ["A388"]
+
+
+def test_filter_jump_matches_matches_description():
+    """Unlike filter_aircraft, the jump palette matches on description --
+    mirrors queries.search_aircraft's SQL match set (icao, registration,
+    type_code, description), which does not include home_base_icao."""
+    rows = [_jump_match(description="BOEING 737-800"), _jump_match(description="AIRBUS A-380-800")]
+    result = filter_jump_matches(rows, "airbus")
+    assert [r.description for r in result] == ["AIRBUS A-380-800"]
+
+
+def test_filter_jump_matches_skips_none_fields():
+    rows = [_jump_match(registration=None, type_code=None, description=None)]
+    result = filter_jump_matches(rows, "n111aa")
+    assert result == []
+
+
+def test_filter_jump_matches_no_match_returns_empty():
+    rows = [_jump_match()]
+    assert filter_jump_matches(rows, "zzzzzz") == []

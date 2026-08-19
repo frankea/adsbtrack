@@ -213,6 +213,118 @@ def test_flight_bbox_returns_none_on_antimeridian_span():
     assert flight_bbox_from_points(points, buffer_nm=50.0) is None
 
 
+def _build_threshold_fixture(n_navaids: int, seed: int) -> tuple[list[_PointSample], list[dict]]:
+    """A flight + navaid set sized by the caller, used to exercise the
+    grid_min_count threshold from both sides.
+
+    Deliberately mirrors the wide-lat/lon-span shape of the larger stress
+    fixture below (5000 points over a 10 deg lat / 50 deg lon transcontinental
+    track, forward navaids anchored across the middle 80% of the flight)
+    rather than a smaller/shorter one. At short range, a forward navaid's
+    flat lat/lon offset from its anchor point is nearly indistinguishable
+    from the constant track bearing all the way back to the first sample,
+    so many navaids look "in view" simultaneously from t=0 -- identical
+    start_ts across different idents, whose relative order is a legitimate
+    implementation detail (grid cell-traversal order vs. navaid-list order)
+    that both this file's brute-force reference and the pre-optimization
+    grid-only implementation already disagreed on before this task existed.
+    At transcontinental range the spherical-vs-flat bearing drift is large
+    enough that alignment onsets spread out and that pre-existing ambiguity
+    doesn't come up, which is why the stress fixture below has never hit it.
+    """
+    rng = random.Random(seed)
+    track_deg = 75.0
+
+    points: list[_PointSample] = []
+    for i in range(5000):
+        lat = 35.0 + 10.0 * (i / 5000)
+        lon = -120.0 + 50.0 * (i / 5000)
+        points.append(_sample(ts=1000.0 + 2.0 * i, lat=lat, lon=lon, track=track_deg))
+
+    navaids: list[dict] = []
+    n_forward = max(1, n_navaids // 4)
+    n_background = n_navaids - n_forward
+    for i in range(n_background):
+        navaids.append(
+            {
+                "ident": f"NAV{i:03d}",
+                "latitude_deg": rng.uniform(30.0, 50.0),
+                "longitude_deg": rng.uniform(-125.0, -65.0),
+                "type": "VOR",
+            }
+        )
+    for i in range(n_forward):
+        anchor = points[rng.randrange(500, 4500)]
+        dist_nm = rng.uniform(40.0, 200.0)
+        dist_deg = dist_nm / 60.0
+        dlat = dist_deg * math.cos(math.radians(track_deg))
+        dlon = dist_deg * math.sin(math.radians(track_deg)) / math.cos(math.radians(anchor.lat))
+        navaids.append(
+            {
+                "ident": f"FWD{i:03d}",
+                "latitude_deg": anchor.lat + dlat,
+                "longitude_deg": anchor.lon + dlon,
+                "type": "VOR",
+            }
+        )
+    return points, navaids
+
+
+def test_below_grid_threshold_skips_grid_and_matches_brute_force(monkeypatch):
+    """With fewer navaids than grid_min_count, the detector should scan the
+    list directly rather than building a _NavaidGrid. Patch the grid's
+    constructor to prove that path is never taken, not just assert the
+    output matches (which the grid path would also satisfy)."""
+    import adsbtrack.navaid_alignment as navaid_alignment
+
+    grid_init_calls = []
+    orig_init = navaid_alignment._NavaidGrid.__init__
+
+    def spy_init(self, *args, **kwargs):
+        grid_init_calls.append(1)
+        return orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(navaid_alignment._NavaidGrid, "__init__", spy_init)
+
+    points, navaids = _build_threshold_fixture(n_navaids=40, seed=1)
+    assert len(navaids) < 64
+
+    expected = _brute_force_detect(points, navaids)
+    assert len(expected) > 0  # fixture must actually exercise segment emission
+
+    actual = detect_navaid_alignments(points, navaids=navaids, grid_min_count=64)
+
+    assert actual == expected
+    assert grid_init_calls == [], "grid should not be built below grid_min_count"
+
+
+def test_at_or_above_grid_threshold_uses_clamped_grid_and_matches_brute_force(monkeypatch):
+    """At/above grid_min_count, the detector should build a _NavaidGrid
+    (with the walk radius clamped to the navaids' own bounding box) and
+    still match the brute-force reference exactly."""
+    import adsbtrack.navaid_alignment as navaid_alignment
+
+    grid_init_calls = []
+    orig_init = navaid_alignment._NavaidGrid.__init__
+
+    def spy_init(self, *args, **kwargs):
+        grid_init_calls.append(1)
+        return orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(navaid_alignment._NavaidGrid, "__init__", spy_init)
+
+    points, navaids = _build_threshold_fixture(n_navaids=120, seed=2)
+    assert len(navaids) >= 64
+
+    expected = _brute_force_detect(points, navaids)
+    assert len(expected) > 0  # fixture must actually exercise segment emission
+
+    actual = detect_navaid_alignments(points, navaids=navaids, grid_min_count=64)
+
+    assert actual == expected
+    assert len(grid_init_calls) == 1, "grid should be built exactly once at/above grid_min_count"
+
+
 def test_detect_matches_brute_force_and_completes_under_budget():
     """Stress test: 5000 points × 500 navaids covering a transcontinental
     flight with a realistic post-bbox-filter candidate set.

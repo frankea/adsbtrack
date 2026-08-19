@@ -538,6 +538,7 @@ def _compute_navaid_track_json(
         split_gap_secs=config.navaid_split_gap_secs,
         min_duration_secs=config.navaid_min_duration_secs,
         near_pass_max_nm=config.navaid_near_pass_max_nm,
+        grid_min_count=config.navaid_grid_min_count,
     )
     if not segments:
         return None

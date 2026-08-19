@@ -430,6 +430,10 @@ class Config:
     navaid_near_pass_max_nm: float = 80.0
     # Bounding-box buffer (nm) applied when prefiltering navaids per flight.
     navaid_bbox_buffer_nm: float = 50.0
+    # Below this many candidate navaids, detect_navaid_alignments scans the
+    # list directly instead of building a lat/lon grid index (pure perf
+    # tuning knob; see adsbtrack/navaid_alignment.py).
+    navaid_grid_min_count: int = 64
 
     # Endurance
     max_endurance_minutes: float = 240.0  # fallback when type_code is unknown

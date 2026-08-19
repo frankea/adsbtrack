@@ -48,18 +48,6 @@ def test_list_aircraft_returns_rows(seeded_db):
     assert row.total_flights >= 1
 
 
-def test_list_aircraft_filter_matches_registration(seeded_db):
-    with Database(seeded_db) as db:
-        rows = list_aircraft(db, filter_substr="111aa")
-    assert [r.icao for r in rows] == ["aaa111"]
-
-
-def test_list_aircraft_filter_non_match(seeded_db):
-    with Database(seeded_db) as db:
-        rows = list_aircraft(db, filter_substr="zzzzzz")
-    assert rows == []
-
-
 def test_list_flights_per_icao(seeded_db):
     with Database(seeded_db) as db:
         flights = list_flights(db, "aaa111")

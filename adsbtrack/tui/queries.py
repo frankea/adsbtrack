@@ -64,13 +64,12 @@ class AircraftRow:
         return self.last_seen or "-"
 
 
-def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int = 5000) -> list[AircraftRow]:
+def list_aircraft(db: Database, *, limit: int = 5000) -> list[AircraftRow]:
     """Return an aircraft list keyed on ICAO hex.
 
-    Source of truth for the aircraft-list screen. ``filter_substr`` does
-    a case-insensitive substring match against ICAO hex, registration,
-    type code, and home-base ICAO (the four columns a user is most
-    likely to be typing when they hit the filter bar). The query joins
+    Source of truth for the aircraft-list screen. Filtering is owned by
+    ``tui.views.aircraft.filter_aircraft`` (an in-Python needle match over
+    the rows this returns), not by this query. The query joins
     aircraft_stats (for utilisation + home base), hex_crossref /
     aircraft_registry (for registration + type), mil_hex_ranges (via
     hex_crossref.is_military), and spoofed_broadcasts (for the SPF
@@ -90,21 +89,9 @@ def list_aircraft(db: Database, *, filter_substr: str | None = None, limit: int 
           FROM aircraft_stats s
           LEFT JOIN aircraft_registry r ON r.icao = s.icao
           LEFT JOIN hex_crossref x ON x.icao = s.icao
+         ORDER BY s.last_seen DESC, s.total_flights DESC LIMIT ?
     """
-    params: list[Any] = []
-    if filter_substr:
-        sql += (
-            " WHERE lower(s.icao) LIKE ? "
-            "    OR lower(COALESCE(r.registration, x.registration, '')) LIKE ? "
-            "    OR lower(COALESCE(r.type_code, x.type_code, '')) LIKE ? "
-            "    OR lower(COALESCE(s.home_base_icao, '')) LIKE ?"
-        )
-        needle = f"%{filter_substr.lower()}%"
-        params.extend([needle, needle, needle, needle])
-    sql += " ORDER BY s.last_seen DESC, s.total_flights DESC LIMIT ?"
-    params.append(limit)
-
-    rows = db.conn.execute(sql, params).fetchall()
+    rows = db.conn.execute(sql, [limit]).fetchall()
     out = []
     for row in rows:
         flags = _render_flags(

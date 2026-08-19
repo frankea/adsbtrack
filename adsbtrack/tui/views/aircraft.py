@@ -133,12 +133,14 @@ class AircraftView(Vertical):
         self.loading = True
         self._fetch_aircraft()
 
-    @work(thread=True, exclusive=True, group="aircraft")
+    @work(thread=True, exclusive=True, group="aircraft", exit_on_error=False)
     def _fetch_aircraft(self) -> list[AircraftRow]:
         """Run the aircraft-list query on a worker's own connection.
 
         Must not touch ``self.app.db`` (the main-thread connection) or any
-        widget -- only DB reads happen here.
+        widget -- only DB reads happen here. ``exit_on_error=False`` on the
+        decorator keeps a raised exception from crashing the whole app
+        before the ``ERROR`` branch in ``on_worker_state_changed`` runs.
         """
         db = self.app.db_factory()
         try:

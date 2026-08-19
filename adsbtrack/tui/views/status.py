@@ -62,12 +62,14 @@ class StatusView(Vertical):
         self.loading = True
         self._fetch_status(self._icao)
 
-    @work(thread=True, exclusive=True, group="status")
+    @work(thread=True, exclusive=True, group="status", exit_on_error=False)
     def _fetch_status(self, icao: str) -> _StatusResult:
         """Run the status-snapshot query on a worker's own connection.
 
         Must not touch ``self.app.db`` (the main-thread connection) or any
-        widget -- only DB reads happen here.
+        widget -- only DB reads happen here. ``exit_on_error=False`` on the
+        decorator keeps a raised exception from crashing the whole app
+        before the ``ERROR`` branch in ``on_worker_state_changed`` runs.
         """
         db = self.app.db_factory()
         try:

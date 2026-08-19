@@ -477,12 +477,15 @@ class MapView(Vertical):
         self.loading = True
         self._fetch_map(self._icao, self._date)
 
-    @work(thread=True, exclusive=True, group="map")
+    @work(thread=True, exclusive=True, group="map", exit_on_error=False)
     def _fetch_map(self, icao: str, date: str | None) -> _MapLoadResult:
         """Run the date-resolution + trace-point queries on a worker's own connection.
 
         Must not touch ``self.app.db`` (the main-thread connection) or any
         widget -- only DB reads and pure computation happen here.
+        ``exit_on_error=False`` on the decorator keeps a raised exception
+        from crashing the whole app before the ``ERROR`` branch in
+        ``on_worker_state_changed`` runs.
         """
         db = self.app.db_factory()
         try:

@@ -171,12 +171,15 @@ class FlightsView(Vertical):
         self.loading = True
         self._fetch_flights(self._icao)
 
-    @work(thread=True, exclusive=True, group="flights")
+    @work(thread=True, exclusive=True, group="flights", exit_on_error=False)
     def _fetch_flights(self, icao: str) -> _FlightsResult:
         """Run the flight + registry queries on a worker's own connection.
 
         Must not touch ``self.app.db`` (the main-thread connection) or any
         widget -- only DB reads and pure computation happen here.
+        ``exit_on_error=False`` on the decorator keeps a raised exception
+        from crashing the whole app before the ``ERROR`` branch in
+        ``on_worker_state_changed`` runs.
         """
         db = self.app.db_factory()
         try:

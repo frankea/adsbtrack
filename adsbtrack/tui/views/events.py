@@ -119,12 +119,17 @@ class EventsView(Vertical):
         self.loading = True
         self._fetch_events(self._icao)
 
-    @work(thread=True, exclusive=True, group="events")
+    @work(thread=True, exclusive=True, group="events", exit_on_error=False)
     def _fetch_events(self, icao: str | None) -> _EventsResult:
         """Run the event query on a worker's own connection (thread-bound).
 
         Must not touch ``self.app.db`` (the main-thread connection) or any
         widget -- only DB reads and pure computation happen here.
+        ``exit_on_error=False`` on the decorator: Textual's default
+        (``True``) routes any exception raised here into a fatal app
+        crash *before* the ``ERROR`` ``StateChanged`` message we handle
+        below is delivered, which would make the ``on_worker_state_changed``
+        error branch dead code.
         """
         db = self.app.db_factory()
         try:

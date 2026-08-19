@@ -20,8 +20,9 @@ from collections import Counter
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from .classifier import _haversine_m, descent_score
-from .ils_alignment import _bearing_deg
+from .classifier import descent_score
+from .geo import bearing_deg as _bearing_deg
+from .geo import haversine_m as _haversine_m
 from .models import LandingType, MissionType
 from .solar import is_night_at
 

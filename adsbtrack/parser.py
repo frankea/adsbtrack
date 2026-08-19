@@ -19,6 +19,7 @@ from .classifier import (
 from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database, iter_parsed_trace_days
 from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments
+from .integrity import count_v2_integrity
 from .landing_anchor import compute_landing_anchor
 from .models import Flight, LandingType
 from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
@@ -393,24 +394,7 @@ def pool_spoof_scores(parsed_rows: Iterable[tuple[sqlite3.Row, list]], config: C
         }
     )
     for row, samples in parsed_rows:
-        src_v2 = 0
-        src_sil0 = 0
-        src_nic0 = 0
-        callsigns: set[str] = set()
-        for s in samples:
-            if not isinstance(s, list) or len(s) <= 8:
-                continue
-            ac = s[8]
-            if not isinstance(ac, dict) or ac.get("version") != 2:
-                continue
-            src_v2 += 1
-            if ac.get("sil") == 0:
-                src_sil0 += 1
-            if ac.get("nic") == 0:
-                src_nic0 += 1
-            flight = (ac.get("flight") or "").strip()
-            if flight:
-                callsigns.add(flight)
+        src_v2, src_sil0, src_nic0, callsigns = count_v2_integrity(samples)
         if src_v2 == 0:
             continue
         agg = by_date[row["date"]]

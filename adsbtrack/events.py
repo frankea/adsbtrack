@@ -19,12 +19,15 @@ parser.py so there is one bimodal-integrity implementation, not two.
 
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
 from .config import Config
 from .db import Database, iter_parsed_trace_days
+from .integrity import count_v2_integrity
 from .parser import pool_spoof_scores
 
 # ---------------------------------------------------------------------------
@@ -56,62 +59,214 @@ class Event:
 # ---------------------------------------------------------------------------
 
 
-def _detect_spoof_events(db: Database, icao: str, since: datetime | None, config: Config) -> list[Event]:
-    """Scan stored trace_days for bimodal-integrity spoof signatures.
+def _event_from_spoof_agg(icao: str, date_str: str, agg: dict) -> Event:
+    """Build the spoof_bimodal_integrity Event for one flagged (icao, date).
 
-    Decodes each row's trace_json once (db.iter_parsed_trace_days) and
-    pools v2 samples across every aggregator that fetched the same date
-    via parser.pool_spoof_scores, so a single aggregator's transient
-    integrity-field glitch does not by itself produce an event; real
-    spoofs hit every receiver that could hear them. Emits one
-    `spoof_bimodal_integrity` Event per date when the pooled sil=0 share
-    crosses `config.spoof_v2_sil0_pct` on a date with
-    >= `config.spoof_min_v2_samples` pooled v2 samples.
+    Shared by both detection routes (decode-based pooling in
+    pool_spoof_scores and the stats-column pooling in
+    _pool_spoof_scores_from_stats) so a flagged date produces the exact
+    same Event regardless of which route found it.
+    """
+    base_ts = agg["timestamp"]
+    if isinstance(base_ts, (int, float)):
+        ts = datetime.fromtimestamp(base_ts, tz=UTC)
+    else:
+        ts = datetime.fromisoformat(date_str).replace(tzinfo=UTC)
+    callsigns = agg["callsigns"]
+    callsign = callsigns[0] if callsigns else None
+    source_names = agg["sources"]
+    v2 = agg["v2_samples"]
+    sil_pct = agg["v2_sil0_pct"]
+    return Event(
+        ts=ts,
+        icao=icao,
+        callsign=callsign,
+        event_type="spoof_bimodal_integrity",
+        severity="unusual",
+        summary=(
+            f"pooled v2 samples with sil=0: {sil_pct:.1f}% ({v2} v2 samples across {len(source_names)} source(s))"
+        ),
+        context={
+            "date": date_str,
+            "sources": source_names,
+            "source_rates": agg["source_rates"],
+            "v2_samples": v2,
+            "v2_sil0_pct": round(sil_pct, 2),
+            "v2_nic0_pct": round(agg["v2_nic0_pct"], 2),
+            "callsigns": callsigns,
+        },
+    )
+
+
+def _trace_days_needs_fallback(db: Database, icao: str, since: datetime | None) -> bool:
+    """True if any of icao's trace_days rows (matching `since` when given)
+    is missing one of the four Task 12 materialized stat columns.
+
+    A True result forces the decode-based path for correctness (some rows
+    haven't been through `db optimize` yet, so the stat columns can't be
+    trusted for pooling). False -- including "icao has no trace_days rows
+    at all" -- means the SQL-only path is safe.
     """
     params: list[Any] = [icao]
-    sql = "SELECT date, source, trace_json, timestamp FROM trace_days WHERE icao = ?"
+    sql = (
+        "SELECT COUNT(*) AS cnt FROM trace_days WHERE icao = ? "
+        "AND (v2_samples IS NULL OR v2_sil0 IS NULL OR v2_nic0 IS NULL OR v2_callsigns IS NULL)"
+    )
     if since is not None:
         sql += " AND date >= ?"
         params.append(since.strftime("%Y-%m-%d"))
-    sql += " ORDER BY date, source"
+    return db.conn.execute(sql, params).fetchone()["cnt"] > 0
 
-    rows = db.conn.execute(sql, params).fetchall()
-    flagged = pool_spoof_scores(iter_parsed_trace_days(rows, icao), config)
+
+def _pool_spoof_scores_from_stats(
+    db: Database, icaos: Iterable[str], since: datetime | None, config: Config
+) -> dict[tuple[str, str], dict]:
+    """SQL-only equivalent of parser.pool_spoof_scores for aircraft whose
+    trace_days rows are all stat-filled (Task 12).
+
+    Aggregates the materialized v2_samples/v2_sil0/v2_nic0 columns instead
+    of decoding trace_json -- avoiding exactly the multi-GB decode this
+    task exists to cut -- then does one small targeted decode covering
+    only the (icao, date) pairs that end up flagged, to recover the
+    actual callsigns (stored only as a count, v2_callsigns, on the row).
+    Every other field is computed straight from the row data, so the
+    result is field-for-field identical to pool_spoof_scores's output for
+    the same rows. Callers must have already confirmed (via
+    _trace_days_needs_fallback) that none of these icaos' rows are
+    missing a stat column.
+    """
+    icao_list = list(icaos)
+    if not icao_list:
+        return {}
+    placeholders = ",".join("?" for _ in icao_list)
+    params: list[Any] = [*icao_list]
+    sql = (
+        f"SELECT icao, date, source, timestamp, v2_samples, v2_sil0, v2_nic0 "
+        f"FROM trace_days WHERE icao IN ({placeholders})"
+    )
+    if since is not None:
+        sql += " AND date >= ?"
+        params.append(since.strftime("%Y-%m-%d"))
+    sql += " ORDER BY icao, date, source"
+
+    by_key: dict[tuple[str, str], dict] = defaultdict(
+        lambda: {"v2": 0, "sil0": 0, "nic0": 0, "sources": set(), "source_rates": [], "timestamp": None}
+    )
+    for row in db.conn.execute(sql, params).fetchall():
+        v2 = row["v2_samples"] or 0
+        if v2 == 0:
+            continue
+        sil0 = row["v2_sil0"] or 0
+        nic0 = row["v2_nic0"] or 0
+        key = (row["icao"], row["date"])
+        agg = by_key[key]
+        agg["v2"] += v2
+        agg["sil0"] += sil0
+        agg["nic0"] += nic0
+        agg["sources"].add(row["source"])
+        agg["source_rates"].append((row["source"], round(100.0 * sil0 / v2, 2)))
+        if agg["timestamp"] is None:
+            agg["timestamp"] = row["timestamp"]
+
+    flagged: dict[tuple[str, str], dict] = {}
+    for key, agg in by_key.items():
+        v2 = agg["v2"]
+        if v2 < config.spoof_min_v2_samples:
+            continue
+        sil_pct = 100.0 * agg["sil0"] / v2
+        if sil_pct < config.spoof_v2_sil0_pct:
+            continue
+        flagged[key] = {
+            "v2_samples": v2,
+            "v2_sil0_pct": sil_pct,
+            "v2_nic0_pct": 100.0 * agg["nic0"] / v2,
+            "sources": sorted(agg["sources"]),
+            "source_rates": sorted(agg["source_rates"]),
+            "timestamp": agg["timestamp"],
+        }
+
+    # Targeted decode: only the (icao, date) pairs that ended up flagged,
+    # and only to recover the callsigns set. Everything else above is
+    # already field-identical to pool_spoof_scores's output.
+    for (icao, date_str), agg in flagged.items():
+        rows = db.conn.execute(
+            "SELECT date, source, trace_json, timestamp FROM trace_days WHERE icao = ? AND date = ?",
+            (icao, date_str),
+        ).fetchall()
+        callsigns: set[str] = set()
+        for _row, samples in iter_parsed_trace_days(rows, icao):
+            callsigns |= count_v2_integrity(samples)[3]
+        agg["callsigns"] = sorted(callsigns)
+
+    return flagged
+
+
+def _detect_spoof_events(db: Database, icao: str, since: datetime | None, config: Config) -> list[Event]:
+    """Scan stored trace_days for bimodal-integrity spoof signatures.
+
+    Pools v2 samples across every aggregator that fetched the same date,
+    so a single aggregator's transient integrity-field glitch does not by
+    itself produce an event; real spoofs hit every receiver that could
+    hear them. Emits one `spoof_bimodal_integrity` Event per date when the
+    pooled sil=0 share crosses `config.spoof_v2_sil0_pct` on a date with
+    >= `config.spoof_min_v2_samples` pooled v2 samples.
+
+    Uses the Task 12 materialized stat columns (no trace_json decode) when
+    every trace_days row for `icao` has them filled; falls back to
+    decoding every row (db.iter_parsed_trace_days + parser.pool_spoof_scores)
+    the moment any row is missing a stat column, so correctness never
+    depends on `db optimize` having run.
+    """
+    if _trace_days_needs_fallback(db, icao, since):
+        params: list[Any] = [icao]
+        sql = "SELECT date, source, trace_json, timestamp FROM trace_days WHERE icao = ?"
+        if since is not None:
+            sql += " AND date >= ?"
+            params.append(since.strftime("%Y-%m-%d"))
+        sql += " ORDER BY date, source"
+        rows = db.conn.execute(sql, params).fetchall()
+        flagged_by_date = pool_spoof_scores(iter_parsed_trace_days(rows, icao), config)
+    else:
+        flagged = _pool_spoof_scores_from_stats(db, [icao], since, config)
+        flagged_by_date = {date_str: agg for (_icao, date_str), agg in flagged.items()}
+
+    return [_event_from_spoof_agg(icao, date_str, agg) for date_str, agg in sorted(flagged_by_date.items())]
+
+
+def bulk_detect_spoof_events(db: Database, icaos: Iterable[str], config: Config | None = None) -> list[Event]:
+    """Spoof-event detection across many aircraft in one grouped SQL scan.
+
+    Used by the all-aircraft events view (tui/queries.py) so scanning N
+    aircraft doesn't mean decoding N full trace histories. One query
+    splits `icaos` into "fully stat-filled" (Task 12 materialized columns,
+    no NULLs) -- handled by a single grouped _pool_spoof_scores_from_stats
+    call covering all of them -- and "needs fallback" -- decoded one
+    aircraft at a time via _detect_spoof_events, same as before this
+    function existed.
+    """
+    config = config or Config()
+    icao_list = list(dict.fromkeys(icaos))  # de-dupe, keep first-seen order
+    if not icao_list:
+        return []
+
+    placeholders = ",".join("?" for _ in icao_list)
+    needs_fallback = {
+        row["icao"]
+        for row in db.conn.execute(
+            f"SELECT DISTINCT icao FROM trace_days WHERE icao IN ({placeholders}) "
+            "AND (v2_samples IS NULL OR v2_sil0 IS NULL OR v2_nic0 IS NULL OR v2_callsigns IS NULL)",
+            icao_list,
+        ).fetchall()
+    }
+    optimized = [icao for icao in icao_list if icao not in needs_fallback]
 
     events: list[Event] = []
-    for date_str, agg in sorted(flagged.items()):
-        base_ts = agg["timestamp"]
-        if isinstance(base_ts, (int, float)):
-            ts = datetime.fromtimestamp(base_ts, tz=UTC)
-        else:
-            ts = datetime.fromisoformat(date_str).replace(tzinfo=UTC)
-        callsigns = agg["callsigns"]
-        callsign = callsigns[0] if callsigns else None
-        source_names = agg["sources"]
-        v2 = agg["v2_samples"]
-        sil_pct = agg["v2_sil0_pct"]
-        events.append(
-            Event(
-                ts=ts,
-                icao=icao,
-                callsign=callsign,
-                event_type="spoof_bimodal_integrity",
-                severity="unusual",
-                summary=(
-                    f"pooled v2 samples with sil=0: {sil_pct:.1f}% "
-                    f"({v2} v2 samples across {len(source_names)} source(s))"
-                ),
-                context={
-                    "date": date_str,
-                    "sources": source_names,
-                    "source_rates": agg["source_rates"],
-                    "v2_samples": v2,
-                    "v2_sil0_pct": round(sil_pct, 2),
-                    "v2_nic0_pct": round(agg["v2_nic0_pct"], 2),
-                    "callsigns": callsigns,
-                },
-            )
-        )
+    for icao in sorted(needs_fallback):
+        events.extend(_detect_spoof_events(db, icao, None, config))
+
+    flagged = _pool_spoof_scores_from_stats(db, optimized, None, config)
+    for (icao, date_str), agg in sorted(flagged.items()):
+        events.append(_event_from_spoof_agg(icao, date_str, agg))
     return events
 
 

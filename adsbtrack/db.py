@@ -4,11 +4,12 @@ import json
 import shutil
 import sqlite3
 import zlib
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import RETRYABLE_FETCH_STATUS_FLOOR, RETRYABLE_FETCH_STATUSES
+from .integrity import count_v2_integrity
 from .models import Flight
 
 SCHEMA = """
@@ -26,6 +27,15 @@ CREATE TABLE IF NOT EXISTS trace_days (
     trace_json TEXT NOT NULL,
     point_count INTEGER NOT NULL,
     fetched_at TEXT NOT NULL,
+    -- Materialized per-day integrity-stat columns (Task 12). Computed by
+    -- insert_trace_day via adsbtrack.integrity.count_v2_integrity -- the
+    -- same counting core parser.pool_spoof_scores uses -- so the numbers
+    -- can't drift from the spoof detector. NULL on rows written before
+    -- this shipped, `adsbtrack db optimize` backfills them.
+    v2_samples INTEGER,
+    v2_sil0 INTEGER,
+    v2_nic0 INTEGER,
+    v2_callsigns INTEGER,
     UNIQUE(icao, date, source)
 );
 
@@ -454,7 +464,10 @@ _SCHEMA_STATEMENTS = [stmt.strip() for stmt in SCHEMA.split(";") if stmt.strip()
 # generated from `dataclasses.fields(Flight)` (see insert_flight below), so
 # adding a Flight field is enough for it to be persisted with no SQL edit.
 # The `.claude/agents/migration-reviewer.md` subagent audits this checklist.
-SCHEMA_VERSION = 1
+#
+# v2: added trace_days.v2_samples / v2_sil0 / v2_nic0 / v2_callsigns
+# (Task 12 materialized integrity stats; see _migrate_add_trace_day_stat_columns).
+SCHEMA_VERSION = 2
 
 
 def _needs_source_migration(conn: sqlite3.Connection) -> bool:
@@ -697,6 +710,22 @@ def _migrate_add_v4_columns(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE aircraft_stats ADD COLUMN {col_name} {col_type}")
 
 
+def _migrate_add_trace_day_stat_columns(conn: sqlite3.Connection) -> None:
+    """Add the four materialized per-day integrity-stat columns to
+    trace_days (Task 12). Idempotent -- duplicate-column errors are
+    suppressed. Existing rows come back NULL until `adsbtrack db optimize`
+    backfills them; new rows get real values from insert_trace_day."""
+    new_columns = [
+        ("v2_samples", "INTEGER"),
+        ("v2_sil0", "INTEGER"),
+        ("v2_nic0", "INTEGER"),
+        ("v2_callsigns", "INTEGER"),
+    ]
+    for col_name, col_type in new_columns:
+        with contextlib.suppress(sqlite3.OperationalError):
+            conn.execute(f"ALTER TABLE trace_days ADD COLUMN {col_name} {col_type}")
+
+
 def _migrate_drop_legacy_indexes(conn: sqlite3.Connection) -> None:
     """Drop indexes that exactly duplicate a table's UNIQUE-constraint
     autoindex prefix. Idempotent.
@@ -770,6 +799,116 @@ def iter_parsed_trace_days(rows: Iterable[sqlite3.Row], icao: str) -> Iterator[t
             )
             continue
         yield row, parsed
+
+
+# ---------------------------------------------------------------------------
+# db optimize: backfill legacy trace_days rows (Task 12)
+# ---------------------------------------------------------------------------
+# Two independent things can be stale on a trace_days row written before
+# its version shipped: trace_json stored as raw JSON TEXT instead of a
+# zlib BLOB (Task 11), and the four v2_samples/v2_sil0/v2_nic0/v2_callsigns
+# stat columns being NULL (Task 12). optimize_trace_days fixes both in one
+# batched pass so operators don't need two separate maintenance commands.
+
+_OPTIMIZE_CANDIDATES_WHERE = (
+    "typeof(trace_json) != 'blob' OR v2_samples IS NULL OR v2_sil0 IS NULL OR v2_nic0 IS NULL OR v2_callsigns IS NULL"
+)
+
+
+def optimize_trace_days(
+    db: "Database",
+    *,
+    batch_size: int = 200,
+    progress_callback: Callable[[int, int], None] | None = None,
+) -> dict[str, int]:
+    """Backfill every trace_days row still missing compression or stats.
+
+    Processes rows in batches of ``batch_size`` (one transaction per
+    batch) ordered by id, so a kill mid-run leaves only the just-committed
+    batch done and a re-run picks up cleanly -- the WHERE clause only ever
+    selects rows that still need work, and a malformed row that can't be
+    fixed is skipped (via the id cursor) rather than looping forever.
+
+    Returns a dict with ``total`` (rows selected at the start), ``processed``
+    (rows visited), ``compressed`` (rows whose trace_json was rewritten to
+    the zlib form), and ``stats_filled`` (rows whose stat columns were
+    computed). Safe to call on an already-optimized database: ``total``
+    (and therefore ``processed``) comes back 0.
+    """
+    total = db.conn.execute(f"SELECT COUNT(*) AS cnt FROM trace_days WHERE {_OPTIMIZE_CANDIDATES_WHERE}").fetchone()[
+        "cnt"
+    ]
+    processed = 0
+    compressed = 0
+    stats_filled = 0
+    if progress_callback:
+        progress_callback(0, total)
+
+    last_id = 0
+    while True:
+        rows = db.conn.execute(
+            f"""SELECT id, trace_json, v2_samples, v2_sil0, v2_nic0, v2_callsigns
+                FROM trace_days
+                WHERE id > ? AND ({_OPTIMIZE_CANDIDATES_WHERE})
+                ORDER BY id
+                LIMIT ?""",
+            (last_id, batch_size),
+        ).fetchall()
+        if not rows:
+            break
+
+        db.conn.execute("BEGIN")
+        try:
+            for row in rows:
+                last_id = row["id"]
+                parsed = decode_trace_json(row["trace_json"])
+                if parsed is None:
+                    print(f"  WARNING: trace_days row id={row['id']} has malformed trace_json; skipping")
+                    processed += 1
+                    continue
+
+                raw = row["trace_json"]
+                already_compressed = isinstance(raw, bytes) and raw[:1] == b"\x78"
+                if already_compressed:
+                    blob = raw
+                else:
+                    blob = zlib.compress(json.dumps(parsed).encode(), 6)
+                    compressed += 1
+
+                needs_stats = (
+                    row["v2_samples"] is None
+                    or row["v2_sil0"] is None
+                    or row["v2_nic0"] is None
+                    or row["v2_callsigns"] is None
+                )
+                if needs_stats:
+                    v2, sil0, nic0, callsigns = count_v2_integrity(parsed)
+                    v2_callsigns = len(callsigns)
+                    stats_filled += 1
+                else:
+                    v2, sil0, nic0, v2_callsigns = (
+                        row["v2_samples"],
+                        row["v2_sil0"],
+                        row["v2_nic0"],
+                        row["v2_callsigns"],
+                    )
+
+                db.conn.execute(
+                    """UPDATE trace_days
+                       SET trace_json = ?, v2_samples = ?, v2_sil0 = ?, v2_nic0 = ?, v2_callsigns = ?
+                       WHERE id = ?""",
+                    (blob, v2, sil0, nic0, v2_callsigns, row["id"]),
+                )
+                processed += 1
+            db.conn.execute("COMMIT")
+        except Exception:
+            db.conn.execute("ROLLBACK")
+            raise
+
+        if progress_callback:
+            progress_callback(processed, total)
+
+    return {"total": total, "processed": processed, "compressed": compressed, "stats_filled": stats_filled}
 
 
 # ---------------------------------------------------------------------------
@@ -847,6 +986,8 @@ class Database:
             _migrate_drop_legacy_indexes(self.conn)
             # aircraft_registry / aircraft_stats column additions
             _migrate_add_v4_columns(self.conn)
+            # Materialized per-day integrity-stat columns on trace_days (Task 12)
+            _migrate_add_trace_day_stat_columns(self.conn)
             # Seed the curated military-hex allocations. Idempotent -- repeated
             # init calls just upsert the same rows. Lazy import avoids a
             # module-level cycle (mil_hex needs Database for TYPE_CHECKING).
@@ -872,11 +1013,18 @@ class Database:
     # -- trace_days --
 
     def insert_trace_day(self, icao: str, date: str, data: dict, source: str = "adsbx"):
+        trace = data["trace"]
+        # Materialized integrity stats (Task 12): computed from the same
+        # trace we're about to compress, via the counting core shared with
+        # parser.pool_spoof_scores, so these numbers can't drift from the
+        # spoof detector's.
+        v2_samples, v2_sil0, v2_nic0, callsigns = count_v2_integrity(trace)
         self.conn.execute(
             """INSERT OR REPLACE INTO trace_days
                (icao, date, source, registration, type_code, description, owner_operator,
-                year, timestamp, trace_json, point_count, fetched_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                year, timestamp, trace_json, point_count, fetched_at,
+                v2_samples, v2_sil0, v2_nic0, v2_callsigns)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 icao,
                 date,
@@ -887,9 +1035,13 @@ class Database:
                 data.get("ownOp"),
                 data.get("year"),
                 data["timestamp"],
-                zlib.compress(json.dumps(data["trace"]).encode(), 6),
-                len(data["trace"]),
+                zlib.compress(json.dumps(trace).encode(), 6),
+                len(trace),
                 datetime.now(UTC).isoformat(),
+                v2_samples,
+                v2_sil0,
+                v2_nic0,
+                len(callsigns),
             ),
         )
 

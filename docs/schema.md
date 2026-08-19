@@ -16,8 +16,14 @@ Raw daily trace data per aircraft per source.
 | description | TEXT | Aircraft type description |
 | owner_operator | TEXT | Owner from trace metadata |
 | timestamp | REAL | Base Unix timestamp for the day |
-| trace_json | TEXT | Raw trace points as a JSON array. Legacy rows store this as raw JSON text; rows written since compressed trace storage shipped store a zlib-compressed BLOB instead (~6.4x smaller). Existing rows are never migrated in place -- `db.decode_trace_json` sniffs the stored form on every read (first byte `0x78` -> zlib-decompress then parse; `[`/`{` or `str` -> parse as-is), so both forms keep working forever. A separate `db optimize` batch job (planned) rewrites legacy rows to the compressed form. |
+| trace_json | TEXT | Raw trace points as a JSON array. Legacy rows store this as raw JSON text; rows written since compressed trace storage shipped store a zlib-compressed BLOB instead (~6.4x smaller). Existing rows are never migrated in place -- `db.decode_trace_json` sniffs the stored form on every read (first byte `0x78` -> zlib-decompress then parse; `[`/`{` or `str` -> parse as-is), so both forms keep working forever. `adsbtrack db optimize` batch-rewrites legacy rows to the compressed form. |
 | point_count | INTEGER | Number of trace points |
+| v2_samples | INTEGER | Count of trace points carrying DO-260B v2 aircraft-state (`ac["version"] == 2`). Computed by `insert_trace_day` via `adsbtrack.integrity.count_v2_integrity` -- the same counting core `parser.pool_spoof_scores` uses -- so the number can't drift from the spoof detector. NULL on rows written before Task 12 shipped; `adsbtrack db optimize` backfills it. |
+| v2_sil0 | INTEGER | Of the v2 samples, how many carried `sil == 0`. Same NULL/backfill rule as v2_samples. |
+| v2_nic0 | INTEGER | Of the v2 samples, how many carried `nic == 0`. Same NULL/backfill rule as v2_samples. |
+| v2_callsigns | INTEGER | Count of distinct non-blank callsigns seen on v2 samples (not the callsign strings themselves). Same NULL/backfill rule as v2_samples. |
+
+The spoof/events path (`events._detect_spoof_events`, `events.bulk_detect_spoof_events`) reads these four columns via SQL instead of decoding trace_json when every trace_days row for an aircraft has them filled; if any row is still NULL it falls back to the decode-based `parser.pool_spoof_scores` scan for that aircraft, so correctness never depends on `db optimize` having run.
 
 ## flights
 

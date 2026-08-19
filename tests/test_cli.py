@@ -785,6 +785,54 @@ def test_enrich_all_cli_wires_progress_callback(tmp_path, monkeypatch):
     assert "wrote 3" in result.output
 
 
+def _v2_sample(sil, nic, flight=""):
+    ac = {"version": 2, "nic": nic, "sil": sil, "flight": flight}
+    return [0.0, 25.25, 55.38, "ground", 0.5, 30.9, 0, None, ac, "adsb_icao", None, None, None, None]
+
+
+def test_db_optimize_backfills_legacy_rows_and_is_idempotent(tmp_path):
+    """`db optimize` compresses a legacy raw-JSON trace_json row and fills
+    the four materialized integrity-stat columns; a second run reports
+    nothing left to do."""
+    db_path = tmp_path / "legacy.db"
+    trace = [_v2_sample(8, 8, "UAL1")] * 3 + [_v2_sample(0, 0, "UAL1")]
+    with Database(db_path) as db:
+        db.conn.execute(
+            """INSERT INTO trace_days
+               (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "abc123",
+                "2024-01-15",
+                "adsbx",
+                1700000000.0,
+                json.dumps(trace),
+                len(trace),
+                datetime(2024, 1, 15, tzinfo=UTC).isoformat(),
+            ),
+        )
+        db.commit()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["db", "optimize", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+
+    with Database(db_path) as db:
+        row = db.conn.execute(
+            "SELECT trace_json, v2_samples, v2_sil0, v2_nic0, v2_callsigns FROM trace_days WHERE icao = ?",
+            ("abc123",),
+        ).fetchone()
+    assert isinstance(row["trace_json"], bytes) and row["trace_json"][:1] == b"\x78"
+    assert row["v2_samples"] == 4
+    assert row["v2_sil0"] == 1
+    assert row["v2_nic0"] == 1
+    assert row["v2_callsigns"] == 1
+
+    second = runner.invoke(cli, ["db", "optimize", "--db", str(db_path)])
+    assert second.exit_code == 0, second.output
+    assert "nothing to optimize" in second.output.lower()
+
+
 def test_mil_hex_reports_range(tmp_path):
     db_path = tmp_path / "t.db"
     runner = CliRunner()

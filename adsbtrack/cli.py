@@ -1736,6 +1736,70 @@ def events(hex_code, tail_number, db_path, since_str, severity, output_json):
     )
 
 
+# -----------------------------------------------------------------------------
+# Database maintenance
+# -----------------------------------------------------------------------------
+
+
+@cli.group("db")
+def db_group():
+    """Database maintenance commands."""
+
+
+@db_group.command("optimize")
+@_db_option()
+@click.option(
+    "--vacuum",
+    is_flag=True,
+    help="Run VACUUM after optimizing. Rewrites the whole database file -- needs free disk space "
+    "roughly the size of the final DB.",
+)
+def db_optimize(db_path, vacuum):
+    """Backfill legacy trace_days rows: compress trace_json (Task 11) and
+    fill the materialized v2_samples/v2_sil0/v2_nic0/v2_callsigns
+    integrity-stat columns (Task 12) that the spoof/events path reads
+    instead of decoding every trace.
+
+    Processes ~200 rows per transaction and is safe to interrupt and
+    re-run -- it skips rows that are already compressed and stat-filled.
+    """
+    from .db import optimize_trace_days
+
+    cfg = _load_config(db_path)
+    with (
+        Database(cfg.db_path) as db,
+        Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+        ) as progress,
+    ):
+        task_id = progress.add_task("Optimizing trace_days", total=None)
+
+        def _on_progress(done: int, total: int) -> None:
+            progress.update(task_id, completed=done, total=total)
+
+        stats = optimize_trace_days(db, progress_callback=_on_progress)
+
+    if stats["total"] == 0:
+        console.print("[green]Nothing to optimize -- all rows already compressed and stat-filled.[/]")
+    else:
+        console.print(
+            f"[green]Optimize complete.[/] {stats['processed']} rows processed "
+            f"({stats['compressed']} compressed, {stats['stats_filled']} stat-filled)."
+        )
+
+    if vacuum:
+        console.print(
+            "[yellow]Running VACUUM -- this rewrites the entire database file and needs free disk space "
+            "roughly the size of the final DB.[/]"
+        )
+        with Database(cfg.db_path) as db:
+            db.conn.execute("VACUUM")
+        console.print("[green]VACUUM complete.[/]")
+
+
 @cli.command("mcp-serve")
 @_db_option("SQLite database path the server reads from.")
 def mcp_serve(db_path):

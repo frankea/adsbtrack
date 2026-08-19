@@ -320,6 +320,136 @@ def test_get_trace_days_reads_legacy_and_compressed_rows_identically(db):
 
 
 # ---------------------------------------------------------------------------
+# Materialized integrity-stat columns (Task 12)
+# ---------------------------------------------------------------------------
+
+
+def _v2_point(sil, nic, flight=""):
+    """A readsb v2 trace point with the aircraft-state dict at index 8."""
+    ac = {"version": 2, "nic": nic, "sil": sil, "flight": flight}
+    return [0.0, 25.25, 55.38, "ground", 0.5, 30.9, 0, None, ac, "adsb_icao", None, None, None, None]
+
+
+def _v1_point():
+    """A readsb v1 trace point -- must not count toward the v2 stats."""
+    ac = {"version": 1}
+    return [0.0, 25.25, 55.38, "ground", 0.5, 30.9, 0, None, ac, "adsb_icao", None, None, None, None]
+
+
+def test_insert_trace_day_fills_integrity_stat_columns(db):
+    """insert_trace_day computes v2_samples/v2_sil0/v2_nic0/v2_callsigns
+    from the trace it already holds, using the same counting core as
+    parser.pool_spoof_scores (adsbtrack.integrity.count_v2_integrity) so
+    the numbers can't drift between the two call sites."""
+    trace = (
+        [_v2_point(sil=8, nic=8, flight="UAL123") for _ in range(3)]
+        + [_v2_point(sil=0, nic=0, flight="UAL123") for _ in range(2)]
+        + [_v1_point() for _ in range(4)]
+    )
+    data = {"timestamp": 1700000000.0, "trace": trace}
+    db.insert_trace_day("abc123", "2024-01-15", data)
+    db.commit()
+
+    row = db.conn.execute(
+        "SELECT v2_samples, v2_sil0, v2_nic0, v2_callsigns FROM trace_days WHERE icao = ? AND date = ?",
+        ("abc123", "2024-01-15"),
+    ).fetchone()
+    assert row["v2_samples"] == 5
+    assert row["v2_sil0"] == 2
+    assert row["v2_nic0"] == 2
+    assert row["v2_callsigns"] == 1
+
+
+def test_legacy_trace_day_row_has_null_stat_columns(db):
+    """A row inserted the old way (before Task 12) never gets the four
+    stat columns backfilled automatically -- only `db optimize` does
+    that. This is what the events fallback rule keys off of."""
+    trace = [_v2_point(sil=0, nic=0, flight="EK01")]
+    db.conn.execute(
+        """INSERT INTO trace_days
+           (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("abc123", "2024-02-01", "adsbx", 1700000000.0, json.dumps(trace), len(trace), datetime.now(UTC).isoformat()),
+    )
+    db.commit()
+
+    row = db.conn.execute(
+        "SELECT v2_samples, v2_sil0, v2_nic0, v2_callsigns FROM trace_days WHERE icao = ? AND date = ?",
+        ("abc123", "2024-02-01"),
+    ).fetchone()
+    assert row["v2_samples"] is None
+    assert row["v2_sil0"] is None
+    assert row["v2_nic0"] is None
+    assert row["v2_callsigns"] is None
+
+
+def test_optimize_trace_days_backfills_and_compresses_legacy_rows(db):
+    """`optimize_trace_days` rewrites a legacy raw-JSON row to the zlib
+    BLOB form and fills the four stat columns; a second call finds
+    nothing left to do (idempotent, safe to re-run)."""
+    from adsbtrack.db import optimize_trace_days
+
+    trace = [_v2_point(sil=8, nic=8, flight="UAL1")] * 3 + [_v2_point(sil=0, nic=0, flight="UAL1")]
+    db.conn.execute(
+        """INSERT INTO trace_days
+           (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        ("abc123", "2024-02-01", "adsbx", 1700000000.0, json.dumps(trace), len(trace), datetime.now(UTC).isoformat()),
+    )
+    db.commit()
+
+    stats = optimize_trace_days(db)
+    db.commit()
+    assert stats["total"] == 1
+    assert stats["processed"] == 1
+    assert stats["compressed"] == 1
+    assert stats["stats_filled"] == 1
+
+    row = db.conn.execute(
+        "SELECT trace_json, v2_samples, v2_sil0, v2_nic0, v2_callsigns FROM trace_days WHERE icao = ?",
+        ("abc123",),
+    ).fetchone()
+    assert isinstance(row["trace_json"], bytes) and row["trace_json"][:1] == b"\x78"
+    assert decode_trace_json(row["trace_json"]) == trace
+    assert row["v2_samples"] == 4
+    assert row["v2_sil0"] == 1
+    assert row["v2_nic0"] == 1
+    assert row["v2_callsigns"] == 1
+
+    second = optimize_trace_days(db)
+    assert second["total"] == 0
+    assert second["processed"] == 0
+
+
+def test_optimize_trace_days_reports_progress(db):
+    """progress_callback is invoked with (done, total) as batches complete."""
+    from adsbtrack.db import optimize_trace_days
+
+    trace = [_v2_point(sil=8, nic=8, flight="UAL1")]
+    for i in range(3):
+        db.conn.execute(
+            """INSERT INTO trace_days
+               (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "abc123",
+                f"2024-02-0{i + 1}",
+                "adsbx",
+                1700000000.0,
+                json.dumps(trace),
+                len(trace),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+    db.commit()
+
+    calls = []
+    optimize_trace_days(db, progress_callback=lambda done, total: calls.append((done, total)))
+    assert calls[0] == (0, 3)
+    assert calls[-1] == (3, 3)
+
+
+# ---------------------------------------------------------------------------
 # fetch_log
 # ---------------------------------------------------------------------------
 

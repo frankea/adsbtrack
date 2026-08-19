@@ -20,6 +20,7 @@ from adsbtrack.tui.queries import (
     count_flights,
     distinct_dates_for_icao,
     list_aircraft,
+    list_events,
     list_flights,
     list_spoofed_broadcasts,
     load_trace_points,
@@ -223,3 +224,32 @@ def test_load_trace_points_reads_legacy_and_compressed_rows(seeded_db):
 def test_distinct_dates_for_icao(seeded_db):
     with Database(seeded_db) as db:
         assert distinct_dates_for_icao(db, "aaa111") == []
+
+
+def _spoof_sample(sil):
+    ac = {"version": 2, "nic": 8, "sil": sil, "flight": "UAL1"}
+    return [0.0, 25.25, 55.38, "ground", 0.5, 30.9, 0, None, ac, "adsb_icao", None, None, None, None]
+
+
+def test_list_events_all_aircraft_finds_spoof_events_via_stat_columns(tmp_path):
+    """The icao=None (all-aircraft) events view must surface a spoof event
+    for a fully-optimized aircraft through the Task 12 grouped-query path,
+    not just the per-aircraft decode loop."""
+    db_path = tmp_path / "all_events.db"
+    spoofy = [_spoof_sample(3) for _ in range(40)] + [_spoof_sample(0) for _ in range(20)]
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="111111",
+                takeoff_time=datetime(2026, 4, 21, 1, 0, tzinfo=UTC),
+                takeoff_lat=25.25,
+                takeoff_lon=55.38,
+                takeoff_date="2026-04-21",
+            )
+        )
+        db.insert_trace_day("111111", "2026-04-21", {"timestamp": 1776600000.0, "trace": spoofy})
+        db.commit()
+        events = list_events(db)
+    spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
+    assert len(spoof) == 1
+    assert spoof[0].icao == "111111"

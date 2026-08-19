@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..db import Database, decode_trace_json
-from ..events import collect_events
+from ..events import bulk_detect_spoof_events, collect_events
 
 # ---------------------------------------------------------------------------
 # Aircraft list
@@ -227,10 +227,11 @@ def list_events(
 ) -> list[Any]:
     """Return recent events, optionally scoped to one ICAO.
 
-    When ``icao`` is None we collect events for every aircraft in the
-    DB and merge - expensive on huge datasets but manageable for the
-    single-user TUI case. When scoped to one hex we delegate directly
-    to ``events.collect_events``.
+    When ``icao`` is None we collect flight-derived events for every
+    aircraft in the DB and merge them with one grouped spoof-detection
+    pass (``events.bulk_detect_spoof_events``, Task 12) instead of
+    decoding each aircraft's full trace history in turn. When scoped to
+    one hex we delegate directly to ``events.collect_events``.
     """
     if icao is not None:
         events = collect_events(db, icao, include_spoof_checks=include_spoof_checks)
@@ -239,7 +240,11 @@ def list_events(
     hexes = [r["icao"] for r in db.conn.execute("SELECT DISTINCT icao FROM flights").fetchall()]
     out: list[Any] = []
     for hex_code in hexes:
-        out.extend(collect_events(db, hex_code, include_spoof_checks=include_spoof_checks))
+        # Spoof checks are handled below in one grouped pass across every
+        # hex, so they're always skipped in this per-hex loop.
+        out.extend(collect_events(db, hex_code, include_spoof_checks=False))
+    if include_spoof_checks:
+        out.extend(bulk_detect_spoof_events(db, hexes))
     out.sort(key=lambda e: e.ts, reverse=True)
     return out[:limit]
 

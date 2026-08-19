@@ -381,6 +381,71 @@ def test_spoof_detector_dedupes_across_aggregators(tmp_path):
     assert len(spoof) == 1
 
 
+def test_spoof_detector_stats_path_matches_parse_path(tmp_path):
+    """A fully-stat-filled aircraft (Task 12 materialized v2_samples/
+    v2_sil0/v2_nic0/v2_callsigns columns) must produce byte-identical
+    spoof events to the decode-every-row parse path -- same fixture, both
+    routes."""
+    db_path = tmp_path / "stats_parity.db"
+    trace = [_make_sample(2, 8, 3) for _ in range(40)] + [_make_sample(2, 0, 0) for _ in range(20)]
+    data = {"timestamp": 1776600000.0, "trace": trace}
+    with Database(db_path) as db:
+        db.insert_trace_day("89618d", "2026-04-21", data)  # fills stats -- fast path eligible
+        db.commit()
+
+        stats_path_events = collect_events(db, "89618d", include_spoof_checks=True)
+
+        # Simulate a pre-Task-12 (never-optimized) row by nulling the
+        # materialized columns back out, forcing the decode-based fallback.
+        db.conn.execute(
+            "UPDATE trace_days SET v2_samples = NULL, v2_sil0 = NULL, v2_nic0 = NULL, v2_callsigns = NULL "
+            "WHERE icao = ?",
+            ("89618d",),
+        )
+        db.commit()
+        parse_path_events = collect_events(db, "89618d", include_spoof_checks=True)
+
+    stats_spoof = [e for e in stats_path_events if e.event_type == "spoof_bimodal_integrity"]
+    parse_spoof = [e for e in parse_path_events if e.event_type == "spoof_bimodal_integrity"]
+    assert len(stats_spoof) == 1
+    assert stats_spoof == parse_spoof
+
+
+def test_spoof_detector_mixed_null_rows_falls_back_for_correctness(tmp_path):
+    """If ANY trace_days row for the aircraft is missing the materialized
+    stat columns (e.g. one date optimized, one still legacy), the whole
+    aircraft must fall back to the decode-based parse path rather than
+    silently under-counting from a partially-filled stats table."""
+    db_path = tmp_path / "mixed.db"
+    spoofy = [_make_sample(2, 8, 3) for _ in range(40)] + [_make_sample(2, 0, 0) for _ in range(20)]
+    with Database(db_path) as db:
+        # One date fully stat-filled via insert_trace_day...
+        db.insert_trace_day("89618d", "2026-04-21", {"timestamp": 1776600000.0, "trace": spoofy})
+        # ...and a second date inserted the legacy way (NULL stat columns).
+        _insert_trace_day(db, "89618d", "2026-05-01", spoofy)
+        db.commit()
+        events = collect_events(db, "89618d", include_spoof_checks=True)
+    spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
+    assert {e.context["date"] for e in spoof} == {"2026-04-21", "2026-05-01"}
+
+
+def test_bulk_detect_spoof_events_covers_optimized_and_fallback_aircraft(tmp_path):
+    """bulk_detect_spoof_events (the all-aircraft events view's spoof pass)
+    must flag a fully-stat-filled aircraft via the grouped-query path and a
+    still-legacy aircraft via the decode fallback, in one call."""
+    from adsbtrack.events import bulk_detect_spoof_events
+
+    db_path = tmp_path / "bulk.db"
+    spoofy = [_make_sample(2, 8, 3) for _ in range(40)] + [_make_sample(2, 0, 0) for _ in range(20)]
+    with Database(db_path) as db:
+        db.insert_trace_day("111111", "2026-04-21", {"timestamp": 1776600000.0, "trace": spoofy})
+        _insert_trace_day(db, "222222", "2026-05-01", spoofy)
+        db.commit()
+        events = bulk_detect_spoof_events(db, ["111111", "222222"])
+    flagged_icaos = {e.icao for e in events if e.event_type == "spoof_bimodal_integrity"}
+    assert flagged_icaos == {"111111", "222222"}
+
+
 def test_spoof_detector_threshold_follows_config_override(tmp_path):
     """A7: the events detector's sil0-rate threshold must move with a
     Config override, not stay pinned to a module-level constant.

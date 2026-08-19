@@ -25,7 +25,9 @@ from dataclasses import dataclass
 
 from .airports import haversine_km
 from .classifier import _PointSample
-from .ils_alignment import _bearing_deg, _smallest_angle
+from .geo import bearing_deg as _bearing_deg
+from .geo import smallest_angle_deg as _smallest_angle
+from .geo import split_on_gaps
 
 _KM_PER_NM = 1.852
 
@@ -232,19 +234,15 @@ def detect_navaid_alignments(
     out: list[NavaidAlignmentSegment] = []
     for ident, kept in kept_by_ident.items():
         # kept is in sample-order by construction.
-        segments: list[list[tuple[float, float]]] = [[kept[0]]]
-        for prev, cur in zip(kept, kept[1:], strict=False):
-            if cur[0] - prev[0] > split_gap_secs:
-                segments.append([cur])
-            else:
-                segments[-1].append(cur)
+        segments = split_on_gaps(
+            kept,
+            ts=lambda item: item[0],
+            split_gap_secs=split_gap_secs,
+            min_duration_secs=min_duration_secs,
+            extra_predicate=lambda seg: min(d for _, d in seg) < near_pass_max_km,
+        )
         for seg in segments:
-            duration = seg[-1][0] - seg[0][0]
-            if duration < min_duration_secs:
-                continue
             min_d = min(d for _, d in seg)
-            if min_d >= near_pass_max_km:
-                continue
             out.append(
                 NavaidAlignmentSegment(
                     navaid_ident=ident,

@@ -691,16 +691,16 @@ def compute_day_night(
     night_count = 0
     day_count = 0
     for sample in metrics.recent_points:
-        if metrics.last_seen_lat is None or metrics.last_seen_lon is None:
-            break
+        if sample.lat is None or sample.lon is None:
+            continue
         try:
             dt = datetime.fromtimestamp(sample.ts)
         except (OSError, OverflowError, ValueError):
             continue
         if is_night_at(
             dt,
-            metrics.last_seen_lat,
-            metrics.last_seen_lon,
+            sample.lat,
+            sample.lon,
             threshold_deg=config.night_sun_altitude_deg,
             lat_lon_quant_deg=config.solar_cache_lat_lon_quant,
             ts_bucket_secs=config.solar_cache_ts_bucket_secs,

@@ -510,17 +510,18 @@ def _flight_is_spoofed(
 
 def _any_climb_between(
     segments: list[IlsAlignmentResult],
-    recent_points: Iterable,
+    points: Iterable,
     *,
     threshold_ft: float = 500.0,
 ) -> bool:
     """Return True when any two consecutive segments in ``segments`` are
     separated by a rise of more than ``threshold_ft`` above the earlier
-    segment's end altitude. Walks ``recent_points`` for each gap; O(n*m)
-    which is fine for n<=240 and m<=5 segments."""
+    segment's end altitude. Walks ``points`` for each gap; O(n*m) where n
+    is the full per-flight point count (``metrics.all_points``) and
+    m<=5 segments, which stays cheap since m is always small."""
     if len(segments) < 2:
         return False
-    points = list(recent_points)
+    points = list(points)
     for i in range(len(segments) - 1):
         a, b = segments[i], segments[i + 1]
         if a.end_alt_ft is None:
@@ -1261,7 +1262,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 # Single pass: all-segments feeds both the longest-wins
                 # ILS signal and the pattern_cycles/go-around block below.
                 all_segments = detect_all_ils_alignments(
-                    metrics,
+                    metrics.all_points,
                     airport_elev_ft=airport_elev_ft,
                     runway_ends=[dict(r) for r in runway_rows],
                     max_offset_m=config.ils_alignment_max_offset_m,
@@ -1310,7 +1311,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         # pattern/go-around. Empty list means no candidate airport, no
         # runway data, or no qualifying alignment.
         flight.pattern_cycles = len(all_segments)
-        flight.had_go_around = 1 if _any_climb_between(all_segments, metrics.recent_points, threshold_ft=500.0) else 0
+        flight.had_go_around = 1 if _any_climb_between(all_segments, metrics.all_points, threshold_ft=500.0) else 0
 
         # --- Pattern mission override ---
         # Upgrade same-airport flights with 2+ aligned segments to mission_type

@@ -200,7 +200,7 @@ def detect_ils_alignment(
 
 
 def detect_all_ils_alignments(
-    metrics: FlightMetrics,
+    samples: Iterable[_PointSample],
     *,
     airport_elev_ft: float,
     runway_ends: Iterable[Mapping[str, object]],
@@ -211,12 +211,20 @@ def detect_all_ils_alignments(
 ) -> list[IlsAlignmentResult]:
     """Return every qualifying ILS-aligned segment across runway ends,
     chronologically ordered by ``first_ts``. Empty list when none qualified.
-    Same kwargs and thresholds as :func:`detect_ils_alignment`."""
-    samples = list(metrics.recent_points)
-    if not samples:
+
+    Unlike :func:`detect_ils_alignment`, this takes the point stream
+    directly rather than a ``FlightMetrics`` instance, so callers can pass
+    the full per-flight history (e.g. ``metrics.all_points``) instead of
+    being limited to the tail-only ``recent_points`` deque (240 samples,
+    ~20 min) - pattern_cycles / had_go_around undercount circuits on
+    longer flights when fed only the tail. ``samples`` must be in
+    chronological order. Same kwargs and thresholds as
+    :func:`detect_ils_alignment`."""
+    sample_list = list(samples)
+    if not sample_list:
         return []
     return _alignments_for_samples(
-        samples,
+        sample_list,
         list(runway_ends),
         airport_elev_ft=airport_elev_ft,
         max_offset_m=max_offset_m,

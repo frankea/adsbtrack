@@ -2,13 +2,14 @@
 
 from collections import deque
 
-from adsbtrack.classifier import FlightMetrics
+from adsbtrack.classifier import FlightMetrics, _PointSample
 from adsbtrack.config import Config
 from adsbtrack.features import (
     _circular_mean_deg,
     classify_category_do260,
     classify_mission,
     compute_callsigns_summary,
+    compute_day_night,
     compute_go_around,
     compute_headings,
     compute_hover,
@@ -741,3 +742,95 @@ def test_compute_squawk_summary_single_point_squawk_is_visible() -> None:
     assert out["had_emergency"] == 1
     # 1200 held ~60+s; 7700 held effectively 0s; primary stays 1200
     assert out["primary_squawk"] == "1200"
+
+
+# ---------------------------------------------------------------------------
+# Day / night (A5: per-sample loop must use each sample's own coordinates)
+# ---------------------------------------------------------------------------
+
+
+def test_day_night_per_sample_loop_uses_sample_coordinates(monkeypatch) -> None:
+    """The per-sample day/night tally must query is_night_at with each
+    sample's own lat/lon, not metrics.last_seen_lat/lon (the landing
+    coordinates) substituted for every sample. Bug: pre-fix, every sample
+    was evaluated at the landing point, so the counts just replicated the
+    landing day/night state N times regardless of where the aircraft
+    actually was."""
+    from datetime import UTC, datetime
+
+    calls: list[tuple[float, float]] = []
+
+    def fake_is_night_at(dt, lat, lon, **kwargs):
+        calls.append((lat, lon))
+        return False
+
+    monkeypatch.setattr("adsbtrack.features.is_night_at", fake_is_night_at)
+
+    metrics = FlightMetrics()
+    sample_coords = [(10.0, 20.0), (11.0, 21.0), (12.0, 22.0)]
+    for i, (lat, lon) in enumerate(sample_coords):
+        metrics.recent_points.append(
+            _PointSample(ts=1_000.0 + i, baro_alt=5000, geom_alt=None, gs=100.0, baro_rate=0.0, lat=lat, lon=lon)
+        )
+    # Landing coordinates deliberately differ from every sample's own
+    # position so a bug that substitutes them in is visible.
+    metrics.last_seen_lat = 50.0
+    metrics.last_seen_lon = 60.0
+
+    ts = datetime(2025, 1, 1, tzinfo=UTC)
+    compute_day_night(
+        takeoff_time=ts,
+        takeoff_lat=0.0,
+        takeoff_lon=0.0,
+        landing_time=ts,
+        landing_lat=50.0,
+        landing_lon=60.0,
+        metrics=metrics,
+        config=_cfg(),
+    )
+
+    # The first two calls are the fixed takeoff/landing endpoint checks;
+    # everything after that is the per-sample loop, which must use each
+    # sample's own coordinates rather than repeating the landing point.
+    per_sample_calls = calls[2:]
+    assert per_sample_calls == sample_coords
+
+
+def test_day_night_per_sample_loop_skips_samples_without_position(monkeypatch) -> None:
+    """A sample lacking lat/lon must be skipped, not treated as the
+    landing position and not abort the whole tally for later samples."""
+    from datetime import UTC, datetime
+
+    calls: list[tuple[float, float]] = []
+
+    def fake_is_night_at(dt, lat, lon, **kwargs):
+        calls.append((lat, lon))
+        return False
+
+    monkeypatch.setattr("adsbtrack.features.is_night_at", fake_is_night_at)
+
+    metrics = FlightMetrics()
+    metrics.recent_points.append(
+        _PointSample(ts=1_000.0, baro_alt=5000, geom_alt=None, gs=100.0, baro_rate=0.0, lat=None, lon=None)
+    )
+    metrics.recent_points.append(
+        _PointSample(ts=1_001.0, baro_alt=5000, geom_alt=None, gs=100.0, baro_rate=0.0, lat=10.0, lon=20.0)
+    )
+    metrics.last_seen_lat = 50.0
+    metrics.last_seen_lon = 60.0
+
+    ts = datetime(2025, 1, 1, tzinfo=UTC)
+    compute_day_night(
+        takeoff_time=ts,
+        takeoff_lat=0.0,
+        takeoff_lon=0.0,
+        landing_time=ts,
+        landing_lat=50.0,
+        landing_lon=60.0,
+        metrics=metrics,
+        config=_cfg(),
+    )
+
+    # Only the second sample (with a position) reaches is_night_at from the
+    # per-sample loop; the positionless first sample is skipped outright.
+    assert calls[2:] == [(10.0, 20.0)]

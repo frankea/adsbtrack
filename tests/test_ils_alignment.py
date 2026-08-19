@@ -211,7 +211,7 @@ def test_detect_all_ils_alignments_returns_multiple_segments() -> None:
     seg_b = _walk_toward(33.64, -84.43, 90.0, start_ts=200.0, n=30, spacing_secs=3.0)
     metrics = _Metrics(seg_a + seg_b)
     results = detect_all_ils_alignments(
-        metrics,
+        metrics.recent_points,
         airport_elev_ft=1026,
         runway_ends=[runway],
     )
@@ -228,7 +228,7 @@ def test_detect_all_ils_alignments_empty_when_nothing_qualifies() -> None:
     metrics = _Metrics(samples)
     assert (
         detect_all_ils_alignments(
-            metrics,
+            metrics.recent_points,
             airport_elev_ft=1026,
             runway_ends=[runway],
         )
@@ -242,12 +242,47 @@ def test_detect_all_ils_alignments_single_segment_equals_longest() -> None:
     runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
     samples = _walk_toward(33.64, -84.43, 90.0, start_ts=0.0, n=30, spacing_secs=3.0)
     metrics = _Metrics(samples)
-    all_segs = detect_all_ils_alignments(metrics, airport_elev_ft=1026, runway_ends=[runway])
+    all_segs = detect_all_ils_alignments(metrics.recent_points, airport_elev_ft=1026, runway_ends=[runway])
     longest = detect_ils_alignment(metrics, airport_elev_ft=1026, runway_ends=[runway])
     assert len(all_segs) == 1
     assert longest is not None
     assert all_segs[0].runway_name == longest.runway_name
     assert all_segs[0].duration_secs == pytest.approx(longest.duration_secs)
+
+
+def _filler(ts_start: float, n: int, spacing: float) -> list[_PointSample]:
+    """Non-qualifying padding samples: level flight at 20,000 ft, well
+    above the 5,000 ft AGL alignment cap. Used purely to inflate a
+    synthetic flight's total sample count past the old 240-sample
+    recent_points cap without producing spurious alignment segments."""
+    return [_sample(ts_start + i * spacing, 33.9, -84.9, 20_000, 270.0) for i in range(n)]
+
+
+def test_detect_all_ils_alignments_sees_full_flight_beyond_240_samples() -> None:
+    """A6: on a flight with more than 240 trace points, detect_all_ils_alignments
+    must see every circuit pass across the whole flight, not just whatever
+    fits in a tail-only 240-sample window (the old recent_points deque)."""
+    runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
+
+    # Three separate circuit passes (~57 s each), well outside each other's
+    # split_gap_secs window, padded with 250 non-qualifying filler samples
+    # between the first and second pass so the flight totals 310 points -
+    # comfortably past the old 240-sample recent_points cap.
+    pass1 = _walk_toward(33.64, -84.43, 90.0, start_ts=0.0, n=20, spacing_secs=3.0)  # ts [0, 57]
+    filler = _filler(ts_start=100.0, n=250, spacing=1.0)  # ts [100, 349]
+    pass2 = _walk_toward(33.64, -84.43, 90.0, start_ts=400.0, n=20, spacing_secs=3.0)  # ts [400, 457]
+    pass3 = _walk_toward(33.64, -84.43, 90.0, start_ts=600.0, n=20, spacing_secs=3.0)  # ts [600, 657]
+    all_samples = pass1 + filler + pass2 + pass3
+    assert len(all_samples) > 240
+
+    results = detect_all_ils_alignments(all_samples, airport_elev_ft=1026, runway_ends=[runway])
+    assert len(results) == 3
+
+    # A tail-only 240-sample window (what the old recent_points-backed call
+    # site saw) drops the earliest pass entirely - this is the bug A6 fixes.
+    tail_only = list(deque(all_samples, maxlen=240))
+    tail_results = detect_all_ils_alignments(tail_only, airport_elev_ft=1026, runway_ends=[runway])
+    assert len(tail_results) == 2
 
 
 def test_ils_alignment_result_carries_first_last_ts_and_end_alt() -> None:
@@ -259,7 +294,7 @@ def test_ils_alignment_result_carries_first_last_ts_and_end_alt() -> None:
     runway = {"runway_name": "09", "latitude_deg": 33.64, "longitude_deg": -84.43, "heading_deg_true": 90.0}
     samples = _walk_toward(33.64, -84.43, 90.0, start_ts=100.0, n=30, spacing_secs=3.0)
     metrics = _Metrics(samples)
-    results = detect_all_ils_alignments(metrics, airport_elev_ft=1026, runway_ends=[runway])
+    results = detect_all_ils_alignments(metrics.recent_points, airport_elev_ft=1026, runway_ends=[runway])
     assert len(results) == 1
     r = results[0]
     # Numeric bracketing: first_ts == earliest sample ts, last_ts == latest.

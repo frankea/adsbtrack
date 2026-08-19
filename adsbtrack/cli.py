@@ -474,6 +474,13 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         flights = db.get_flights(hex_code, from_date, to_date, airport)
 
+        if not flights:
+            if output_json:
+                click.echo(json.dumps([], indent=2))
+            else:
+                console.print("[yellow]No flights found[/]")
+            return
+
         def _col(row, name, default=None):
             try:
                 return row[name]
@@ -484,6 +491,23 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
         # at all, so users who haven't run `acars` don't see an empty column.
         acars_row = db.conn.execute("SELECT COUNT(*) AS c FROM acars_messages WHERE icao = ?", (hex_code,)).fetchone()
         has_acars = acars_row and acars_row["c"] > 0
+
+        def _flight_acars(f):
+            """Per-flight ACARS message count + OOOI presence. Single source of
+            truth for this query -- called from both the --json row builder and
+            the table row builder so the two output paths never diverge."""
+            msg_count_row = db.conn.execute(
+                """SELECT COUNT(*) AS c FROM acars_messages
+                   WHERE icao = ? AND timestamp BETWEEN ? AND ?""",
+                (
+                    hex_code,
+                    f["takeoff_time"],
+                    f["landing_time"] or f["last_seen_time"] or f["takeoff_time"],
+                ),
+            ).fetchone()
+            msg_count = msg_count_row["c"] if msg_count_row else 0
+            has_oooi = any(_col(f, k) for k in ("acars_out", "acars_off", "acars_on", "acars_in"))
+            return msg_count, has_oooi
 
         # Auto-show the alignment column when any row has alignment data,
         # mirroring the ACARS auto-detect behavior.
@@ -518,19 +542,9 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                     "mission_type": _col(f, "mission_type"),
                 }
                 if has_acars:
-                    msg_count_row = db.conn.execute(
-                        """SELECT COUNT(*) AS c FROM acars_messages
-                           WHERE icao = ? AND timestamp BETWEEN ? AND ?""",
-                        (
-                            hex_code,
-                            f["takeoff_time"],
-                            f["landing_time"] or f["last_seen_time"] or f["takeoff_time"],
-                        ),
-                    ).fetchone()
-                    row["acars_message_count"] = msg_count_row["c"] if msg_count_row else 0
-                    row["acars_oooi"] = bool(
-                        any(_col(f, k) for k in ("acars_out", "acars_off", "acars_on", "acars_in"))
-                    )
+                    msg_count, has_oooi = _flight_acars(f)
+                    row["acars_message_count"] = msg_count
+                    row["acars_oooi"] = has_oooi
                 if show_alignment_col:
                     row["aligned_runway"] = _col(f, "aligned_runway")
                     row["aligned_seconds"] = _col(f, "aligned_seconds")
@@ -538,10 +552,6 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                     row["primary_squawk"] = _col(f, "primary_squawk")
                 rows.append(row)
             click.echo(json.dumps(rows, indent=2))
-            return
-
-        if not flights:
-            console.print("[yellow]No flights found[/]")
             return
 
         table = Table(title=f"Flights for {hex_code}")
@@ -632,20 +642,9 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
 
             row_cells = [takeoff, origin, dest, duration, callsign, mission, conf_str, type_display]
             if has_acars:
-                # Count ACARS messages whose timestamp falls in this flight's
-                # window. OOOI marker appears when any of acars_out/off/on/in
-                # is populated - an OOOI-tagged flight is highlighted.
-                msg_count_row = db.conn.execute(
-                    """SELECT COUNT(*) AS c FROM acars_messages
-                       WHERE icao = ? AND timestamp BETWEEN ? AND ?""",
-                    (
-                        hex_code,
-                        f["takeoff_time"],
-                        f["landing_time"] or f["last_seen_time"] or f["takeoff_time"],
-                    ),
-                ).fetchone()
-                msg_count = msg_count_row["c"] if msg_count_row else 0
-                has_oooi = any(_col(f, k) for k in ("acars_out", "acars_off", "acars_on", "acars_in"))
+                # OOOI marker appears when any of acars_out/off/on/in is
+                # populated - an OOOI-tagged flight is highlighted.
+                msg_count, has_oooi = _flight_acars(f)
                 if msg_count > 0 and has_oooi:
                     acars_cell = f"[green]{msg_count} OOOI[/]"
                 elif msg_count > 0:

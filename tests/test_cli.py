@@ -1,6 +1,7 @@
 """Tests for adsbtrack.cli -- Click command surface."""
 
 import io
+import json
 import re
 import zipfile
 from datetime import UTC, date, datetime
@@ -1651,3 +1652,147 @@ def test_route_cli_tail_resolves_via_aircraft_registry(tmp_path, monkeypatch):
     result = CliRunner().invoke(cli, ["route", "--tail", "G-XYZA", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "NDB1 (<1m)" in result.output
+
+
+# -----------------------------------------------------------------------------
+# --json output (U2)
+# -----------------------------------------------------------------------------
+
+
+def test_trips_json_emits_flight_objects(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flights(db_path)
+
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ae07b3", "--db", str(db_path), "--json"])
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    assert len(payload) == 2
+    assert payload[0]["icao"] == "ae07b3"
+    assert "id" in payload[0]
+
+
+def test_trips_default_output_unchanged_with_table_title(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flights(db_path)
+
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ae07b3", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Flights for ae07b3" in result.output
+
+
+def test_status_json_emits_summary_object(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flights(db_path)
+
+    result = CliRunner().invoke(cli, ["status", "--hex", "ae07b3", "--db", str(db_path), "--json"])
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.output)
+    assert payload["hex"] == "ae07b3"
+    assert payload["total_flights"] == 2
+
+
+def test_status_default_output_unchanged_with_header(tmp_path):
+    db_path = tmp_path / "t.db"
+    _seed_flights(db_path)
+
+    result = CliRunner().invoke(cli, ["status", "--hex", "ae07b3", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Status for ae07b3" in result.output
+
+
+def _seed_gap_trace(db_path):
+    """Single-day trace with a deliberate 600-second gap at FL350.
+
+    Mirrors tests/test_gaps.py's populated_db fixture, trimmed to what
+    a CLI-level --json smoke test needs.
+    """
+    base_ts = 1700000000.0
+    trace = []
+    for i in range(30):
+        alt = min(35000, 1000 + i * 1200)
+        lat = 29.5 + i * 0.01
+        lon = -98.5 + i * 0.02
+        trace.append([i * 30.0, lat, lon, alt, 400.0, 0.0, 0, 0, {}, "adsb_icao"])
+    gap_end_offset = 30 * 30.0 + 600.0
+    for i in range(20):
+        lat = 29.80 + i * 0.01
+        lon = -97.86 + i * 0.02
+        trace.append([gap_end_offset + i * 30.0, lat, lon, 35000, 400.0, 0.0, 0, 0, {}, "adsb_icao"])
+
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "abc123",
+            "2023-11-14",
+            {"timestamp": base_ts, "trace": trace, "r": "N12345", "t": "C172"},
+            source="adsbx",
+        )
+        db.commit()
+
+
+def test_gaps_json_emits_row_list(tmp_path):
+    db_path = tmp_path / "g.db"
+    _seed_gap_trace(db_path)
+
+    result = CliRunner().invoke(cli, ["gaps", "--hex", "abc123", "--db", str(db_path), "--json"])
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    assert 550 < payload[0]["duration_secs"] < 650
+    assert "classification" in payload[0]
+
+
+def test_gaps_default_output_unchanged_with_table_title(tmp_path):
+    db_path = tmp_path / "g.db"
+    _seed_gap_trace(db_path)
+
+    result = CliRunner().invoke(cli, ["gaps", "--hex", "abc123", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "ADS-B gaps for abc123" in result.output
+
+
+def _seed_event_flight(db_path):
+    """One flight with an emergency squawk so collect_events yields exactly one event."""
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="aaa001",
+                takeoff_time=datetime(2024, 6, 15, 12, 0, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2024-06-15",
+                landing_time=datetime(2024, 6, 15, 13, 30, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="UAL100",
+                emergency_squawk="7700",
+                destination_icao="KBOS",
+            )
+        )
+        db.commit()
+
+
+def test_events_json_emits_event_list(tmp_path):
+    db_path = tmp_path / "e.db"
+    _seed_event_flight(db_path)
+
+    result = CliRunner().invoke(cli, ["events", "--hex", "aaa001", "--db", str(db_path), "--json"])
+    assert result.exit_code == 0, result.output
+
+    payload = json.loads(result.output)
+    assert isinstance(payload, list)
+    assert len(payload) == 1
+    assert payload[0]["event_type"] == "emergency_squawk"
+    assert payload[0]["severity"] == "emergency"
+
+
+def test_events_default_output_unchanged_with_table_title(tmp_path):
+    db_path = tmp_path / "e.db"
+    _seed_event_flight(db_path)
+
+    result = CliRunner().invoke(cli, ["events", "--hex", "aaa001", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Events for aaa001" in result.output

@@ -1,3 +1,4 @@
+import json
 import os
 import re
 from collections.abc import Callable
@@ -53,6 +54,18 @@ def _db_option(help_text: str = "Database path.") -> Callable:
         default="adsbtrack.db",
         envvar="ADSBTRACK_DB",
         help=f"{help_text} Reads $ADSBTRACK_DB if set (default: ./adsbtrack.db).",
+    )
+
+
+def _json_option() -> Callable:
+    """Shared --json flag for read commands. Emits a single JSON document to
+    stdout via click.echo (no Rich markup/ANSI) instead of the Rich table."""
+    return click.option(
+        "--json",
+        "output_json",
+        is_flag=True,
+        default=False,
+        help="Emit a single JSON document to stdout instead of the table.",
     )
 
 
@@ -453,16 +466,13 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     default=False,
     help="Show the primary squawk code held by each flight.",
 )
+@_json_option()
 @_db_option()
-def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, show_squawk, db_path):
+def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, show_squawk, output_json, db_path):
     """Show flight history."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         flights = db.get_flights(hex_code, from_date, to_date, airport)
-
-        if not flights:
-            console.print("[yellow]No flights found[/]")
-            return
 
         def _col(row, name, default=None):
             try:
@@ -481,6 +491,58 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
         show_alignment_col = show_alignment or has_alignment_data
 
         show_squawk_col = show_squawk
+
+        if output_json:
+            rows = []
+            for f in flights:
+                row = {
+                    "id": f["id"],
+                    "icao": hex_code,
+                    "date": f["takeoff_time"][:10] if f["takeoff_time"] else None,
+                    "takeoff_time": f["takeoff_time"],
+                    "landing_time": f["landing_time"],
+                    "origin_icao": f["origin_icao"],
+                    "origin_name": f["origin_name"],
+                    "takeoff_runway": _col(f, "takeoff_runway"),
+                    "takeoff_lat": f["takeoff_lat"],
+                    "takeoff_lon": f["takeoff_lon"],
+                    "destination_icao": f["destination_icao"],
+                    "destination_name": f["destination_name"],
+                    "landing_lat": f["landing_lat"],
+                    "landing_lon": f["landing_lon"],
+                    "landing_type": f["landing_type"] or "unknown",
+                    "landing_confidence": f["landing_confidence"],
+                    "probable_destination_icao": _col(f, "probable_destination_icao"),
+                    "duration_minutes": f["duration_minutes"],
+                    "callsign": f["callsign"],
+                    "mission_type": _col(f, "mission_type"),
+                }
+                if has_acars:
+                    msg_count_row = db.conn.execute(
+                        """SELECT COUNT(*) AS c FROM acars_messages
+                           WHERE icao = ? AND timestamp BETWEEN ? AND ?""",
+                        (
+                            hex_code,
+                            f["takeoff_time"],
+                            f["landing_time"] or f["last_seen_time"] or f["takeoff_time"],
+                        ),
+                    ).fetchone()
+                    row["acars_message_count"] = msg_count_row["c"] if msg_count_row else 0
+                    row["acars_oooi"] = bool(
+                        any(_col(f, k) for k in ("acars_out", "acars_off", "acars_on", "acars_in"))
+                    )
+                if show_alignment_col:
+                    row["aligned_runway"] = _col(f, "aligned_runway")
+                    row["aligned_seconds"] = _col(f, "aligned_seconds")
+                if show_squawk_col:
+                    row["primary_squawk"] = _col(f, "primary_squawk")
+                rows.append(row)
+            click.echo(json.dumps(rows, indent=2))
+            return
+
+        if not flights:
+            console.print("[yellow]No flights found[/]")
+            return
 
         table = Table(title=f"Flights for {hex_code}")
         table.add_column("Date", style="cyan")
@@ -659,8 +721,9 @@ def route(hex_code, tail_number, db_path):
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
+@_json_option()
 @_db_option()
-def status(hex_code, tail_number, db_path):
+def status(hex_code, tail_number, output_json, db_path):
     """Show database statistics."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
@@ -670,24 +733,50 @@ def status(hex_code, tail_number, db_path):
         first_date, last_date = db.get_date_range(hex_code)
         top_airports = db.get_top_airports(hex_code)
 
-        console.print(f"\n[bold]Status for {hex_code}[/]\n")
+        # Row dict built once; the table path below prints from the same
+        # variables instead of re-querying, and the --json path serializes
+        # this dict directly.
+        payload: dict = {
+            "hex": hex_code,
+            "registration": None,
+            "type": None,
+            "owner": None,
+            "date_range": {"first": first_date, "last": last_date},
+            "days_checked": total_fetched,
+            "days_with_data": days_with_data,
+            "total_flights": flight_count,
+            "quality": {},
+            "utilization": None,
+            "top_airports": [
+                {"airport": ap["airport"], "name": ap["name"], "visits": ap["visits"]} for ap in top_airports
+            ],
+            "acars": None,
+        }
+
+        if not output_json:
+            console.print(f"\n[bold]Status for {hex_code}[/]\n")
 
         # Get aircraft info from first trace day
         trace_days = db.get_trace_days(hex_code)
         if trace_days:
             td = trace_days[0]
-            console.print(f"  Registration:  {td['registration']}")
-            console.print(f"  Type:          {td['description']}")
-            console.print(f"  Owner:         {td['owner_operator']}")
-            console.print()
+            payload["registration"] = td["registration"]
+            payload["type"] = td["description"]
+            payload["owner"] = td["owner_operator"]
+            if not output_json:
+                console.print(f"  Registration:  {td['registration']}")
+                console.print(f"  Type:          {td['description']}")
+                console.print(f"  Owner:         {td['owner_operator']}")
+                console.print()
 
         # FAA registry block: show registrant, address, cert info when
         # we have FAA data loaded. Also flag deregistered hexes so the
         # user knows the aircraft was pulled from the registry (common
-        # in the ghost-helicopter pattern).
+        # in the ghost-helicopter pattern). Not part of the --json payload
+        # (see task-4-brief.md); table-only.
         faa_reg = db.get_faa_registry_by_hex(hex_code)
         faa_dereg = db.get_faa_deregistered_by_hex(hex_code)
-        if faa_reg or faa_dereg:
+        if (faa_reg or faa_dereg) and not output_json:
             source = faa_reg or faa_dereg
             label = "FAA registry" if faa_reg else "FAA registry (DEREGISTERED)"
             color = "cyan" if faa_reg else "red"
@@ -706,14 +795,16 @@ def status(hex_code, tail_number, db_path):
             if faa_reg and faa_dereg:
                 console.print("  [dim yellow]Note: prior deregistration record also on file[/]")
 
-        console.print(f"  Date range:    {first_date or 'N/A'} to {last_date or 'N/A'}")
-        console.print(f"  Days checked:  {total_fetched}")
-        console.print(f"  Days w/ data:  {days_with_data}")
-        console.print(f"  Total flights: {flight_count}")
+        if not output_json:
+            console.print(f"  Date range:    {first_date or 'N/A'} to {last_date or 'N/A'}")
+            console.print(f"  Days checked:  {total_fetched}")
+            console.print(f"  Days w/ data:  {days_with_data}")
+            console.print(f"  Total flights: {flight_count}")
 
         # Data quality summary
         quality = db.get_flight_quality_summary(hex_code)
-        if quality and any(k != "unknown" for k in quality):
+        payload["quality"] = quality
+        if quality and any(k != "unknown" for k in quality) and not output_json:
             console.print("\n[bold]Data quality:[/]\n")
             type_labels = {
                 "confirmed": ("green", "Confirmed landings"),
@@ -740,7 +831,7 @@ def status(hex_code, tail_number, db_path):
             ).fetchall()
         except Exception:
             emergency_rows = []
-        if emergency_rows:
+        if emergency_rows and not output_json:
             parts = ", ".join(f"{row['cnt']} ({row['emergency_squawk']})" for row in emergency_rows)
             console.print(f"  [red]Emergencies:{' ' * (22 - len('Emergencies:'))}{parts}[/]")
 
@@ -753,7 +844,7 @@ def status(hex_code, tail_number, db_path):
             ).fetchone()
         except Exception:
             avg_row = None
-        if avg_row and avg_row["n"] and avg_row["avg_changes"] is not None:
+        if avg_row and avg_row["n"] and avg_row["avg_changes"] is not None and not output_json:
             console.print(f"  Squawk changes per flight (avg): {avg_row['avg_changes']:.1f}")
 
         # Go-around + pattern-work counters. Wrapped in try/except so a
@@ -769,7 +860,7 @@ def status(hex_code, tail_number, db_path):
             ).fetchone()
         except Exception:
             counts_row = None
-        if counts_row and (counts_row["go_arounds"] or counts_row["pattern_flights"]):
+        if counts_row and (counts_row["go_arounds"] or counts_row["pattern_flights"]) and not output_json:
             console.print("\n[bold]Approach behaviour:[/]\n")
             console.print(f"  Go-arounds:     {counts_row['go_arounds'] or 0}")
             console.print(f"  Pattern work:   {counts_row['pattern_flights'] or 0} flights")
@@ -779,7 +870,7 @@ def status(hex_code, tail_number, db_path):
             "SELECT mission_type, COUNT(*) as cnt FROM flights WHERE icao = ? GROUP BY mission_type ORDER BY cnt DESC",
             (hex_code,),
         ).fetchall()
-        if mission_rows and any(r["mission_type"] for r in mission_rows):
+        if mission_rows and any(r["mission_type"] for r in mission_rows) and not output_json:
             console.print("\n[bold]Mission breakdown:[/]\n")
             for row in mission_rows:
                 mt = row["mission_type"] or "(none)"
@@ -792,16 +883,27 @@ def status(hex_code, tail_number, db_path):
         except Exception:
             stats_row = None
         if stats_row:
-            console.print("\n[bold]Utilization:[/]\n")
-            console.print(f"  Total hours:      {stats_row['total_hours'] or 0:.1f}")
-            console.print(f"  Cycles:           {stats_row['total_cycles'] or 0}")
-            console.print(f"  Avg flight:       {stats_row['avg_flight_minutes'] or 0:.1f} min")
-            console.print(f"  Distinct airports: {stats_row['distinct_airports'] or 0}")
-            console.print(f"  Distinct callsigns: {stats_row['distinct_callsigns'] or 0}")
-            if stats_row["busiest_day_date"]:
-                console.print(
-                    f"  Busiest day:      {stats_row['busiest_day_date']} ({stats_row['busiest_day_count']} flights)"
-                )
+            payload["utilization"] = {
+                "total_hours": stats_row["total_hours"],
+                "total_cycles": stats_row["total_cycles"],
+                "avg_flight_minutes": stats_row["avg_flight_minutes"],
+                "distinct_airports": stats_row["distinct_airports"],
+                "distinct_callsigns": stats_row["distinct_callsigns"],
+                "busiest_day_date": stats_row["busiest_day_date"],
+                "busiest_day_count": stats_row["busiest_day_count"],
+            }
+            if not output_json:
+                console.print("\n[bold]Utilization:[/]\n")
+                console.print(f"  Total hours:      {stats_row['total_hours'] or 0:.1f}")
+                console.print(f"  Cycles:           {stats_row['total_cycles'] or 0}")
+                console.print(f"  Avg flight:       {stats_row['avg_flight_minutes'] or 0:.1f} min")
+                console.print(f"  Distinct airports: {stats_row['distinct_airports'] or 0}")
+                console.print(f"  Distinct callsigns: {stats_row['distinct_callsigns'] or 0}")
+                if stats_row["busiest_day_date"]:
+                    console.print(
+                        f"  Busiest day:      {stats_row['busiest_day_date']} "
+                        f"({stats_row['busiest_day_count']} flights)"
+                    )
 
         # Position source breakdown (readsb type/src field). Weight each
         # flight's percentage by its data_points so the total matches the
@@ -823,7 +925,7 @@ def status(hex_code, tail_number, db_path):
                  AND (adsb_pct IS NOT NULL OR mlat_pct IS NOT NULL OR tisb_pct IS NOT NULL)""",
             (hex_code,),
         ).fetchone()
-        if src_row and src_row["total_points"]:
+        if src_row and src_row["total_points"] and not output_json:
             adsb_pct = src_row["adsb"] or 0.0
             mlat_pct = src_row["mlat"] or 0.0
             tisb_pct = src_row["tisb"] or 0.0
@@ -862,10 +964,6 @@ def status(hex_code, tail_number, db_path):
                         OR acars_on IS NOT NULL OR acars_in IS NOT NULL)""",
                 (hex_code,),
             ).fetchone()["c"]
-            console.print("\n[bold]ACARS:[/]\n")
-            console.print(f"  Total messages: {acars_total}")
-            console.print(f"  Flights fetched: {acars_flights}")
-            console.print(f"  Flights with OOOI data: {oooi_flights}")
             # Top labels for context
             label_rows = db.conn.execute(
                 """SELECT label, COUNT(*) AS c FROM acars_messages
@@ -873,25 +971,37 @@ def status(hex_code, tail_number, db_path):
                    GROUP BY label ORDER BY c DESC LIMIT 6""",
                 (hex_code,),
             ).fetchall()
-            if label_rows:
-                top = ", ".join(f"{r['label']}({r['c']})" for r in label_rows)
-                console.print(f"  Top labels: {top}")
+            payload["acars"] = {
+                "total_messages": acars_total,
+                "flights_fetched": acars_flights,
+                "flights_with_oooi": oooi_flights,
+                "top_labels": [{"label": r["label"], "count": r["c"]} for r in label_rows],
+            }
+            if not output_json:
+                console.print("\n[bold]ACARS:[/]\n")
+                console.print(f"  Total messages: {acars_total}")
+                console.print(f"  Flights fetched: {acars_flights}")
+                console.print(f"  Flights with OOOI data: {oooi_flights}")
+                if label_rows:
+                    top = ", ".join(f"{r['label']}({r['c']})" for r in label_rows)
+                    console.print(f"  Top labels: {top}")
 
-        # v3: emergency / night indicators
+        # v3: emergency / night indicators. Table-only; not part of the
+        # --json payload (see task-4-brief.md).
         night_count = db.conn.execute(
             "SELECT COUNT(*) FROM flights WHERE icao = ? AND night_flight = 1", (hex_code,)
         ).fetchone()[0]
         emergency_count = db.conn.execute(
             "SELECT COUNT(*) FROM flights WHERE icao = ? AND emergency_squawk IS NOT NULL", (hex_code,)
         ).fetchone()[0]
-        if night_count > 0 or emergency_count > 0:
+        if (night_count > 0 or emergency_count > 0) and not output_json:
             console.print("\n[bold]Indicators:[/]\n")
             if night_count > 0:
                 console.print(f"  Night flights:    {night_count}")
             if emergency_count > 0:
                 console.print(f"  [red]Emergency squawks: {emergency_count}[/]")
 
-        if top_airports:
+        if top_airports and not output_json:
             console.print("\n[bold]Top airports:[/]\n")
             table = Table(show_header=True)
             table.add_column("Airport", style="cyan")
@@ -900,6 +1010,9 @@ def status(hex_code, tail_number, db_path):
             for ap in top_airports:
                 table.add_row(ap["airport"], ap["name"], str(ap["visits"]))
             console.print(table)
+
+        if output_json:
+            click.echo(json.dumps(payload, indent=2))
 
 
 @cli.command()
@@ -1380,7 +1493,8 @@ def mil_scan_cmd(db_path):
     show_default=True,
     help="Filter output by classification bucket.",
 )
-def gaps(hex_code, tail_number, db_path, min_gap_secs, classification):
+@_json_option()
+def gaps(hex_code, tail_number, db_path, min_gap_secs, classification, output_json):
     """Find within-flight ADS-B signal gaps and classify each.
 
     A gap is only tagged as likely_transponder_off when all of:
@@ -1388,17 +1502,40 @@ def gaps(hex_code, tail_number, db_path, min_gap_secs, classification):
     position is within 200 nm of a known airport. Ambiguous gaps
     default to "unknown" rather than a confident mislabel.
     """
+    from datetime import UTC, datetime
+
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         all_gaps = detect_gaps(db, hex_code, min_gap_secs=float(min_gap_secs))
 
     filtered = [g for g in all_gaps if g.classification == classification] if classification != "all" else all_gaps
 
+    if output_json:
+        rows = [
+            {
+                "gap_start": datetime.fromtimestamp(g.gap_start_ts, UTC).isoformat(),
+                "gap_end": datetime.fromtimestamp(g.gap_end_ts, UTC).isoformat(),
+                "duration_secs": g.duration_secs,
+                "start_lat": g.start_lat,
+                "start_lon": g.start_lon,
+                "end_lat": g.end_lat,
+                "end_lon": g.end_lon,
+                "start_alt_ft": g.start_alt_ft,
+                "end_alt_ft": g.end_alt_ft,
+                "nearest_airport_nm": g.nearest_airport_nm,
+                "pre_source_mix": g.pre_source_mix,
+                "post_source_mix": g.post_source_mix,
+                "classification": g.classification,
+                "classification_reason": g.classification_reason,
+            }
+            for g in filtered
+        ]
+        click.echo(json.dumps(rows, indent=2))
+        return
+
     if not filtered:
         console.print(f"[green]No gaps found for {hex_code} (min_gap_secs={min_gap_secs}, filter={classification}).[/]")
         return
-
-    from datetime import UTC, datetime
 
     color_by_class = {
         "likely_transponder_off": "red",
@@ -1464,7 +1601,8 @@ def _pct(mix: dict, key: str) -> str:
     show_default=True,
     help="Filter by severity tier.",
 )
-def events(hex_code, tail_number, db_path, since_str, severity):
+@_json_option()
+def events(hex_code, tail_number, db_path, since_str, severity, output_json):
     """Show a chronological event log for an aircraft.
 
     Surfaces: emergency squawks (7500/7600/7700), emergency flags,
@@ -1486,6 +1624,21 @@ def events(hex_code, tail_number, db_path, since_str, severity):
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         evts = collect_events(db, hex_code, since=since, severity=severity)
+
+    if output_json:
+        rows = [
+            {
+                "ts": e.ts.isoformat(),
+                "icao": e.icao,
+                "callsign": e.callsign,
+                "event_type": e.event_type,
+                "severity": e.severity,
+                "summary": e.summary,
+            }
+            for e in evts
+        ]
+        click.echo(json.dumps(rows, indent=2))
+        return
 
     if not evts:
         console.print(f"[green]No events for {hex_code} (filter={severity}).[/]")

@@ -1,4 +1,5 @@
 import contextlib
+import dataclasses
 import json
 import shutil
 import sqlite3
@@ -379,16 +380,12 @@ CREATE TABLE IF NOT EXISTS spoofed_broadcasts (
     UNIQUE(icao, takeoff_time)
 );
 
-CREATE INDEX IF NOT EXISTS idx_spoofed_broadcasts_icao_time ON spoofed_broadcasts(icao, takeoff_time);
-
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_runways_airport_ident ON runways(airport_ident);
 CREATE INDEX IF NOT EXISTS idx_runways_latlon ON runways(latitude_deg, longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_navaids_latlon ON navaids(latitude_deg, longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_navaids_ident ON navaids(ident);
-CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time);
-CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_n_number ON faa_registry(n_number);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_name ON faa_registry(name);
 CREATE INDEX IF NOT EXISTS idx_faa_registry_city_state ON faa_registry(city, state);
@@ -439,6 +436,24 @@ CREATE VIEW IF NOT EXISTS flights_with_type AS
 
 # Individual CREATE statements for safe execution (no implicit commit)
 _SCHEMA_STATEMENTS = [stmt.strip() for stmt in SCHEMA.split(";") if stmt.strip()]
+
+# Bumped every time a migration function's *behavior* changes (a new column,
+# a new dropped column, a new dropped index, ...). Database.__init__ compares
+# this against the DB's PRAGMA user_version: when they already match, the
+# ALTER TABLE / DROP INDEX / mil-hex-reseed battery is skipped entirely --
+# CREATE TABLE IF NOT EXISTS still always runs (cheap, and required before a
+# brand-new DB can be stamped). When they don't match, every migration runs
+# and the DB is restamped to SCHEMA_VERSION on exit from that branch.
+#
+# Schema changes now touch six spots instead of seven: CREATE TABLE, the
+# relevant migration function (add a column / `_migrate_drop_*` for a
+# DROP), this SCHEMA_VERSION bump, the `Flight` dataclass (if a flights
+# column), `docs/schema.md`, and the legacy-fixture round-trip test. The
+# `insert_flight` INSERT statement no longer needs editing -- it is
+# generated from `dataclasses.fields(Flight)` (see insert_flight below), so
+# adding a Flight field is enough for it to be persisted with no SQL edit.
+# The `.claude/agents/migration-reviewer.md` subagent audits this checklist.
+SCHEMA_VERSION = 1
 
 
 def _needs_source_migration(conn: sqlite3.Connection) -> bool:
@@ -513,9 +528,6 @@ def _migrate_add_source(conn: sqlite3.Connection, db_path: Path):
             FROM fetch_log_old
         """)
         conn.execute("DROP TABLE fetch_log_old")
-
-        # Recreate indexes
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date)")
 
         conn.execute("COMMIT")
         print("  Migration complete.")
@@ -684,6 +696,22 @@ def _migrate_add_v4_columns(conn: sqlite3.Connection):
             conn.execute(f"ALTER TABLE aircraft_stats ADD COLUMN {col_name} {col_type}")
 
 
+def _migrate_drop_legacy_indexes(conn: sqlite3.Connection) -> None:
+    """Drop indexes that exactly duplicate a table's UNIQUE-constraint
+    autoindex prefix. Idempotent.
+
+    idx_flights_icao_time(icao, takeoff_time), idx_trace_days_icao_date
+    (icao, date), and idx_spoofed_broadcasts_icao_time(icao, takeoff_time)
+    were each a prefix of (or identical to) the columns SQLite already
+    indexes via the table's UNIQUE(...) constraint (sqlite_autoindex_*);
+    every query they served was already index-served through the
+    autoindex, so they cost a second B-tree on every insert for no
+    query-plan benefit.
+    """
+    for idx_name in ("idx_flights_icao_time", "idx_trace_days_icao_date", "idx_spoofed_broadcasts_icao_time"):
+        conn.execute(f"DROP INDEX IF EXISTS {idx_name}")
+
+
 # ---------------------------------------------------------------------------
 # trace_json decoding
 # ---------------------------------------------------------------------------
@@ -731,6 +759,42 @@ def iter_parsed_trace_days(rows: Iterable[sqlite3.Row], icao: str) -> Iterator[t
         yield row, parsed
 
 
+# ---------------------------------------------------------------------------
+# insert_flight: generated INSERT (D4)
+# ---------------------------------------------------------------------------
+# The flights table has 100+ columns and gains more as features ship.
+# Building the column list and VALUES placeholders from
+# dataclasses.fields(Flight) means adding a Flight field is enough for
+# insert_flight to persist it -- no hand-maintained column list or
+# positional-placeholder count to keep in sync (see the SCHEMA_VERSION
+# checklist comment above _SCHEMA_STATEMENTS). Named parameters (:field)
+# are used instead of positional "?" so this doesn't depend on the
+# dataclass field order matching the table's physical column order.
+_FLIGHT_FIELD_NAMES: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(Flight))
+# datetime-typed fields need ISO-string serialization before sqlite3 can
+# bind them; every other field is passed through unchanged.
+_FLIGHT_DATETIME_FIELDS = frozenset(f.name for f in dataclasses.fields(Flight) if f.type in (datetime, datetime | None))
+_INSERT_FLIGHT_SQL = (
+    "INSERT OR REPLACE INTO flights ("
+    + ", ".join(_FLIGHT_FIELD_NAMES)
+    + ") VALUES ("
+    + ", ".join(f":{name}" for name in _FLIGHT_FIELD_NAMES)
+    + ")"
+)
+
+
+def _flight_insert_params(flight: Flight) -> dict:
+    """Build the named-parameter dict for _INSERT_FLIGHT_SQL from a Flight,
+    serializing the datetime fields to ISO strings in this one shim spot."""
+    params = {}
+    for name in _FLIGHT_FIELD_NAMES:
+        value = getattr(flight, name)
+        if name in _FLIGHT_DATETIME_FIELDS and value is not None:
+            value = value.isoformat()
+        params[name] = value
+    return params
+
+
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -744,30 +808,39 @@ class Database:
         self.conn.execute("PRAGMA journal_mode = WAL")
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.execute("PRAGMA busy_timeout = 30000")
-        # Migrate existing databases that lack the source column
-        if _needs_source_migration(self.conn):
-            _migrate_add_source(self.conn, db_path)
-        # Run the full column migration every startup. Each ALTER TABLE is
-        # wrapped in suppress so duplicate-column errors are ignored cheaply.
-        # This is much simpler than maintaining per-column sentinel checks.
-        if _flights_table_exists(self.conn):
+        # CREATE TABLE IF NOT EXISTS always runs -- it's cheap, and a
+        # brand-new DB needs the tables to exist before it can be stamped.
+        current_version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        if current_version == SCHEMA_VERSION:
+            for stmt in _SCHEMA_STATEMENTS:
+                self.conn.execute(stmt)
+        else:
+            # Migrate existing databases that lack the source column
+            if _needs_source_migration(self.conn):
+                _migrate_add_source(self.conn, db_path)
+            # Run the full column migration every startup. Each ALTER TABLE is
+            # wrapped in suppress so duplicate-column errors are ignored cheaply.
+            # This is much simpler than maintaining per-column sentinel checks.
+            if _flights_table_exists(self.conn):
+                _migrate_add_flight_columns(self.conn)
+            for stmt in _SCHEMA_STATEMENTS:
+                self.conn.execute(stmt)
+            # Also run the flight-column migration after CREATE TABLE so brand-new
+            # databases pick up any columns that might have been added since the
+            # schema string was last written (cheap, idempotent).
             _migrate_add_flight_columns(self.conn)
-        for stmt in _SCHEMA_STATEMENTS:
-            self.conn.execute(stmt)
-        # Also run the flight-column migration after CREATE TABLE so brand-new
-        # databases pick up any columns that might have been added since the
-        # schema string was last written (cheap, idempotent).
-        _migrate_add_flight_columns(self.conn)
-        # Drop legacy columns that are strictly redundant with others.
-        _migrate_drop_callsign_count(self.conn)
-        # aircraft_registry / aircraft_stats column additions
-        _migrate_add_v4_columns(self.conn)
-        # Seed the curated military-hex allocations. Idempotent -- repeated
-        # init calls just upsert the same rows. Lazy import avoids a
-        # module-level cycle (mil_hex needs Database for TYPE_CHECKING).
-        from .mil_hex import seed_mil_hex_ranges
+            # Drop legacy columns/indexes that are strictly redundant with others.
+            _migrate_drop_callsign_count(self.conn)
+            _migrate_drop_legacy_indexes(self.conn)
+            # aircraft_registry / aircraft_stats column additions
+            _migrate_add_v4_columns(self.conn)
+            # Seed the curated military-hex allocations. Idempotent -- repeated
+            # init calls just upsert the same rows. Lazy import avoids a
+            # module-level cycle (mil_hex needs Database for TYPE_CHECKING).
+            from .mil_hex import seed_mil_hex_ranges
 
-        seed_mil_hex_ranges(self)
+            seed_mil_hex_ranges(self)
+            self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     def __enter__(self):
         return self
@@ -807,9 +880,15 @@ class Database:
             ),
         )
 
-    def get_trace_days(self, icao: str) -> list[sqlite3.Row]:
-        """Return ALL source rows -- parser merges them by date."""
-        return self.conn.execute("SELECT * FROM trace_days WHERE icao = ? ORDER BY date", (icao,)).fetchall()
+    def get_trace_days(self, icao: str) -> Iterator[sqlite3.Row]:
+        """Yield ALL source rows, ordered by date -- parser merges them by
+        date. A generator rather than a fetchall() list: a multi-year trace
+        history can be hundreds of MB, and single-row callers (e.g. cli.py's
+        status lookup) don't need the whole scan materialized just to peek
+        at the first row. Callers that need more than one pass over the
+        rows (parser.py) should wrap the result in list(...) themselves."""
+        cursor = self.conn.execute("SELECT * FROM trace_days WHERE icao = ? ORDER BY date", (icao,))
+        yield from cursor
 
     # -- fetch_log --
 
@@ -910,165 +989,7 @@ class Database:
                 f"landing_time {flight.landing_time.isoformat()} <= takeoff_time[/]"
             )
             return
-        self.conn.execute(
-            """INSERT OR REPLACE INTO flights
-               (icao, takeoff_time, takeoff_lat, takeoff_lon, takeoff_date,
-                landing_time, landing_lat, landing_lon, landing_date,
-                origin_icao, origin_name, origin_distance_km,
-                destination_icao, destination_name, destination_distance_km,
-                duration_minutes, callsign,
-                landing_type, takeoff_type, takeoff_confidence, landing_confidence,
-                data_points, sources, max_altitude,
-                ground_points_at_landing, ground_points_at_takeoff, baro_error_points,
-                last_seen_lat, last_seen_lon, last_seen_alt_ft, last_seen_time,
-                squawk_first, squawk_last, squawk_changes, emergency_squawk, vfr_flight,
-                mission_type, category_do260, autopilot_target_alt_ft, emergency_flag,
-                path_length_km, max_distance_km, loiter_ratio, path_efficiency,
-                max_hover_secs, hover_episodes, go_around_count,
-                takeoff_heading_deg, landing_heading_deg,
-                climb_secs, cruise_secs, descent_secs, level_secs,
-                cruise_alt_ft, cruise_gs_kt, cruise_detected, heavy_signal_gap,
-                peak_climb_fpm, peak_descent_fpm,
-                takeoff_is_night, landing_is_night, night_flight,
-                callsigns, callsign_changes,
-                probable_destination_icao, probable_destination_distance_km, probable_destination_confidence,
-                active_minutes, signal_gap_secs, signal_gap_count, fragments_stitched,
-                nearest_origin_icao, nearest_origin_distance_km,
-                nearest_destination_icao, nearest_destination_distance_km,
-                max_gs_kt, turnaround_minutes,
-                origin_helipad_id, destination_helipad_id,
-                type_override,
-                turnaround_category, is_first_observed_flight, is_last_observed_flight,
-                mlat_pct, tisb_pct, adsb_pct, other_pct, adsc_pct,
-                acars_out, acars_off, acars_on, acars_in, landing_anchor_method,
-                aligned_runway, aligned_seconds, aligned_min_offset_m, takeoff_runway,
-                had_go_around, pattern_cycles, squawks_observed, had_emergency, primary_squawk, navaid_track)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?,
-                       ?, ?, ?, ?,
-                       ?, ?, ?, ?,
-                       ?, ?,
-                       ?, ?, ?, ?,
-                       ?, ?, ?,
-                       ?, ?,
-                       ?, ?, ?,
-                       ?, ?,
-                       ?, ?, ?,
-                       ?, ?, ?, ?,
-                       ?, ?,
-                       ?, ?,
-                       ?, ?, ?, ?, ?,
-                       ?, ?, ?,
-                       ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                flight.icao,
-                flight.takeoff_time.isoformat(),
-                flight.takeoff_lat,
-                flight.takeoff_lon,
-                flight.takeoff_date,
-                flight.landing_time.isoformat() if flight.landing_time else None,
-                flight.landing_lat,
-                flight.landing_lon,
-                flight.landing_date,
-                flight.origin_icao,
-                flight.origin_name,
-                flight.origin_distance_km,
-                flight.destination_icao,
-                flight.destination_name,
-                flight.destination_distance_km,
-                flight.duration_minutes,
-                flight.callsign,
-                flight.landing_type,
-                flight.takeoff_type,
-                flight.takeoff_confidence,
-                flight.landing_confidence,
-                flight.data_points,
-                flight.sources,
-                flight.max_altitude,
-                flight.ground_points_at_landing,
-                flight.ground_points_at_takeoff,
-                flight.baro_error_points,
-                flight.last_seen_lat,
-                flight.last_seen_lon,
-                flight.last_seen_alt_ft,
-                flight.last_seen_time.isoformat() if flight.last_seen_time else None,
-                flight.squawk_first,
-                flight.squawk_last,
-                flight.squawk_changes,
-                flight.emergency_squawk,
-                flight.vfr_flight,
-                flight.mission_type,
-                flight.category_do260,
-                flight.autopilot_target_alt_ft,
-                flight.emergency_flag,
-                flight.path_length_km,
-                flight.max_distance_km,
-                flight.loiter_ratio,
-                flight.path_efficiency,
-                flight.max_hover_secs,
-                flight.hover_episodes,
-                flight.go_around_count,
-                flight.takeoff_heading_deg,
-                flight.landing_heading_deg,
-                flight.climb_secs,
-                flight.cruise_secs,
-                flight.descent_secs,
-                flight.level_secs,
-                flight.cruise_alt_ft,
-                flight.cruise_gs_kt,
-                flight.cruise_detected,
-                flight.heavy_signal_gap,
-                flight.peak_climb_fpm,
-                flight.peak_descent_fpm,
-                flight.takeoff_is_night,
-                flight.landing_is_night,
-                flight.night_flight,
-                flight.callsigns,
-                flight.callsign_changes,
-                flight.probable_destination_icao,
-                flight.probable_destination_distance_km,
-                flight.probable_destination_confidence,
-                flight.active_minutes,
-                flight.signal_gap_secs,
-                flight.signal_gap_count,
-                flight.fragments_stitched,
-                flight.nearest_origin_icao,
-                flight.nearest_origin_distance_km,
-                flight.nearest_destination_icao,
-                flight.nearest_destination_distance_km,
-                flight.max_gs_kt,
-                flight.turnaround_minutes,
-                flight.origin_helipad_id,
-                flight.destination_helipad_id,
-                flight.type_override,
-                flight.turnaround_category,
-                flight.is_first_observed_flight,
-                flight.is_last_observed_flight,
-                flight.mlat_pct,
-                flight.tisb_pct,
-                flight.adsb_pct,
-                flight.other_pct,
-                flight.adsc_pct,
-                flight.acars_out,
-                flight.acars_off,
-                flight.acars_on,
-                flight.acars_in,
-                flight.landing_anchor_method,
-                flight.aligned_runway,
-                flight.aligned_seconds,
-                flight.aligned_min_offset_m,
-                flight.takeoff_runway,
-                flight.had_go_around,
-                flight.pattern_cycles,
-                flight.squawks_observed,
-                flight.had_emergency,
-                flight.primary_squawk,
-                flight.navaid_track,
-            ),
-        )
+        self.conn.execute(_INSERT_FLIGHT_SQL, _flight_insert_params(flight))
 
     def get_flights(
         self, icao: str, from_date: str | None = None, to_date: str | None = None, airport: str | None = None
@@ -1340,8 +1261,9 @@ class Database:
         rows written.
 
         The five per-icao side queries below look like an N+1 antipattern but
-        are intentional: each targets a small indexed slice through
-        idx_flights_icao_time and runs in microseconds. Consolidating them
+        are intentional: each targets a small indexed slice through the
+        flights table's UNIQUE(icao, takeoff_time) autoindex and runs in
+        microseconds. Consolidating them
         into grouped/windowed queries (COUNT DISTINCT + GROUP BY icao,
         ROW_NUMBER OVER PARTITION BY icao) was benchmarked slower at every
         scale tested: 1.2 -> 1.5 ms (30 aircraft), 6.9 -> 9.2 ms (100),

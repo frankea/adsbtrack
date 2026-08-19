@@ -69,6 +69,99 @@ def test_context_manager_commits_on_success(db_path):
 
 
 # ---------------------------------------------------------------------------
+# PRAGMA user_version migration gating (Task 10, P8)
+# ---------------------------------------------------------------------------
+
+
+def test_open_stamps_user_version(db_path):
+    """A freshly created DB should be stamped to SCHEMA_VERSION on open."""
+    import sqlite3
+
+    from adsbtrack.db import SCHEMA_VERSION
+
+    Database(db_path).close()
+
+    raw = sqlite3.connect(db_path)
+    version = raw.execute("PRAGMA user_version").fetchone()[0]
+    raw.close()
+    assert version == SCHEMA_VERSION
+
+
+def test_reopen_skips_flight_column_migration_when_version_current(db_path, monkeypatch):
+    """A second open of an already-versioned DB must not re-run the ALTER
+    TABLE battery at all -- PRAGMA user_version short-circuits it."""
+    import adsbtrack.db as db_module
+
+    Database(db_path).close()  # first open: creates schema and stamps version
+
+    calls = []
+    original = db_module._migrate_add_flight_columns
+
+    def counting(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(db_module, "_migrate_add_flight_columns", counting)
+
+    Database(db_path).close()  # second open: version already current
+
+    assert calls == []
+
+
+def test_reopen_with_stale_version_migrates_and_restamps(db_path):
+    """A pre-versioned DB (user_version reset to 0, missing a column the
+    migration battery adds back) must still migrate on open and end up
+    stamped to SCHEMA_VERSION."""
+    import sqlite3
+
+    from adsbtrack.db import SCHEMA_VERSION
+
+    Database(db_path).close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("PRAGMA user_version = 0")
+    raw.execute("ALTER TABLE flights DROP COLUMN navaid_track")
+    raw.commit()
+    raw.close()
+
+    Database(db_path).close()
+
+    raw = sqlite3.connect(db_path)
+    version = raw.execute("PRAGMA user_version").fetchone()[0]
+    cols = {row[1] for row in raw.execute("PRAGMA table_info(flights)").fetchall()}
+    raw.close()
+    assert version == SCHEMA_VERSION
+    assert "navaid_track" in cols
+
+
+def test_open_drops_legacy_redundant_indexes(db_path):
+    """idx_flights_icao_time, idx_trace_days_icao_date, and
+    idx_spoofed_broadcasts_icao_time each exactly duplicate a UNIQUE-
+    constraint autoindex prefix; a stale DB carrying them must shed them
+    on the next open."""
+    import sqlite3
+
+    Database(db_path).close()
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("PRAGMA user_version = 0")
+    raw.execute("CREATE INDEX IF NOT EXISTS idx_flights_icao_time ON flights(icao, takeoff_time)")
+    raw.execute("CREATE INDEX IF NOT EXISTS idx_trace_days_icao_date ON trace_days(icao, date)")
+    raw.execute("CREATE INDEX IF NOT EXISTS idx_spoofed_broadcasts_icao_time ON spoofed_broadcasts(icao, takeoff_time)")
+    raw.commit()
+    raw.close()
+
+    Database(db_path).close()
+
+    raw = sqlite3.connect(db_path)
+    names = {row[0] for row in raw.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()}
+    raw.close()
+    assert "idx_flights_icao_time" not in names
+    assert "idx_trace_days_icao_date" not in names
+    assert "idx_spoofed_broadcasts_icao_time" not in names
+
+
+# ---------------------------------------------------------------------------
 # trace_days
 # ---------------------------------------------------------------------------
 
@@ -86,7 +179,7 @@ def test_insert_and_get_trace_days(db):
     db.insert_trace_day("abc123", "2024-01-15", data, source="adsbx")
     db.commit()
 
-    rows = db.get_trace_days("abc123")
+    rows = list(db.get_trace_days("abc123"))
     assert len(rows) == 1
     row = rows[0]
     assert row["icao"] == "abc123"
@@ -112,7 +205,7 @@ def test_insert_trace_day_upsert(db):
     db.insert_trace_day("abc123", "2024-01-15", data2)
     db.commit()
 
-    rows = db.get_trace_days("abc123")
+    rows = list(db.get_trace_days("abc123"))
     assert len(rows) == 1
     trace = json.loads(rows[0]["trace_json"])
     assert trace[0][1] == 41.0  # Should be the updated data
@@ -132,14 +225,14 @@ def test_multiple_sources_same_date(db):
     db.insert_trace_day("abc123", "2024-01-15", data_adsbfi, source="adsbfi")
     db.commit()
 
-    rows = db.get_trace_days("abc123")
+    rows = list(db.get_trace_days("abc123"))
     assert len(rows) == 2
     sources = {row["source"] for row in rows}
     assert sources == {"adsbx", "adsbfi"}
 
 
 def test_get_trace_days_empty(db):
-    rows = db.get_trace_days("nonexistent")
+    rows = list(db.get_trace_days("nonexistent"))
     assert rows == []
 
 
@@ -150,9 +243,28 @@ def test_get_trace_days_ordered_by_date(db):
         db.insert_trace_day("abc123", date_str, data)
     db.commit()
 
-    rows = db.get_trace_days("abc123")
+    rows = list(db.get_trace_days("abc123"))
     dates = [row["date"] for row in rows]
     assert dates == ["2024-01-10", "2024-01-15", "2024-01-20"]
+
+
+def test_get_trace_days_returns_an_iterator(db):
+    """get_trace_days must be a generator (P7) -- fetchall() on a
+    potentially hundreds-of-MB trace_days scan is the thing being fixed --
+    while still yielding rows in the same date order and content a list
+    would have."""
+    for date_str, lat in [("2024-01-20", 41.0), ("2024-01-10", 40.0)]:
+        data = {"timestamp": 1700000000.0, "trace": [[0, lat, -74.0, 5000, 200, None, None, None, {}]]}
+        db.insert_trace_day("abc123", date_str, data)
+    db.commit()
+
+    result = db.get_trace_days("abc123")
+    assert not isinstance(result, list)
+    assert hasattr(result, "__next__"), "get_trace_days should return a generator/iterator, not a list"
+
+    rows = list(result)
+    assert [row["date"] for row in rows] == ["2024-01-10", "2024-01-20"]
+    assert [json.loads(row["trace_json"])[0][1] for row in rows] == [40.0, 41.0]
 
 
 # ---------------------------------------------------------------------------
@@ -227,6 +339,54 @@ def test_fetched_dates_includes_retried_then_succeeded_day(db):
 # ---------------------------------------------------------------------------
 # flights
 # ---------------------------------------------------------------------------
+
+
+def test_insert_flight_round_trips_every_field(db):
+    """D4 safety net: insert_flight's SQL is now generated from
+    dataclasses.fields(Flight) instead of a hand-maintained column list.
+    Populate every single field with a distinguishable value and verify
+    each one survives the round trip -- a field silently dropped from the
+    generated INSERT would only be caught here, since the hand-picked
+    fixtures elsewhere in this file only cover a handful of columns."""
+    import dataclasses
+    import typing
+
+    hints = typing.get_type_hints(Flight)
+    values: dict = {
+        "takeoff_time": datetime(2026, 5, 1, 8, 0, 0, tzinfo=UTC),
+        "landing_time": datetime(2026, 5, 1, 9, 30, 0, tzinfo=UTC),
+        "last_seen_time": datetime(2026, 5, 1, 9, 29, 0, tzinfo=UTC),
+    }
+    counter = 0
+    for f in dataclasses.fields(Flight):
+        if f.name in values:
+            continue
+        hint = hints[f.name]
+        if hint in (str, str | None):
+            values[f.name] = f"val_{f.name}"
+        elif hint in (int, int | None):
+            counter += 1
+            values[f.name] = counter
+        elif hint in (float, float | None):
+            counter += 1
+            values[f.name] = counter + 0.5
+        else:
+            raise AssertionError(f"unhandled Flight field type for {f.name!r}: {hint!r}")
+    values["icao"] = "full001"
+
+    flight = Flight(**values)
+    db.insert_flight(flight)
+    db.commit()
+
+    row = db.conn.execute("SELECT * FROM flights WHERE icao = ?", ("full001",)).fetchone()
+    assert row is not None
+    for f in dataclasses.fields(Flight):
+        expected = getattr(flight, f.name)
+        actual = row[f.name]
+        if isinstance(expected, datetime):
+            assert actual == expected.isoformat(), f.name
+        else:
+            assert actual == expected, f.name
 
 
 def test_insert_and_get_flights(db):
@@ -1628,10 +1788,14 @@ def test_drop_callsign_count_migration_removes_column_preserves_data(tmp_path):
             callsign_changes=2,
         )
         db.insert_flight(f)
-    # Re-inject the callsign_count column directly to simulate legacy state.
+    # Re-inject the callsign_count column directly to simulate legacy state,
+    # and reset PRAGMA user_version to 0 -- a genuinely pre-migration DB was
+    # never stamped by this code, so the version gate (Task 10, P8) must see
+    # a mismatch here to actually run the drop migration on next open.
     raw = sqlite3.connect(db_path)
     raw.execute("ALTER TABLE flights ADD COLUMN callsign_count INTEGER")
     raw.execute("UPDATE flights SET callsign_count = 2 WHERE icao = 'leg001'")
+    raw.execute("PRAGMA user_version = 0")
     raw.commit()
     raw.close()
 

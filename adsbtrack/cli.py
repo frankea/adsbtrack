@@ -803,10 +803,11 @@ def status(hex_code, tail_number, output_json, db_path):
         if not output_json:
             console.print(f"\n[bold]Status for {hex_code}[/]\n")
 
-        # Get aircraft info from first trace day
-        trace_days = db.get_trace_days(hex_code)
-        if trace_days:
-            td = trace_days[0]
+        # Get aircraft info from first trace day. get_trace_days is a
+        # generator (P7); next() pulls just the first row without pulling
+        # the whole (possibly multi-year) trace history into memory.
+        td = next(db.get_trace_days(hex_code), None)
+        if td:
             payload["registration"] = td["registration"]
             payload["type"] = td["description"]
             payload["owner"] = td["owner_operator"]

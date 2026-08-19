@@ -1,6 +1,6 @@
 # Database schema
 
-All data is stored in a local SQLite database (`adsbtrack.db`). WAL mode is enabled so multiple fetch/extract sessions can run concurrently from different terminals. Schema migrations run automatically on open.
+All data is stored in a local SQLite database (`adsbtrack.db`). WAL mode is enabled so multiple fetch/extract sessions can run concurrently from different terminals. Schema migrations run automatically on open, gated behind `PRAGMA user_version`: `Database.__init__` compares the DB's stored version against `db.SCHEMA_VERSION` and skips the whole ALTER TABLE / DROP INDEX / mil-hex-reseed migration battery when they already match, restamping to `SCHEMA_VERSION` whenever it runs them. Every schema-changing edit (a new column, a dropped column, a dropped index) must bump `SCHEMA_VERSION` or existing databases will never see the change.
 
 ## trace_days
 

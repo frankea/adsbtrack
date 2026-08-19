@@ -565,7 +565,10 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     if reprocess:
         db.clear_flights(hex_code)
 
-    trace_days = db.get_trace_days(hex_code)
+    # get_trace_days is a generator (P7); materialize it here since this
+    # function makes multiple passes over trace_days below (registry
+    # upsert, type_code/owner_operator fallback scans, iter_parsed_trace_days).
+    trace_days = list(db.get_trace_days(hex_code))
     if not trace_days:
         return 0
 
@@ -576,7 +579,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     type_code: str | None = None
     owner_operator: str | None = None
     try:
-        registry_row = db.upsert_aircraft_registry(hex_code, list(trace_days))
+        registry_row = db.upsert_aircraft_registry(hex_code, trace_days)
     except Exception:
         registry_row = None
     if isinstance(registry_row, dict):

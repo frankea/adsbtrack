@@ -227,7 +227,9 @@ def detect_gaps(
     """
     cfg = config or Config()
     max_within_flight_gap_secs = cfg.max_point_gap_minutes * 60.0
-    rows = db.get_trace_days(icao)
+    # get_trace_days is a generator (P7); materialize it so the empty-check
+    # below is meaningful (a generator object is always truthy).
+    rows = list(db.get_trace_days(icao))
     if not rows:
         return []
 

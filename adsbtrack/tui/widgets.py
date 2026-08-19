@@ -428,14 +428,19 @@ class Sidebar(Label):
 # ---------------------------------------------------------------------------
 
 
+# Every key here must match a real binding. "/" runs action_focus_filter
+# (not a "search" action), "f" runs goto('ops') (not "filter" -- that was
+# the actual bug report), and there is no "j"/"k"/"e"/"m" binding
+# anywhere in the app; "move" reflects DataTable's real up/down cursor
+# bindings and the events/map shortcuts are the real "3"/"5" view keys.
 _ACTION_HINTS: list[tuple[str, str]] = [
-    ("/", "search"),
-    ("f", "filter"),
+    ("/", "filter"),
+    ("f", "ops"),
     (":", "jump"),
-    ("j/k", "move"),
+    ("up/down", "move"),
     ("enter", "open"),
-    ("e", "events"),
-    ("m", "map"),
+    ("3", "events"),
+    ("5", "map"),
     ("?", "help"),
     ("q", "quit"),
 ]

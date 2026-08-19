@@ -115,6 +115,35 @@ class JumpToHex(ModalScreen[str | None]):
             self._results.move_cursor(row=0)
 
 
+# Keyboard-shortcut hints shown in the help overlay. Every key here must
+# match a real binding: row 0 is app.py's filter/movement/select keys
+# (movement + select are DataTable's own built-in bindings, not app-level
+# ones -- there is no "j"/"k"/"g g"/"G" binding anywhere in this app), row
+# 1 is app-level chrome, row 2 is the view-switch bindings from
+# AdsbtrackApp.BINDINGS. Kept as a module constant (not inline in
+# compose()) so tests can cross-check it against the real bindings.
+_HELP_ROWS: list[list[tuple[str, str]]] = [
+    [
+        ("/", "filter"),
+        ("up", "cursor up"),
+        ("down", "cursor down"),
+        ("enter", "select"),
+        ("ctrl+home", "top"),
+        ("ctrl+end", "bottom"),
+    ],
+    [(":", "jump to hex"), ("esc", "back"), ("?", "help"), ("q", "quit")],
+    [
+        ("1", "aircraft"),
+        ("2", "flights"),
+        ("3", "events"),
+        ("4", "spoof"),
+        ("5", "map"),
+        ("6", "status"),
+        ("f", "ops"),
+    ],
+]
+
+
 class HelpScreen(ModalScreen[None]):
     """Modal listing keyboard shortcuts, matching design/components-kbd.html."""
 
@@ -130,21 +159,8 @@ class HelpScreen(ModalScreen[None]):
     """
 
     def compose(self) -> ComposeResult:
-        rows = [
-            [("/", "search"), ("f", "filter"), ("j", "next"), ("k", "prev"), ("g g", "top"), ("G", "bottom")],
-            [(":", "jump to hex"), ("esc", "back"), ("?", "help"), ("q", "quit")],
-            [
-                ("1", "aircraft"),
-                ("2", "flights"),
-                ("3", "events"),
-                ("4", "spoof"),
-                ("5", "map"),
-                ("6", "status"),
-                ("f", "ops"),
-            ],
-        ]
         lines: list[str] = [f"[b {FG_0}]Keyboard shortcuts[/]", ""]
-        for row in rows:
+        for row in _HELP_ROWS:
             cells = []
             for key, label in row:
                 cells.append(f"[{FG_2} on #0b0f14] {key} [/] [{FG_1}]{label}[/]")

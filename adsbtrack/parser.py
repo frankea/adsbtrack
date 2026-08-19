@@ -24,6 +24,14 @@ from .landing_anchor import compute_landing_anchor
 from .models import Flight, LandingType
 from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
 
+# Stamped on every Flight produced by extract_flights (see the three
+# Flight(...) construction sites below). Bump this on any behavior change
+# to extraction or derivation -- a new heuristic, a threshold change with
+# algorithmic effect, a new derived field -- so rows can be told apart by
+# which revision produced them. Legacy rows written before this column
+# existed stay NULL.
+EXTRACTOR_VERSION = 1
+
 
 def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> PointData:
     """Parse a readsb trace point into a PointData dataclass.
@@ -743,6 +751,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                         takeoff_lon=lon,
                         takeoff_date=day_date,
                         callsign=current_callsign,
+                        extractor_version=EXTRACTOR_VERSION,
                     )
                     pending_metrics = FlightMetrics(sources=set(all_sources))
                     pending_metrics.takeoff_type = "found_mid_flight"
@@ -774,6 +783,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                         takeoff_lon=to_lon,
                         takeoff_date=to_date,
                         callsign=current_callsign,
+                        extractor_version=EXTRACTOR_VERSION,
                     )
                     pending_metrics = FlightMetrics(sources=set(all_sources))
                     pending_metrics.takeoff_type = "observed"
@@ -853,6 +863,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                         takeoff_lon=to_lon,
                         takeoff_date=to_date,
                         callsign=current_callsign,
+                        extractor_version=EXTRACTOR_VERSION,
                     )
                     pending_metrics = FlightMetrics(sources=set(all_sources))
                     pending_metrics.takeoff_type = "observed"

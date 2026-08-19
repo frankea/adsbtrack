@@ -1997,6 +1997,97 @@ def test_drop_callsign_count_migration_removes_column_preserves_data(tmp_path):
         assert row["callsign_changes"] == 2
 
 
+# ---------------------------------------------------------------------------
+# extractor_version column (Task 13)
+# ---------------------------------------------------------------------------
+
+
+def test_flights_extractor_version_column(tmp_path):
+    from adsbtrack.db import Database
+
+    with Database(tmp_path / "ev.db") as db:
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert "extractor_version" in cols
+
+
+def test_reopen_migrates_legacy_flight_missing_extractor_version(db_path):
+    """A flights row written before extractor_version existed must survive
+    the ALTER TABLE ADD COLUMN migration with NULL in that column -- only
+    flights written by extract_flights after this shipped carry a real
+    value (see test_parser.py's test_extracted_flight_carries_extractor_version)."""
+    import sqlite3
+
+    from adsbtrack.db import SCHEMA_VERSION
+
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="leg002",
+                takeoff_time=datetime(2026, 3, 27, 12, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-80.0,
+                takeoff_date="2026-03-27",
+            )
+        )
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("ALTER TABLE flights DROP COLUMN extractor_version")
+    raw.execute("PRAGMA user_version = 0")
+    raw.commit()
+    raw.close()
+
+    with Database(db_path) as db:
+        cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+        assert "extractor_version" in cols
+        row = db.conn.execute("SELECT extractor_version FROM flights WHERE icao = ?", ("leg002",)).fetchone()
+        assert row["extractor_version"] is None
+
+    raw = sqlite3.connect(db_path)
+    version = raw.execute("PRAGMA user_version").fetchone()[0]
+    raw.close()
+    assert version == SCHEMA_VERSION
+
+
+def test_reopen_migrates_trace_days_missing_v2_stat_columns(db_path):
+    """A trace_days table literally lacking the four v2_* stat columns
+    (the schema state before v2 -- PRAGMA user_version = 1 -- introduced
+    _migrate_add_trace_day_stat_columns) must, on reopen via Database,
+    gain the columns, get restamped to SCHEMA_VERSION, and leave the
+    pre-existing row's stats NULL -- only `db optimize` backfills them."""
+    import sqlite3
+
+    from adsbtrack.db import SCHEMA_VERSION
+
+    trace = [_v2_point(sil=0, nic=0, flight="EK01")]
+    with Database(db_path) as db:
+        db.insert_trace_day("abc123", "2024-02-01", {"timestamp": 1700000000.0, "trace": trace})
+        db.commit()
+
+    raw = sqlite3.connect(db_path)
+    for col in ("v2_samples", "v2_sil0", "v2_nic0", "v2_callsigns"):
+        raw.execute(f"ALTER TABLE trace_days DROP COLUMN {col}")
+    raw.execute("PRAGMA user_version = 1")
+    raw.commit()
+    raw.close()
+
+    with Database(db_path) as db:
+        cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(trace_days)").fetchall()}
+        assert {"v2_samples", "v2_sil0", "v2_nic0", "v2_callsigns"} <= cols
+        row = db.conn.execute(
+            "SELECT v2_samples, v2_sil0, v2_nic0, v2_callsigns FROM trace_days WHERE icao = ?",
+            ("abc123",),
+        ).fetchone()
+        assert row["v2_samples"] is None
+        assert row["v2_sil0"] is None
+        assert row["v2_nic0"] is None
+        assert row["v2_callsigns"] is None
+
+    raw = sqlite3.connect(db_path)
+    version = raw.execute("PRAGMA user_version").fetchone()[0]
+    raw.close()
+    assert version == SCHEMA_VERSION
+
+
 def test_flight_insert_round_trip_without_callsign_count(tmp_path):
     """After the refactor, Flight has no callsign_count attribute and the
     insert / select code path must not reference the column. This test

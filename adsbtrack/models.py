@@ -260,6 +260,13 @@ class Flight:
     # before navaid alignment existed.
     navaid_track: str | None = None
 
+    # extractor_version: the adsbtrack.parser.EXTRACTOR_VERSION that
+    # produced this row. Bumped whenever extraction/derivation behavior
+    # changes, so rows from different algorithm revisions can be told
+    # apart without re-extracting everything. NULL for rows written
+    # before this column existed.
+    extractor_version: int | None = None
+
 
 @dataclass
 class AirportMatch:

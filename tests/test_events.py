@@ -411,6 +411,53 @@ def test_spoof_detector_stats_path_matches_parse_path(tmp_path):
     assert stats_spoof == parse_spoof
 
 
+def test_pool_spoof_scores_stats_and_parse_paths_agree_with_mixed_source_rates(tmp_path):
+    """Two sources on the same date with different sil0 rates (33% vs 75%)
+    must pool to field-identical output whether computed via the
+    materialized stat columns (_pool_spoof_scores_from_stats) or by
+    decoding trace_json (pool_spoof_scores) -- v2_samples, sil/nic
+    percentages, sources, source_rates ordering, timestamp, and callsigns
+    all match. Guards against the two pooling routes drifting apart on a
+    multi-aggregator, non-uniform-rate day (test_spoof_detector_stats_path_
+    matches_parse_path only exercises a single source)."""
+    from adsbtrack.db import iter_parsed_trace_days
+    from adsbtrack.events import _pool_spoof_scores_from_stats
+    from adsbtrack.parser import pool_spoof_scores
+
+    db_path = tmp_path / "multi_source.db"
+    icao = "89618d"
+    date = "2026-04-21"
+    # adsbx: 20 clean + 10 garbage = 30 v2, sil0 rate 33.33%
+    source_adsbx = [_make_sample(2, 8, 3) for _ in range(20)] + [_make_sample(2, 0, 0) for _ in range(10)]
+    # adsbfi: 5 clean + 15 garbage = 20 v2, sil0 rate 75%
+    source_adsbfi = [_make_sample(2, 8, 3) for _ in range(5)] + [_make_sample(2, 0, 0) for _ in range(15)]
+
+    config = Config()
+    with Database(db_path) as db:
+        db.insert_trace_day(icao, date, {"timestamp": 1776600000.0, "trace": source_adsbx}, source="adsbx")
+        db.insert_trace_day(icao, date, {"timestamp": 1776600100.0, "trace": source_adsbfi}, source="adsbfi")
+        db.commit()
+
+        stats_result = _pool_spoof_scores_from_stats(db, [icao], None, config)
+
+        rows = db.conn.execute(
+            "SELECT date, source, trace_json, timestamp FROM trace_days WHERE icao = ? ORDER BY date, source",
+            (icao,),
+        ).fetchall()
+        parse_result = pool_spoof_scores(iter_parsed_trace_days(rows, icao), config)
+
+    stats_agg = stats_result[(icao, date)]
+    parse_agg = parse_result[date]
+
+    assert stats_agg["v2_samples"] == parse_agg["v2_samples"] == 50
+    assert stats_agg["v2_sil0_pct"] == pytest.approx(parse_agg["v2_sil0_pct"])
+    assert stats_agg["v2_nic0_pct"] == pytest.approx(parse_agg["v2_nic0_pct"])
+    assert stats_agg["sources"] == parse_agg["sources"] == ["adsbfi", "adsbx"]
+    assert stats_agg["source_rates"] == parse_agg["source_rates"]
+    assert stats_agg["timestamp"] == parse_agg["timestamp"]
+    assert stats_agg["callsigns"] == parse_agg["callsigns"] == ["EK01"]
+
+
 def test_spoof_detector_mixed_null_rows_falls_back_for_correctness(tmp_path):
     """If ANY trace_days row for the aircraft is missing the materialized
     stat columns (e.g. one date optimized, one still legacy), the whole

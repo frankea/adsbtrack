@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS flights (
     had_emergency INTEGER,
     primary_squawk TEXT,
     navaid_track TEXT,
+    extractor_version INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -467,7 +468,8 @@ _SCHEMA_STATEMENTS = [stmt.strip() for stmt in SCHEMA.split(";") if stmt.strip()
 #
 # v2: added trace_days.v2_samples / v2_sil0 / v2_nic0 / v2_callsigns
 # (Task 12 materialized integrity stats; see _migrate_add_trace_day_stat_columns).
-SCHEMA_VERSION = 2
+# v3: added flights.extractor_version (Task 13; see _migrate_add_flight_columns).
+SCHEMA_VERSION = 3
 
 
 def _needs_source_migration(conn: sqlite3.Connection) -> bool:
@@ -657,6 +659,10 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         ("had_emergency", "INTEGER"),
         ("primary_squawk", "TEXT"),
         ("navaid_track", "TEXT"),
+        # extractor_version: adsbtrack.parser.EXTRACTOR_VERSION that produced
+        # this row (Task 13). NULL for rows written before this column
+        # existed.
+        ("extractor_version", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.

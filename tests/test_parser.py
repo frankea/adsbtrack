@@ -137,6 +137,36 @@ def test_basic_takeoff_and_landing():
     assert flight.landing_lat is not None
 
 
+def test_extracted_flight_carries_extractor_version():
+    """Every flight produced by extract_flights must carry the current
+    EXTRACTOR_VERSION so rows can be told apart from ones written under an
+    older extraction revision (legacy rows predating this column stay
+    NULL; see test_db.py's migration round-trip test)."""
+    from adsbtrack.parser import EXTRACTOR_VERSION
+
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.0, -74.0, "ground", gs=5),
+        _make_trace_point(120, 40.001, -74.0, 1000, gs=120),
+        _make_trace_point(600, 40.5, -74.5, 5000, gs=200),
+        _make_trace_point(3600, 41.0, -75.0, 5000, gs=200),
+        _make_trace_point(7200, 41.5, -75.5, "ground", gs=10),
+    ]
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1
+    flight = db.insert_flight.call_args[0][0]
+    assert flight.extractor_version == EXTRACTOR_VERSION == 1
+
+
 def test_airborne_at_start():
     """If first point is airborne, a flight should start from there."""
     config = _make_config()

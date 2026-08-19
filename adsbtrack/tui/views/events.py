@@ -177,7 +177,7 @@ class EventsView(Vertical):
                     )
                 )
             )
-            self._apply_filter("")
+            self._apply_filter(self._filter.input_widget.value)
             self.loading = False
         elif event.state == WorkerState.ERROR:
             self.loading = False

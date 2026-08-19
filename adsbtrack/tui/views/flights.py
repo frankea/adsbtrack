@@ -227,7 +227,7 @@ class FlightsView(Vertical):
             self._header.set_title(result.icao)
             self._header.set_crumb(result.reg_desc)
             self._header.set_trailing(f"{len(self._rows):,} flights {DOT} {total_hours:,.1f} hrs")
-            self._apply_filter("")
+            self._apply_filter(self._filter.input_widget.value)
             self.loading = False
         elif event.state == WorkerState.ERROR:
             self.loading = False

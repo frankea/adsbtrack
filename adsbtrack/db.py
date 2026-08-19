@@ -5,7 +5,7 @@ import shutil
 import sqlite3
 import zlib
 from collections.abc import Callable, Iterable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from .config import RETRYABLE_FETCH_STATUS_FLOOR, RETRYABLE_FETCH_STATUSES
@@ -1051,15 +1051,67 @@ class Database:
             ),
         )
 
-    def get_trace_days(self, icao: str) -> Iterator[sqlite3.Row]:
+    def get_trace_days(self, icao: str, since: str | None = None) -> Iterator[sqlite3.Row]:
         """Yield ALL source rows, ordered by date -- parser merges them by
         date. A generator rather than a fetchall() list: a multi-year trace
         history can be hundreds of MB, and single-row callers (e.g. cli.py's
         status lookup) don't need the whole scan materialized just to peek
         at the first row. Callers that need more than one pass over the
-        rows (parser.py) should wrap the result in list(...) themselves."""
-        cursor = self.conn.execute("SELECT * FROM trace_days WHERE icao = ? ORDER BY date", (icao,))
+        rows (parser.py) should wrap the result in list(...) themselves.
+
+        ``since`` (YYYY-MM-DD) narrows the scan to that date onward, which is
+        how an incremental extract avoids decompressing history it is not
+        going to re-process.
+        """
+        if since is None:
+            cursor = self.conn.execute("SELECT * FROM trace_days WHERE icao = ? ORDER BY date", (icao,))
+        else:
+            cursor = self.conn.execute(
+                "SELECT * FROM trace_days WHERE icao = ? AND date >= ? ORDER BY date",
+                (icao, since),
+            )
         yield from cursor
+
+    def get_trace_day_metadata(self, icao: str) -> list[sqlite3.Row]:
+        """Every trace_days row for an ICAO with the trace_json blob left
+        behind, ordered by date.
+
+        The registry resolution in parser._resolve_registry_metadata votes
+        over the aircraft's whole history and must not see a narrowed window,
+        but it only reads the metadata columns. Selecting those alone lets an
+        incremental extract keep the full-history vote at a fraction of the
+        memory a SELECT * would pull in.
+        """
+        return self.conn.execute(
+            """SELECT icao, date, source, registration, type_code, description,
+                      owner_operator, year, timestamp, point_count, fetched_at
+               FROM trace_days WHERE icao = ? ORDER BY date""",
+            (icao,),
+        ).fetchall()
+
+    def get_trace_day(self, icao: str, day: str) -> list[sqlite3.Row]:
+        """Every source's row for one date. Same shape and order as the
+        matching slice of get_trace_days, so a caller that wants a single
+        day (parser._carried_callsign walking backwards) sees exactly what
+        the full-history scan would have handed it for that day."""
+        return self.conn.execute(
+            "SELECT * FROM trace_days WHERE icao = ? AND date = ?",
+            (icao, day),
+        ).fetchall()
+
+    def get_earliest_trace_date_since(self, icao: str, fetched_since: str) -> str | None:
+        """Earliest trace day this ICAO gained (or had replaced) since the ISO
+        timestamp ``fetched_since``. Returns None when the run stored nothing.
+
+        This is how `fetch` tells the extractor where its new data starts:
+        it covers days added under any source, including a second source
+        filling in a date another source already had.
+        """
+        row = self.conn.execute(
+            "SELECT MIN(date) AS earliest FROM trace_days WHERE icao = ? AND fetched_at >= ?",
+            (icao, fetched_since),
+        ).fetchone()
+        return row["earliest"] if row else None
 
     # -- fetch_log --
 
@@ -1097,6 +1149,71 @@ class Database:
         # Clear rejections too so a reprocess-with-updated-rules doesn't
         # leave stale entries from the previous gate configuration.
         self.conn.execute("DELETE FROM spoofed_broadcasts WHERE icao = ?", (icao,))
+
+    def clear_flights_since(self, icao: str, boundary_date: date | str) -> None:
+        """Delete this ICAO's flights and spoof rejections from
+        ``boundary_date`` (YYYY-MM-DD) onward, leaving earlier rows alone.
+
+        The partial-history counterpart of clear_flights: an incremental
+        extract re-processes the trace days at and after the boundary, so
+        everything those days previously produced has to go first. Both
+        tables are cleared for the same reason clear_flights clears both --
+        a rejection and a flight are two possible outcomes of one fragment,
+        and re-extraction decides again which one it is.
+        """
+        boundary = boundary_date.isoformat() if isinstance(boundary_date, date) else boundary_date
+        self.conn.execute("DELETE FROM flights WHERE icao = ? AND takeoff_date >= ?", (icao, boundary))
+        self.conn.execute("DELETE FROM spoofed_broadcasts WHERE icao = ? AND takeoff_date >= ?", (icao, boundary))
+
+    def count_stale_extractor_flights(self, icao: str, extractor_version: int) -> int:
+        """How many of this ICAO's flights were written by a different
+        extractor generation (legacy rows predating the column count as
+        different). Incremental extraction refuses when this is non-zero:
+        extending a history with a newer algorithm would leave one aircraft
+        holding rows that no single extractor would ever produce together."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM flights WHERE icao = ? AND extractor_version IS NOT ?",
+            (icao, extractor_version),
+        ).fetchone()
+        return row["cnt"]
+
+    def get_last_flight_end_before(self, icao: str, boundary_date: str) -> str | None:
+        """When this ICAO's last flight before ``boundary_date`` stopped being
+        observed -- its landing_time, or its last_seen_time when it never
+        landed. None when no earlier flight exists.
+
+        An incremental extract restarts the turnaround chain from here, so
+        the first flight it writes gets the same turnaround_minutes and
+        is_first_observed_flight a full reprocess would have given it.
+        """
+        row = self.conn.execute(
+            """SELECT landing_time, last_seen_time FROM flights
+               WHERE icao = ? AND takeoff_date < ?
+               ORDER BY takeoff_time DESC LIMIT 1""",
+            (icao, boundary_date),
+        ).fetchone()
+        if row is None:
+            return None
+        return row["landing_time"] or row["last_seen_time"]
+
+    def refresh_last_observed_flag(self, icao: str) -> None:
+        """Leave is_last_observed_flight set on exactly this ICAO's newest
+        flight and cleared everywhere else.
+
+        A full extract can just flag the last row it writes. An incremental
+        one cannot: the row that held the flag may sit before the boundary
+        and survive the rebuild, and a window that yields no flights still
+        has to hand the flag back to whatever is now newest.
+        """
+        self.conn.execute(
+            "UPDATE flights SET is_last_observed_flight = 0 WHERE icao = ? AND is_last_observed_flight != 0",
+            (icao,),
+        )
+        self.conn.execute(
+            """UPDATE flights SET is_last_observed_flight = 1
+               WHERE id = (SELECT id FROM flights WHERE icao = ? ORDER BY takeoff_time DESC LIMIT 1)""",
+            (icao,),
+        )
 
     def insert_spoofed_broadcast(
         self,

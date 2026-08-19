@@ -677,6 +677,71 @@ def test_clear_flights(db):
     assert rows == []
 
 
+def _seed_flight_and_rejection(db, day: str, hour: int) -> None:
+    """One flight plus one spoof rejection on the same day."""
+    takeoff = datetime(2024, 6, int(day[-2:]), hour, 0, 0, tzinfo=UTC)
+    db.insert_flight(
+        Flight(
+            icao="abc123",
+            takeoff_time=takeoff,
+            takeoff_lat=40.0,
+            takeoff_lon=-74.0,
+            takeoff_date=day,
+        )
+    )
+    db.insert_spoofed_broadcast(
+        icao="abc123",
+        takeoff_time=takeoff.isoformat(),
+        landing_time=None,
+        takeoff_date=day,
+        callsign="EK123",
+        takeoff_lat=40.0,
+        takeoff_lon=-74.0,
+        landing_lat=None,
+        landing_lon=None,
+        max_altitude=1000,
+        data_points=10,
+        sources="adsbx",
+        origin_icao=None,
+        destination_icao=None,
+        reason="crude_heuristic",
+        reason_detail=None,
+    )
+
+
+def test_clear_flights_since_clears_both_tables_from_the_boundary(db):
+    """Incremental extraction rebuilds the flights and the rejections for the
+    window it re-processes, so both tables have to be cleared together."""
+    _seed_flight_and_rejection(db, "2024-06-14", 10)
+    _seed_flight_and_rejection(db, "2024-06-15", 11)
+    _seed_flight_and_rejection(db, "2024-06-16", 12)
+    db.commit()
+
+    db.clear_flights_since("abc123", "2024-06-15")
+    db.commit()
+
+    assert [row["takeoff_date"] for row in db.get_flights("abc123")] == ["2024-06-14"]
+    rejections = db.conn.execute(
+        "SELECT takeoff_date FROM spoofed_broadcasts WHERE icao = ? ORDER BY takeoff_date",
+        ("abc123",),
+    ).fetchall()
+    assert [row["takeoff_date"] for row in rejections] == ["2024-06-14"]
+
+
+def test_clear_flights_since_accepts_a_date_object(db):
+    """Callers hold a date, not a string; sqlite cannot bind one directly."""
+    from datetime import date
+
+    _seed_flight_and_rejection(db, "2024-06-14", 10)
+    _seed_flight_and_rejection(db, "2024-06-16", 12)
+    db.commit()
+
+    db.clear_flights_since("abc123", date(2024, 6, 16))
+    db.commit()
+
+    assert [row["takeoff_date"] for row in db.get_flights("abc123")] == ["2024-06-14"]
+
+
 def test_insert_flight_upsert(db):
     """Inserting a flight with the same icao+takeoff_time should replace."""
     flight1 = Flight(

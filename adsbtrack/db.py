@@ -3,6 +3,7 @@ import dataclasses
 import json
 import shutil
 import sqlite3
+import zlib
 from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -720,19 +721,31 @@ def _migrate_drop_legacy_indexes(conn: sqlite3.Connection) -> None:
 # trace_days rows and previously each ran its own json.loads over
 # row["trace_json"]; some call sites even parsed the same row twice within
 # one extract. Routing every caller through iter_parsed_trace_days means
-# each row's JSON is decoded exactly once per scan, and a future compressed
-# trace-storage format only has to change decode_trace_json.
+# each row's JSON is decoded exactly once per scan, and the compressed
+# trace-storage format added in Task 11 only had to change decode_trace_json.
+#
+# trace_json is a zlib-compressed BLOB for rows written by this version of
+# insert_trace_day, and raw JSON TEXT for every row written before Task 11
+# shipped. Rows are never migrated in place -- decode_trace_json sniffs the
+# stored form on every read so old rows keep working forever (a future
+# "db optimize" batch job rewrites them to the compressed form).
 
 
-def decode_trace_json(raw_trace_json: str) -> list | None:
+def decode_trace_json(raw_trace_json: bytes | str) -> list | None:
     """Decode a trace_days.trace_json value into its point list.
 
-    Returns None (instead of raising) for malformed JSON or a payload that
-    isn't a list, so callers can skip a bad row rather than crash on it.
+    Sniffs the stored form: bytes starting with the zlib header byte
+    (0x78) are decompressed first; bytes starting with '[' or '{' are raw
+    JSON stored as a BLOB; anything else (str) is legacy raw JSON TEXT.
+    Returns None (instead of raising) for malformed/undecodable input or a
+    payload that isn't a list, so callers can skip a bad row rather than
+    crash on it.
     """
     try:
+        if isinstance(raw_trace_json, bytes) and raw_trace_json[:1] == b"\x78":
+            raw_trace_json = zlib.decompress(raw_trace_json)
         parsed = json.loads(raw_trace_json)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, zlib.error):
         return None
     return parsed if isinstance(parsed, list) else None
 
@@ -874,7 +887,7 @@ class Database:
                 data.get("ownOp"),
                 data.get("year"),
                 data["timestamp"],
-                json.dumps(data["trace"]),
+                zlib.compress(json.dumps(data["trace"]).encode(), 6),
                 len(data["trace"]),
                 datetime.now(UTC).isoformat(),
             ),

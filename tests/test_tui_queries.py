@@ -180,6 +180,46 @@ def test_load_trace_points_empty_when_no_trace(seeded_db):
     assert pts == []
 
 
+def test_load_trace_points_reads_legacy_and_compressed_rows(seeded_db):
+    """load_trace_points must pool a normally-inserted (compressed) row
+    with a hand-inserted legacy raw-JSON TEXT row for the same icao/date --
+    Task 11's sniff has to work through this reader too."""
+    compressed_trace = [[0, 40.1, -74.1, 5500, 210, None, None, None, {}, "adsb_icao"]]
+    legacy_trace = [[10, 41.2, -75.2, 6000, 220, None, None, None, {}, "mlat"]]
+    with Database(seeded_db) as db:
+        db.insert_trace_day(
+            "aaa111",
+            "2026-05-01",
+            {"timestamp": 1700000000.0, "trace": compressed_trace},
+            source="adsbx",
+        )
+        db.conn.execute(
+            """INSERT INTO trace_days
+               (icao, date, source, registration, type_code, description, owner_operator,
+                year, timestamp, trace_json, point_count, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "aaa111",
+                "2026-05-01",
+                "adsbfi",
+                None,
+                None,
+                None,
+                None,
+                None,
+                1700000000.0,
+                json.dumps(legacy_trace),
+                len(legacy_trace),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        db.commit()
+        pts = load_trace_points(db, "aaa111", "2026-05-01")
+
+    assert {p.lat for p in pts} == {40.1, 41.2}
+    assert {p.source for p in pts} == {"adsb_icao", "mlat"}
+
+
 def test_distinct_dates_for_icao(seeded_db):
     with Database(seeded_db) as db:
         assert distinct_dates_for_icao(db, "aaa111") == []

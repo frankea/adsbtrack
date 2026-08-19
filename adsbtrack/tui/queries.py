@@ -18,7 +18,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
 
-from ..db import Database
+from ..db import Database, decode_trace_json
 from ..events import collect_events
 
 # ---------------------------------------------------------------------------
@@ -385,11 +385,8 @@ def load_trace_points(db: Database, icao: str, date: str) -> list[TracePoint]:
     seen: set[tuple[float, int, int]] = set()
     out: list[TracePoint] = []
     for r in rows:
-        try:
-            samples = json.loads(r["trace_json"])
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(samples, list):
+        samples = decode_trace_json(r["trace_json"])
+        if samples is None:
             continue
         base = r["timestamp"]
         for s in samples:

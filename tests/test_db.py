@@ -6,7 +6,7 @@ from sqlite3 import ProgrammingError
 
 import pytest
 
-from adsbtrack.db import Database
+from adsbtrack.db import Database, decode_trace_json
 from adsbtrack.models import Flight
 
 # ---------------------------------------------------------------------------
@@ -188,7 +188,7 @@ def test_insert_and_get_trace_days(db):
     assert row["registration"] == "N12345"
     assert row["type_code"] == "C172"
     assert row["point_count"] == 1
-    assert json.loads(row["trace_json"]) == data["trace"]
+    assert decode_trace_json(row["trace_json"]) == data["trace"]
 
 
 def test_insert_trace_day_upsert(db):
@@ -207,7 +207,7 @@ def test_insert_trace_day_upsert(db):
 
     rows = list(db.get_trace_days("abc123"))
     assert len(rows) == 1
-    trace = json.loads(rows[0]["trace_json"])
+    trace = decode_trace_json(rows[0]["trace_json"])
     assert trace[0][1] == 41.0  # Should be the updated data
 
 
@@ -264,7 +264,59 @@ def test_get_trace_days_returns_an_iterator(db):
 
     rows = list(result)
     assert [row["date"] for row in rows] == ["2024-01-10", "2024-01-20"]
-    assert [json.loads(row["trace_json"])[0][1] for row in rows] == [40.0, 41.0]
+    assert [decode_trace_json(row["trace_json"])[0][1] for row in rows] == [40.0, 41.0]
+
+
+def test_insert_trace_day_stores_zlib_compressed_blob(db):
+    """New writes must compress trace_json to a zlib BLOB (first byte 0x78),
+    not store raw JSON TEXT -- the whole point of Task 11."""
+    data = {
+        "timestamp": 1700000000.0,
+        "trace": [[0, 40.0, -74.0, 5000, 200, None, None, None, {}]],
+    }
+    db.insert_trace_day("abc123", "2024-01-15", data)
+    db.commit()
+
+    raw = db.conn.execute(
+        "SELECT trace_json FROM trace_days WHERE icao = ? AND date = ?",
+        ("abc123", "2024-01-15"),
+    ).fetchone()["trace_json"]
+    assert isinstance(raw, bytes), "trace_json must be stored as a BLOB, not TEXT"
+    assert raw[0] == 0x78, "zlib stream must start with the 0x78 header byte"
+
+
+def test_get_trace_days_reads_legacy_and_compressed_rows_identically(db):
+    """A hand-inserted legacy raw-JSON TEXT row and a normally-inserted
+    (now compressed) row must decode to the same content via
+    decode_trace_json -- old rows keep working forever."""
+    trace = [[0, 40.0, -74.0, 5000, 200, None, None, None, {}]]
+    data = {"timestamp": 1700000000.0, "trace": trace}
+    db.insert_trace_day("abc123", "2024-01-15", data, source="adsbx")
+    db.conn.execute(
+        """INSERT INTO trace_days
+           (icao, date, source, registration, type_code, description, owner_operator,
+            year, timestamp, trace_json, point_count, fetched_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            "abc123",
+            "2024-01-16",
+            "adsbfi",
+            None,
+            None,
+            None,
+            None,
+            None,
+            1700000000.0,
+            json.dumps(trace),
+            len(trace),
+            datetime.now(UTC).isoformat(),
+        ),
+    )
+    db.commit()
+
+    rows = {row["date"]: row for row in db.get_trace_days("abc123")}
+    assert decode_trace_json(rows["2024-01-15"]["trace_json"]) == trace
+    assert decode_trace_json(rows["2024-01-16"]["trace_json"]) == trace
 
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@ Raw daily trace data per aircraft per source.
 | description | TEXT | Aircraft type description |
 | owner_operator | TEXT | Owner from trace metadata |
 | timestamp | REAL | Base Unix timestamp for the day |
-| trace_json | TEXT | Raw trace points as JSON array |
+| trace_json | TEXT | Raw trace points as a JSON array. Legacy rows store this as raw JSON text; rows written since compressed trace storage shipped store a zlib-compressed BLOB instead (~6.4x smaller). Existing rows are never migrated in place -- `db.decode_trace_json` sniffs the stored form on every read (first byte `0x78` -> zlib-decompress then parse; `[`/`{` or `str` -> parse as-is), so both forms keep working forever. A separate `db optimize` batch job (planned) rewrites legacy rows to the compressed form. |
 | point_count | INTEGER | Number of trace points |
 
 ## flights

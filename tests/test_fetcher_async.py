@@ -284,6 +284,13 @@ def test_404_between_403s_resets_circuit(tmp_db, fast_config, monkeypatch, _no_r
     ).fetchall()
     assert len(rows) == 4
     assert [r["status"] for r in rows] == [403, 404, 403, 403]
+    # The three retry-exhausted days are surfaced so the caller can report
+    # them and know they'll be retried on the next run.
+    assert set(stats["failed_days"]) == {
+        (days[0].isoformat(), 403),
+        (days[2].isoformat(), 403),
+        (days[3].isoformat(), 403),
+    }
 
 
 def test_200_between_403s_resets_circuit(tmp_db, fast_config, monkeypatch, _no_real_sleep):
@@ -453,7 +460,7 @@ def test_progress_advances_once_per_day_under_concurrency(tmp_db, fast_config, m
 def test_sync_wrapper_signature_unchanged(tmp_db, fast_config, monkeypatch, _no_real_sleep):
     """fetch_traces(db, config, hex_code, start, end) must still work
     (positional, no concurrency kwarg) and return the same stats dict
-    keys as the pre-async version."""
+    keys as the pre-async version, plus failed_days."""
     day = date(2024, 6, 15)
     script = {day.isoformat(): [(200, _trace_payload(day), {})]}
     transport = _ScriptedTransport(script)
@@ -462,7 +469,7 @@ def test_sync_wrapper_signature_unchanged(tmp_db, fast_config, monkeypatch, _no_
     # Call with exact positional signature existing callers use.
     stats = fetch_traces(tmp_db, fast_config, "abc123", day, day)
 
-    assert set(stats.keys()) == {"fetched", "with_data", "skipped", "errors"}
+    assert set(stats.keys()) == {"fetched", "with_data", "skipped", "errors", "failed_days"}
     assert stats["fetched"] == 1
     assert stats["with_data"] == 1
     assert stats["skipped"] == 0
@@ -488,8 +495,8 @@ def test_concurrency_one_is_serial(tmp_db, fast_config, monkeypatch, _no_real_sl
 
 def test_no_days_to_fetch_returns_empty_stats(tmp_db, fast_config, monkeypatch, _no_real_sleep):
     """If every day in the range is already fetched, fetch_traces must
-    return {"fetched": 0, "with_data": 0, "skipped": N, "errors": 0}
-    without touching the transport at all."""
+    return {"fetched": 0, "with_data": 0, "skipped": N, "errors": 0,
+    "failed_days": []} without touching the transport at all."""
     day = date(2024, 6, 15)
     # Pre-populate fetch_log so the day is considered done.
     tmp_db.insert_fetch_log("abc123", day.isoformat(), 200, source="adsbx")
@@ -500,5 +507,5 @@ def test_no_days_to_fetch_returns_empty_stats(tmp_db, fast_config, monkeypatch, 
     _patch_transport(monkeypatch, transport)
 
     stats = fetch_traces(tmp_db, fast_config, "abc123", day, day, source="adsbx", concurrency=2)
-    assert stats == {"fetched": 0, "with_data": 0, "skipped": 1, "errors": 0}
+    assert stats == {"fetched": 0, "with_data": 0, "skipped": 1, "errors": 0, "failed_days": []}
     assert transport.requests == []

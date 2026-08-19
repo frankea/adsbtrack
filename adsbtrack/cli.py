@@ -216,7 +216,15 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
             sources_to_fetch = [source]
             console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
 
-        total_stats = {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+        total_stats = {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+        def _accumulate(stats: dict) -> None:
+            for k in total_stats:
+                if k == "failed_days":
+                    total_stats[k].extend(stats.get("failed_days", []))
+                else:
+                    total_stats[k] += stats[k]
+
         if len(sources_to_fetch) > 1:
             # Parallel fetch: each source in its own thread with its own
             # DB connection (SQLite WAL supports concurrent writers).
@@ -234,8 +242,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
                     else:
                         stats = fetch_traces(thread_db, thread_config, hex_code, start, end, source=src)
                     with lock:
-                        for k in total_stats:
-                            total_stats[k] += stats[k]
+                        _accumulate(stats)
 
             threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
             for t in threads:
@@ -248,8 +255,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
                 stats = fetch_traces_opensky(db, config, hex_code, start, end)
             else:
                 stats = fetch_traces(db, config, hex_code, start, end, source=src)
-            for k in total_stats:
-                total_stats[k] += stats[k]
+            _accumulate(stats)
 
         console.print(
             f"\n[green]Done![/] Fetched: {total_stats['fetched']}, "
@@ -257,6 +263,9 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
             f"Skipped (already fetched): {total_stats['skipped']}, "
             f"Errors: {total_stats['errors']}"
         )
+        if total_stats["failed_days"]:
+            failed_str = ", ".join(f"{d} ({status})" for d, status in total_stats["failed_days"])
+            console.print(f"[yellow]Failed days (will retry on next run):[/] {failed_str}")
 
         # Auto-extract flights
         console.print("\nExtracting flights...")

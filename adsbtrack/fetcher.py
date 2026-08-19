@@ -316,16 +316,19 @@ async def _db_writer(
             elif item.status == 403 and item.had_error:
                 db.insert_fetch_log(hex_code, day_str, 403, source=source)
                 stats["errors"] += 1
+                stats["failed_days"].append((day_str, item.status))
                 outcome = "403_exhausted"
             elif item.status == 0 and item.had_error:
                 # Network error exhausted retries; no fetch_log row so the
                 # day gets re-tried on next run. Count in stats only.
                 stats["errors"] += 1
+                stats["failed_days"].append((day_str, item.status))
                 outcome = "network_exhausted"
             else:
                 db.insert_fetch_log(hex_code, day_str, item.status, source=source)
                 if item.had_error:
                     stats["errors"] += 1
+                    stats["failed_days"].append((day_str, item.status))
                 outcome = str(item.status)
 
             stats["fetched"] += 1
@@ -383,13 +386,14 @@ async def _fetch_traces_async(
     to_fetch = [d for d in all_days if d.isoformat() not in already_fetched]
 
     if not to_fetch:
-        return {"fetched": 0, "with_data": 0, "skipped": len(all_days), "errors": 0}
+        return {"fetched": 0, "with_data": 0, "skipped": len(all_days), "errors": 0, "failed_days": []}
 
     stats = {
         "fetched": 0,
         "with_data": 0,
         "skipped": len(all_days) - len(to_fetch),
         "errors": 0,
+        "failed_days": [],
     }
 
     state = _FetchState(

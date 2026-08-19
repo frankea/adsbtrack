@@ -201,6 +201,29 @@ def test_fetched_dates_empty(db):
     assert dates == set()
 
 
+def test_fetched_dates_excludes_retry_exhausted_days(db):
+    """A date whose only fetch_log rows are retryable-exhaustion statuses
+    (403, 429, >=500) must not count as fetched -- it should be retried."""
+    db.insert_fetch_log("abc123", "2024-01-10", 200, source="adsbx")
+    db.insert_fetch_log("abc123", "2024-01-11", 403, source="adsbx")
+    db.insert_fetch_log("abc123", "2024-01-12", 200, source="other")
+    db.commit()
+
+    dates = db.get_fetched_dates("abc123", source="adsbx")
+    assert dates == {"2024-01-10"}
+
+
+def test_fetched_dates_includes_retried_then_succeeded_day(db):
+    """A day that first exhausted retries (403) but later succeeded (200)
+    counts as fetched -- the retry itself is what makes it done."""
+    db.insert_fetch_log("abc123", "2024-01-13", 403, source="adsbx")
+    db.insert_fetch_log("abc123", "2024-01-13", 200, source="adsbx")
+    db.commit()
+
+    dates = db.get_fetched_dates("abc123", source="adsbx")
+    assert dates == {"2024-01-13"}
+
+
 # ---------------------------------------------------------------------------
 # flights
 # ---------------------------------------------------------------------------

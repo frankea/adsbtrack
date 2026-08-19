@@ -1256,3 +1256,61 @@ def test_fetch_cli_accepts_nonus_tail(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert calls == ["abcdef"]
+
+
+def test_fetch_cli_prints_failed_days(tmp_path, monkeypatch):
+    """When fetch_traces reports retry-exhausted days, the summary lists
+    each date with its terminal status so the user knows what still
+    needs a retry."""
+    from adsbtrack import cli as cli_module
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        return {
+            "fetched": 2,
+            "with_data": 0,
+            "skipped": 0,
+            "errors": 2,
+            "failed_days": [("2026-05-02", 403), ("2026-05-03", 503)],
+        }
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "abcdef", "--start", "2026-05-02", "--end", "2026-05-03", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Failed days (will retry on next run): 2026-05-02 (403), 2026-05-03 (503)" in result.output
+
+
+def test_fetch_cli_omits_failed_days_header_when_empty(tmp_path, monkeypatch):
+    """No failed_days -> no extra header/line in the summary output."""
+    from adsbtrack import cli as cli_module
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        return {"fetched": 1, "with_data": 1, "skipped": 0, "errors": 0, "failed_days": []}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "abcdef", "--start", "2026-05-02", "--end", "2026-05-02", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Failed days" not in result.output

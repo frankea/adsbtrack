@@ -9,6 +9,23 @@ SOURCE_URLS = {
     "theairtraffic": "https://globe.theairtraffic.com/globe_history",
 }
 
+# fetch_log statuses that mean a day's retries were exhausted without ever
+# landing on a terminal answer (403 bot-block, 429 rate-limit, 5xx server
+# error). A fetch_log row carrying only these statuses does NOT count as
+# "fetched" -- db.Database.get_fetched_dates excludes such days so they're
+# retried on the next run, and fetcher.py's failed_days collection gates on
+# this same predicate so the CLI's "will retry on next run" message matches
+# actual skip behavior. Statuses outside this set (e.g. 400, 401, 451) are
+# logged and counted as errors but are NOT retried by the fetcher itself
+# (see the "unrecognized status" fallthrough in fetcher._fetch_one_day), so
+# they correctly count as "fetched" and must not appear in failed_days.
+RETRYABLE_FETCH_STATUSES = frozenset({403, 429})
+RETRYABLE_FETCH_STATUS_FLOOR = 500  # any status >= this is also retryable (5xx)
+
+
+def is_retryable_fetch_status(status: int) -> bool:
+    return status in RETRYABLE_FETCH_STATUSES or status >= RETRYABLE_FETCH_STATUS_FLOOR
+
 
 # Max endurance in minutes by Mode S type code. Flights longer than this
 # are treated as data-gap artifacts rather than real single flights. Values

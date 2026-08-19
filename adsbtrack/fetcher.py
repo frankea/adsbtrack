@@ -12,7 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 import httpx
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
-from .config import SOURCE_URLS, Config
+from .config import SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database
 
 # Referer headers per source domain
@@ -328,7 +328,13 @@ async def _db_writer(
                 db.insert_fetch_log(hex_code, day_str, item.status, source=source)
                 if item.had_error:
                     stats["errors"] += 1
-                    stats["failed_days"].append((day_str, item.status))
+                    # Only report as "will retry" if get_fetched_dates would
+                    # actually exclude this day. An unrecognized status (not
+                    # 403/429/5xx) is a terminal answer as far as the
+                    # fetcher's own retry loop is concerned -- it's not
+                    # retried here, so it must not claim to be retried later.
+                    if is_retryable_fetch_status(item.status):
+                        stats["failed_days"].append((day_str, item.status))
                 outcome = str(item.status)
 
             stats["fetched"] += 1

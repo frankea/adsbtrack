@@ -5,6 +5,7 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .config import RETRYABLE_FETCH_STATUS_FLOOR, RETRYABLE_FETCH_STATUSES
 from .models import Flight
 
 SCHEMA = """
@@ -773,13 +774,18 @@ class Database:
 
     def get_fetched_dates(self, icao: str, source: str = "adsbx") -> set[str]:
         """Dates already fetched for icao/source. A date only counts if it has
-        at least one fetch_log row that isn't a retry-exhaustion status (403,
-        429, >=500); those days are left out so a future fetch retries them."""
+        at least one fetch_log row that isn't a retry-exhaustion status (see
+        config.RETRYABLE_FETCH_STATUSES / RETRYABLE_FETCH_STATUS_FLOOR); those
+        days are left out so a future fetch retries them. fetcher.py's
+        failed_days collection uses the same constants so the CLI's "will
+        retry on next run" message matches this skip behavior."""
+        retryable_list = ", ".join(str(s) for s in sorted(RETRYABLE_FETCH_STATUSES))
         rows = self.conn.execute(
-            """SELECT date FROM fetch_log
+            f"""SELECT date FROM fetch_log
                WHERE icao = ? AND source = ?
                GROUP BY date
-               HAVING SUM(CASE WHEN status IN (403, 429) OR status >= 500 THEN 0 ELSE 1 END) > 0
+               HAVING SUM(CASE WHEN status IN ({retryable_list}) OR status >= {RETRYABLE_FETCH_STATUS_FLOOR}
+                               THEN 0 ELSE 1 END) > 0
                UNION
                SELECT date FROM trace_days WHERE icao = ? AND source = ?""",
             (icao, source, icao, source),

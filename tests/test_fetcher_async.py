@@ -310,6 +310,32 @@ def test_200_between_403s_resets_circuit(tmp_db, fast_config, monkeypatch, _no_r
     assert stats["with_data"] == 1
 
 
+def test_unrecognized_status_not_reported_as_failed_day(tmp_db, fast_config, monkeypatch, _no_real_sleep):
+    """A status outside the retry set (e.g. 400) hits the "unrecognized
+    status" fallthrough in _fetch_one_day: it's logged and counted as an
+    error on the first attempt, with no retry loop entered. Since
+    get_fetched_dates only excludes 403/429/5xx days, this date is NOT
+    retried on a future run -- so it must not appear in failed_days (which
+    the CLI reports as "will retry on next run"), or the message would lie.
+    """
+    day = date(2024, 6, 15)
+    script = {day.isoformat(): [(400, b"", {})]}
+    transport = _ScriptedTransport(script)
+    _patch_transport(monkeypatch, transport)
+
+    stats = fetch_traces(tmp_db, fast_config, "abc123", day, day, source="adsbx", concurrency=1)
+    assert stats["errors"] == 1
+    assert stats["failed_days"] == []
+
+    # Confirms the message and the skip behavior actually agree: the day is
+    # logged with its real status and counts as fetched (won't be retried).
+    row = tmp_db.conn.execute(
+        "SELECT status FROM fetch_log WHERE icao = ? AND date = ?", ("abc123", day.isoformat())
+    ).fetchone()
+    assert row["status"] == 400
+    assert tmp_db.get_fetched_dates("abc123", source="adsbx") == {day.isoformat()}
+
+
 # ---------------------------------------------------------------------------
 # Gate 3: semaphore bound is honored (peak in-flight <= configured concurrency)
 # ---------------------------------------------------------------------------

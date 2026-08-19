@@ -8,6 +8,7 @@ them or reach for a leading-underscore name across module boundaries.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable, Sequence
 
 EARTH_RADIUS_M = 6_371_000.0
 
@@ -58,3 +59,47 @@ def destination_point(lat_deg: float, lon_deg: float, bearing_deg: float, distan
     x = math.cos(ang) - math.sin(phi1) * sin_phi2
     lam2 = lam1 + math.atan2(y, x)
     return math.degrees(phi2), ((math.degrees(lam2) + 540.0) % 360.0) - 180.0
+
+
+def split_on_gaps[T](
+    points: Sequence[T],
+    *,
+    ts: Callable[[T], float],
+    split_gap_secs: float,
+    min_duration_secs: float,
+    extra_predicate: Callable[[Sequence[T]], bool] | None = None,
+) -> list[list[T]]:
+    """Split a chronological run of already-qualified points into contiguous
+    segments, dropping short ones.
+
+    Shared by the geometric detectors (ILS alignment, navaid alignment):
+    each collects the points passing its own per-point predicate first,
+    then hands the kept, chronologically-ordered list here to do the
+    split-on-time-gap / min-duration-filter step common to all of them.
+    ``points`` is assumed already filtered to that per-point predicate --
+    this function only knows about gaps and duration.
+
+    A new segment starts whenever two consecutive points are more than
+    ``split_gap_secs`` apart. A segment survives only if its span (last
+    ``ts`` minus first ``ts``) is at least ``min_duration_secs`` and, when
+    given, ``extra_predicate(segment)`` returns True (used for segment-level
+    filters beyond duration, e.g. a minimum closest-approach distance).
+    """
+    if not points:
+        return []
+
+    segments: list[list[T]] = [[points[0]]]
+    for prev, cur in zip(points, points[1:], strict=False):
+        if ts(cur) - ts(prev) > split_gap_secs:
+            segments.append([cur])
+        else:
+            segments[-1].append(cur)
+
+    out: list[list[T]] = []
+    for seg in segments:
+        if ts(seg[-1]) - ts(seg[0]) < min_duration_secs:
+            continue
+        if extra_predicate is not None and not extra_predicate(seg):
+            continue
+        out.append(seg)
+    return out

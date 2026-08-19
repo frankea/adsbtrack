@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 
 from adsbtrack.events import Event
 from adsbtrack.tui.queries import AircraftRow, FlightRow, JumpMatch
-from adsbtrack.tui.views.aircraft import filter_aircraft
+from adsbtrack.tui.views.aircraft import _fmt_flags, filter_aircraft
 from adsbtrack.tui.views.events import filter_events
 from adsbtrack.tui.views.flights import _airport_cell, _display_destination, _display_origin, filter_flights
 from adsbtrack.tui.views.jump import filter_jump_matches
@@ -225,6 +225,8 @@ def _aircraft(**overrides) -> AircraftRow:
         last_seen="2026-03-01",
         spoof_count=0,
         is_military=0,
+        has_hover=False,
+        has_type_override=False,
         flags="",
     )
     fields.update(overrides)
@@ -276,6 +278,31 @@ def test_filter_aircraft_skips_none_home_base():
 def test_filter_aircraft_no_match_returns_empty():
     rows = [_aircraft()]
     assert filter_aircraft(rows, "zzzzzz") == []
+
+
+def test_fmt_flags_no_flags_is_dash():
+    result = _fmt_flags(_aircraft())
+    assert result.plain == "--"
+
+
+def test_fmt_flags_hover_uses_amber():
+    result = _fmt_flags(_aircraft(has_hover=True))
+    assert "HOVER" in result.plain
+    assert ACCENT_AMBER in result.spans[0].style
+
+
+def test_fmt_flags_type_override_uses_amber():
+    result = _fmt_flags(_aircraft(has_type_override=True))
+    assert "TYP" in result.plain
+    assert ACCENT_AMBER in result.spans[0].style
+
+
+def test_fmt_flags_mil_spf_hover_typ_all_present():
+    result = _fmt_flags(_aircraft(is_military=1, spoof_count=3, has_hover=True, has_type_override=True))
+    assert "MIL" in result.plain
+    assert "SPF" in result.plain
+    assert "HOVER" in result.plain
+    assert "TYP" in result.plain
 
 
 # ---------------------------------------------------------------------------

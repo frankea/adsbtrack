@@ -253,3 +253,68 @@ def test_list_events_all_aircraft_finds_spoof_events_via_stat_columns(tmp_path):
     spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
     assert len(spoof) == 1
     assert spoof[0].icao == "111111"
+
+
+def test_list_events_all_aircraft_finds_spoof_events_via_decode_fallback(tmp_path):
+    """Same icao=None view, but for an aircraft whose trace_days row predates
+    Task 12's materialized stat columns (v2_samples/v2_sil0/v2_nic0/v2_callsigns
+    all NULL, as a raw legacy insert leaves them). bulk_detect_spoof_events must
+    route this icao through the per-aircraft decode fallback instead of dropping
+    it from the grouped-stats query."""
+    db_path = tmp_path / "all_events_fallback.db"
+    spoofy = [_spoof_sample(3) for _ in range(40)] + [_spoof_sample(0) for _ in range(20)]
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="222222",
+                takeoff_time=datetime(2026, 4, 21, 1, 0, tzinfo=UTC),
+                takeoff_lat=25.25,
+                takeoff_lon=55.38,
+                takeoff_date="2026-04-21",
+            )
+        )
+        # Bypasses insert_trace_day's count_v2_integrity computation, so the
+        # v2_* stat columns stay NULL -- the condition _trace_days_needs_fallback
+        # checks for.
+        db.conn.execute(
+            """INSERT INTO trace_days
+               (icao, date, source, registration, type_code, description, owner_operator,
+                year, timestamp, trace_json, point_count, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "222222",
+                "2026-04-21",
+                "adsbx",
+                None,
+                None,
+                None,
+                None,
+                None,
+                1776600000.0,
+                json.dumps(spoofy),
+                len(spoofy),
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        db.commit()
+        events = list_events(db)
+    spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
+    assert len(spoof) == 1
+    assert spoof[0].icao == "222222"
+
+
+def test_list_aircraft_respects_row_limit(tmp_path):
+    """list_aircraft's LIMIT clause caps the returned row count even when
+    aircraft_stats holds more rows than the limit. Seeded directly via SQL
+    (skipping insert_flight/refresh_aircraft_stats) since only the row count
+    matters here."""
+    db_path = tmp_path / "many_aircraft.db"
+    with Database(db_path) as db:
+        for i in range(8):
+            db.conn.execute(
+                "INSERT INTO aircraft_stats (icao, total_flights, total_hours, last_seen) VALUES (?, ?, ?, ?)",
+                (f"{i:06x}", 1, 1.0, f"2026-01-{i + 1:02d}"),
+            )
+        db.commit()
+        rows = list_aircraft(db, limit=5)
+    assert len(rows) == 5

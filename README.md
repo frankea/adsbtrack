@@ -22,7 +22,7 @@ uv sync
 uv run python -m adsbtrack.cli fetch --hex a66ad3 --start 2020-01-01
 ```
 
-Downloads daily traces, then auto-extracts flights. Options: `--source` (adsbx, adsbfi, airplaneslive, adsblol, theairtraffic, opensky), `--end`, `--rate`, `--db`, `--tail` (converts N-number to hex). Skips dates already fetched. WAL mode lets multiple fetches run in parallel.
+Downloads daily traces, then auto-extracts flights. Options: `--source` (adsbx, adsbfi, airplaneslive, adsblol, theairtraffic, opensky), `--end`, `--rate`, `--db`, `--tail` (converts N-number to hex). Skips dates already fetched; omitting `--start` auto-resumes from the day after the last fetched day, or pass `--since-last` to require that behavior explicitly (errors if there's no fetch history yet). WAL mode lets multiple fetches run in parallel.
 
 ### View statistics
 
@@ -52,7 +52,7 @@ Utilization:
   Distinct airports: 47
 ```
 
-Shows data quality breakdown, mission type distribution, utilization rollup, night/emergency indicators, and top airports.
+Shows data quality breakdown, mission type distribution, utilization rollup, night/emergency indicators, and top airports. Pass `--json` to emit a single JSON document instead of the table.
 
 ### View flight history
 
@@ -69,7 +69,35 @@ uv run python -m adsbtrack.cli trips --hex a66ad3 --from 2026-03-27
  2026-03-29 | KSPG  | ~KFXE | 12m      | N512WB   |         |   0% | DROP
 ```
 
-`Conf` is landing confidence (0-100%), `Type` is landing classification (OK/SIG LOST/DROP/UNCERT/ALT ERR). Options: `--from`, `--to`, `--airport`.
+`Conf` is landing confidence (0-100%), `Type` is landing classification (OK/SIG LOST/DROP/UNCERT/ALT ERR). Options: `--from`, `--to`, `--airport`. Pass `--json` to emit a single JSON document instead of the table.
+
+### Route fingerprint
+
+```
+uv run python -m adsbtrack.cli route --hex a66ad3
+```
+
+```
+2026-03-27 KSPG -> KHKY  SHAWZ (15m) -> KEEMO (8m) -> CLT (3m)
+```
+
+Prints one line per flight with a navaid track: the ordered chain of VORs/NDBs/fixes the ground track pointed straight at for a sustained stretch, a compact fingerprint of the enroute routing. Requires `navaids refresh` to have been run at least once; otherwise this is always empty. Options: `--tail`.
+
+### Signal gaps
+
+```
+uv run python -m adsbtrack.cli gaps --hex a66ad3
+```
+
+Finds within-flight ADS-B signal gaps and classifies each as `likely_transponder_off`, `coverage_hole`, or `unknown` based on altitude, surrounding coverage, and proximity to a known airport. Options: `--min-gap-secs` (default 300), `--classification` (filter to one bucket). Pass `--json` to emit a single JSON document instead of the table.
+
+### Event log
+
+```
+uv run python -m adsbtrack.cli events --hex a66ad3
+```
+
+Chronological log of emergency squawks (7500/7600/7700), emergency flags, off-airport landings, sustained hover (>= 5 min), and multiple go-arounds (>= 2 per flight) - all read from pre-computed columns on the `flights` table, no new heuristics. Options: `--since` (filter from a date), `--severity` (`emergency`, `unusual`, or `all`). Pass `--json` to emit a single JSON document instead of the table.
 
 ### Re-extract flights
 
@@ -104,6 +132,17 @@ uv run python -m adsbtrack.cli registry address --state MT --city BILLINGS
 ```
 
 The `status` command surfaces FAA registrant, address, and certificate info inline when the registry is loaded, and flags aircraft found only in `faa_deregistered`.
+
+## Runway and navaid reference data
+
+Load [OurAirports](https://ourairports.com/data/) runway geometry and navaid (VOR/NDB/fix) reference tables, used internally for takeoff-runway identification, ILS-alignment detection, and the `route` navaid fingerprint:
+
+```
+uv run python -m adsbtrack.cli runways refresh
+uv run python -m adsbtrack.cli navaids refresh
+```
+
+Both download the relevant CSV from OurAirports and upsert it; re-running is idempotent (`runways refresh` overwrites rows keyed by airport ident + runway name, `navaids refresh` by ident + lat/lon). Pass `--csv <path>` to use a local file instead of downloading.
 
 ## ACARS ingestion
 
@@ -179,6 +218,42 @@ Traces from multiple sources are automatically merged during extraction.
 | [TheAirTraffic](https://globe.theairtraffic.com/) | `--source theairtraffic` | |
 | [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
+
+## Interactive surfaces
+
+### Terminal UI
+
+```
+uv sync --extra tui
+uv run python -m adsbtrack.cli tui --db adsbtrack.db
+```
+
+Launches a Textual TUI over the local database: aircraft list, flight timeline, event feed, spoofed-broadcasts audit, map, and status views, plus an ops pane that wraps the DB-writing commands.
+
+### Static HTML explorer
+
+```
+uv run python -m adsbtrack.cli gui --hex a66ad3
+```
+
+Writes a static three-column HTML explorer (`index.html` + a JSON data snapshot) to `--out` (default `gui-export`) that renders the aircraft list, flight timeline, events, and spoofed-broadcasts audit. Open `index.html` directly in a browser via `file://` - no local server needed. Read-only; rerun the command to refresh the snapshot. Options: `--out`, `--hex` (focus the initial view on one aircraft).
+
+### MCP server
+
+```
+uv sync --extra mcp
+uv run python -m adsbtrack.cli mcp-serve --db adsbtrack.db
+```
+
+Runs a read-only MCP server over stdio, exposing aircraft stats, flights, events, gaps, and registry lookup tools to MCP-compatible LLM clients such as Claude Desktop and Claude Code. No fetch or write path is exposed.
+
+## Database maintenance
+
+```
+uv run python -m adsbtrack.cli db optimize
+```
+
+Backfills legacy `trace_days` rows written before the compressed trace storage and materialized integrity-stat columns existed: compresses `trace_json` and fills the `v2_samples`/`v2_sil0`/`v2_nic0`/`v2_callsigns` columns that the spoof-detection and events path reads instead of decoding every trace. Processes rows in batches and is safe to interrupt and re-run - it skips rows already compressed and stat-filled. Pass `--vacuum` to run `VACUUM` afterward (rewrites the whole database file; needs free disk space roughly the size of the final DB).
 
 ## Configuration file
 

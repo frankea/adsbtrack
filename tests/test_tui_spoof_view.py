@@ -3,8 +3,12 @@
 Ports PR #16's expand/collapse behaviour onto the current SpoofView:
 a trailing `+`/`-` indicator column, expanded-row state that survives
 a filter re-render (unless the expanded row itself got filtered out),
-and cursor position preserved (by underlying icao/date identity, not
-raw index) across a filter re-render.
+and cursor position preserved (by underlying icao/takeoff_time
+identity, not raw index) across a filter re-render. Keyed on
+takeoff_time rather than takeoff_date -- spoofed_broadcasts is
+UNIQUE(icao, takeoff_time), so two broadcasts for one aircraft can
+share a calendar date; see
+test_two_same_day_broadcasts_for_one_icao_expand_independently.
 """
 
 from __future__ import annotations
@@ -22,15 +26,17 @@ from adsbtrack.tui.queries import SpoofedBroadcast  # noqa: E402
 from adsbtrack.tui.views.spoof import SpoofView  # noqa: E402
 
 
-def _row(icao: str, date: str, callsign: str = "CS1") -> SpoofedBroadcast:
+def _row(
+    icao: str, date: str, callsign: str = "CS1", time: str = "00:00:00", v2_samples: int = 100
+) -> SpoofedBroadcast:
     return SpoofedBroadcast(
         icao=icao,
-        takeoff_time=f"{date}T00:00:00+00:00",
+        takeoff_time=f"{date}T{time}+00:00",
         takeoff_date=date,
         callsign=callsign,
         max_altitude=250,
         reason="bimodal_integrity",
-        reason_detail={"v2_samples": 100, "v2_sil0_pct": 25.0, "v2_nic0_pct": 30.0},
+        reason_detail={"v2_samples": v2_samples, "v2_sil0_pct": 25.0, "v2_nic0_pct": 30.0},
         detected_at=f"{date}T01:00:00+00:00",
     )
 
@@ -147,5 +153,41 @@ def test_cursor_reseats_on_underlying_row_after_filter_shifts_indices():
             selected = app.view._selected()
             assert selected is not None
             assert selected.icao == "ccc333"
+
+    asyncio.run(scenario())
+
+
+def test_two_same_day_broadcasts_for_one_icao_expand_independently():
+    """Regression: spoofed_broadcasts is UNIQUE(icao, takeoff_time), not
+    (icao, takeoff_date) -- two broadcasts for the same aircraft on the
+    same calendar date must stay distinguishable. Keying _expanded_key on
+    takeoff_date alone would make expanding the morning broadcast also
+    mark the afternoon one "-", and toggling the afternoon one would
+    incorrectly collapse (treated as re-toggling the "same" row) instead
+    of switching the detail pane to it."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test():
+            morning = _row("aaa111", "2026-01-01", callsign="MORNING", time="10:00:00", v2_samples=111)
+            afternoon = _row("aaa111", "2026-01-01", callsign="AFTERNOON", time="14:00:00", v2_samples=222)
+            app.view._rows = [morning, afternoon]
+            app.view._rerender("")
+            table = app.view.query_one(DataTable)
+            assert table.row_count == 2
+
+            table.move_cursor(row=0)
+            app.view.toggle_detail()
+            assert app.view._detail.display is True
+            assert "111" in app.view._detail.render().plain
+            assert table.get_row_at(0)[-1].plain == "−"
+            assert table.get_row_at(1)[-1].plain == "+", "the afternoon row must not appear expanded too"
+
+            table.move_cursor(row=1)
+            app.view.toggle_detail()
+            assert app.view._detail.display is True, "selecting a different same-day row must not collapse the pane"
+            assert "222" in app.view._detail.render().plain, "detail must switch to the afternoon broadcast"
+            assert table.get_row_at(0)[-1].plain == "+"
+            assert table.get_row_at(1)[-1].plain == "−"
 
     asyncio.run(scenario())

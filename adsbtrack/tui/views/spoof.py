@@ -95,11 +95,17 @@ class SpoofView(Vertical):
     def toggle_detail(self) -> None:
         """Expand/collapse the detail pane for the selected row.
 
-        Tracks the expanded row by ``(icao, takeoff_date)`` identity (not
+        Tracks the expanded row by ``(icao, takeoff_time)`` identity (not
         table index) in ``self._expanded_key`` so a second press on the
         same row collapses it, and so ``_rerender`` can carry the
         expansion across a filter re-render instead of always resetting
         it (the previous behaviour collapsed on every keystroke).
+        ``takeoff_time``, not ``takeoff_date``: ``spoofed_broadcasts`` is
+        UNIQUE(icao, takeoff_time), so two broadcasts for one aircraft on
+        the same calendar date share a ``takeoff_date`` -- keying on the
+        date would make them indistinguishable, marking both rows
+        expanded and making a press on the second row collapse instead
+        of switching detail to it.
         """
         row = self._selected()
         if row is None:
@@ -107,7 +113,7 @@ class SpoofView(Vertical):
             self._detail.display = False
             self._rerender(self._last_needle)
             return
-        key = (row.icao, row.takeoff_date)
+        key = (row.icao, row.takeoff_time)
         if self._expanded_key == key:
             self._expanded_key = None
             self._detail.display = False
@@ -155,16 +161,18 @@ class SpoofView(Vertical):
         Preserves two bits of state across the rebuild instead of always
         resetting them: the expanded detail row (``self._expanded_key``,
         collapsed only if it got filtered out) and the cursor position
-        (re-seated onto the same underlying (icao, takeoff_date) row if it
+        (re-seated onto the same underlying (icao, takeoff_time) row if it
         survived the filter, since ``DataTable.clear()`` always resets the
-        cursor to row 0).
+        cursor to row 0). Keyed on ``takeoff_time`` rather than
+        ``takeoff_date`` -- see ``toggle_detail`` -- so two same-day
+        broadcasts for one aircraft stay distinguishable.
         """
         self._last_needle = needle
         cursor_key: tuple[str, str] | None = None
         idx = self._table.cursor_row
         if self._matched and idx is not None and 0 <= idx < len(self._matched):
             cursor_row = self._matched[idx]
-            cursor_key = (cursor_row.icao, cursor_row.takeoff_date)
+            cursor_key = (cursor_row.icao, cursor_row.takeoff_time)
 
         self._table.clear()
         needle_low = needle.lower() if needle else ""
@@ -180,7 +188,7 @@ class SpoofView(Vertical):
             sil_fmt = f"{sil:.1f}" if isinstance(sil, (int, float)) else "-"
             nic_fmt = f"{nic:.1f}" if isinstance(nic, (int, float)) else "-"
             per_source = _format_source_rates(detail) or "-"
-            is_expanded = self._expanded_key == (row.icao, row.takeoff_date)
+            is_expanded = self._expanded_key == (row.icao, row.takeoff_time)
             indicator = "−" if is_expanded else "+"
             indicator_colour = ACCENT_VIOLET if is_expanded else FG_2
             self._table.add_row(
@@ -197,17 +205,17 @@ class SpoofView(Vertical):
 
         # If the previously-expanded row got filtered out, collapse it.
         if self._expanded_key is not None and not any(
-            (r.icao, r.takeoff_date) == self._expanded_key for r in self._matched
+            (r.icao, r.takeoff_time) == self._expanded_key for r in self._matched
         ):
             self._expanded_key = None
             self._detail.display = False
 
-        # Re-seat the cursor on the same (icao, date) pair if it survived
-        # the filter, so toggling/filtering doesn't silently jump the
-        # selection to an unrelated row.
+        # Re-seat the cursor on the same (icao, takeoff_time) pair if it
+        # survived the filter, so toggling/filtering doesn't silently jump
+        # the selection to an unrelated row.
         if cursor_key is not None:
             for new_idx, row in enumerate(self._matched):
-                if (row.icao, row.takeoff_date) == cursor_key:
+                if (row.icao, row.takeoff_time) == cursor_key:
                     self._table.move_cursor(row=new_idx)
                     break
 

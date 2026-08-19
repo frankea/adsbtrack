@@ -533,6 +533,12 @@ class Config:
     # approach_alts deque cap for go-around detection (samples, ~5s spacing)
     approach_alts_maxlen: int = 240
 
+    # --- TUI map view (adsbtrack/tui/views/map.py) ---
+    # A jump in trace-point timestamp longer than this is drawn as a dashed
+    # amber segment on the map so the user can see where signal coverage
+    # dropped out, instead of a solid line implying continuous coverage.
+    map_trace_gap_secs: float = 60.0
+
     # Helicopter types (mirror of HELICOPTER_TYPES for runtime access)
     helicopter_types: frozenset[str] = field(default_factory=lambda: HELICOPTER_TYPES)
     callsign_prefix_missions: dict[str, str] = field(default_factory=lambda: dict(CALLSIGN_PREFIX_MISSIONS))

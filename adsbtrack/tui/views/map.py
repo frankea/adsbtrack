@@ -14,16 +14,20 @@ The compositor is a simple two-pass painter:
    connected with Bresenham segments, coloured by the starting point's
    readsb source. Segments straddling a gap in time are drawn as dashed
    amber.
-2. A cell grid records per-cell Rich markup (grid dots, braille glyphs,
-   panel borders, labels). Panels and labels paint AFTER the trace so
-   they cover the trace where they overlap; grid backdrop paints only
-   where the trace hasn't already touched.
+2. A ``_Grid`` records per-cell character + colour (grid dots, braille
+   glyphs, panel borders, labels). Panels and labels paint AFTER the
+   trace so they cover the trace where they overlap; grid backdrop
+   paints only where the trace hasn't already touched. The grid is
+   flattened to a single ``rich.text.Text`` by coalescing runs of
+   same-coloured characters, rather than emitting one markup tag per
+   character.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from rich.text import Text
 from textual import work
@@ -69,23 +73,47 @@ _SOURCE_LEGEND: list[tuple[str, str, list[str]]] = [
     ("ADS-C", ACCENT_VIOLET, ["adsc"]),
 ]
 
-# Gap threshold: jumps in timestamp longer than this are drawn dashed so
-# the user can see where coverage dropped out.
-_GAP_SECS = 60.0
+# Footer legend annotations for entries that double up as another map
+# element's colour (gap dashes reuse TIS-B's amber, the end marker
+# reuses ADS-R's cyan). Keyed by the _SOURCE_LEGEND label.
+_FOOTER_SUFFIX = {"TIS-B": "gap", "ADS-R": "end"}
 
 # Grid backdrop: one dot every N cols / M rows.
 _GRID_COL_STEP = 6
 _GRID_ROW_STEP = 3
 
+# Overlay panel geometry. The pane needs room for a 1-col margin, both
+# panels side by side, and a matching margin on the right before the
+# LAYERS/TRACE panels are worth drawing (see the gate in ``_compose``).
+_PANEL_MARGIN = 1
+_LAYERS_PANEL_WIDTH = 22
+_INFO_PANEL_WIDTH = 32
+_MIN_PANEL_COLS = _PANEL_MARGIN + _LAYERS_PANEL_WIDTH + _INFO_PANEL_WIDTH + _PANEL_MARGIN
+
 
 @dataclass(frozen=True)
 class _MapCtx:
-    """Everything the renderer needs in one immutable bundle."""
+    """Everything the renderer needs in one immutable bundle.
+
+    ``lat_min``/``lat_max``/``lon_min``/``lon_max``, the altitude range,
+    and ``source_counts`` are reductions over ``points`` computed once
+    (in ``_build_ctx``, on data load) rather than recomputed on every
+    ``MapCanvas.render()`` call -- a terminal resize alone would
+    otherwise re-walk the whole point list several times per frame.
+    """
 
     points: list[TracePoint]
     date: str | None
     start_label: str
     end_label: str
+    gap_secs: float
+    lat_min: float
+    lat_max: float
+    lon_min: float
+    lon_max: float
+    alt_min: int | None
+    alt_max: int | None
+    source_counts: Counter[str]
 
 
 @dataclass(frozen=True)
@@ -99,36 +127,100 @@ class _MapLoadResult:
     trailing: str
 
 
+def _build_ctx(
+    points: list[TracePoint],
+    date: str | None,
+    start_label: str,
+    end_label: str,
+    gap_secs: float,
+) -> _MapCtx:
+    """Build a ``_MapCtx`` from a nonempty point list, computing the bbox /
+    altitude range / source counts exactly once (F7)."""
+    lats = [p.lat for p in points]
+    lons = [p.lon for p in points]
+    alts = [p.alt_ft for p in points if p.alt_ft is not None]
+    return _MapCtx(
+        points=points,
+        date=date,
+        start_label=start_label,
+        end_label=end_label,
+        gap_secs=gap_secs,
+        lat_min=min(lats),
+        lat_max=max(lats),
+        lon_min=min(lons),
+        lon_max=max(lons),
+        alt_min=min(alts) if alts else None,
+        alt_max=max(alts) if alts else None,
+        source_counts=Counter(p.source for p in points),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Projection + trace rasterisation
 # ---------------------------------------------------------------------------
 
 
-def _project_to_dots(points: list[TracePoint], dot_w: int, dot_h: int) -> list[tuple[int, int, str]]:
-    """Project trace points into dot coordinates on the braille canvas.
+def _usable_dot_span(dot_w: int, dot_h: int) -> tuple[int, int, int, int]:
+    """Return ``(inset_x, inset_y, usable_w, usable_h)`` dot spans.
 
-    Returns ``(dot_x, dot_y, source)`` triples in input order. Lat/lon
-    is projected into ``[0, dot_w-1] x [0, dot_h-1]`` with lat inverted
-    (north = top of screen) and a small inset so endpoint labels don't
-    hit the edge. A tiny epsilon protects against a degenerate bbox
-    from a single-point trace.
+    The projection insets by ~10% so the trace doesn't hug the pane
+    edges where endpoint labels want to live. Shared by the projector
+    and the legend's degrees-per-cell scale so both agree on what "the
+    map" actually spans.
     """
-    if not points or dot_w <= 1 or dot_h <= 1:
-        return []
-    lats = [p.lat for p in points]
-    lons = [p.lon for p in points]
-    lat_min, lat_max = min(lats), max(lats)
-    lon_min, lon_max = min(lons), max(lons)
-    if lat_max == lat_min:
-        lat_max = lat_min + 1e-6
-    if lon_max == lon_min:
-        lon_max = lon_min + 1e-6
-    # Inset the projection by ~10% so the trace doesn't hug the edges
-    # of the pane where the labels want to live.
     inset_x = max(1, dot_w // 10)
     inset_y = max(1, dot_h // 10)
     usable_w = max(1, dot_w - 2 * inset_x - 1)
     usable_h = max(1, dot_h - 2 * inset_y - 1)
+    return inset_x, inset_y, usable_w, usable_h
+
+
+def _scale_deg_per_cell(
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+    dot_w: int,
+    dot_h: int,
+) -> float:
+    """Approximate degrees-per-cell for the legend caption (F1).
+
+    Uses the same usable-span math as ``_project_to_dots`` so the
+    caption reflects the actual current projection instead of a fixed
+    guess -- scale varies enormously between a transcontinental trace
+    and a helicopter hop. A terminal cell is ~2 dots wide x 4 dots
+    tall, so lon-per-cell and lat-per-cell can differ; this returns
+    the larger of the two, the dimension that would clip first.
+    """
+    _, _, usable_w, usable_h = _usable_dot_span(dot_w, dot_h)
+    lon_per_cell = (lon_max - lon_min) / usable_w * 2
+    lat_per_cell = (lat_max - lat_min) / usable_h * 4
+    return max(lon_per_cell, lat_per_cell)
+
+
+def _project_to_dots(
+    points: list[TracePoint],
+    lat_min: float,
+    lat_max: float,
+    lon_min: float,
+    lon_max: float,
+    dot_w: int,
+    dot_h: int,
+) -> list[tuple[int, int, str]]:
+    """Project trace points into dot coordinates on the braille canvas.
+
+    Returns ``(dot_x, dot_y, source)`` triples in input order. Lat/lon
+    is projected into ``[0, dot_w-1] x [0, dot_h-1]`` with lat inverted
+    (north = top of screen) using the caller-supplied bbox (computed
+    once in ``_build_ctx``, not re-derived here).
+    """
+    if not points or dot_w <= 1 or dot_h <= 1:
+        return []
+    if lat_max == lat_min:
+        lat_max = lat_min + 1e-6
+    if lon_max == lon_min:
+        lon_max = lon_min + 1e-6
+    inset_x, inset_y, usable_w, usable_h = _usable_dot_span(dot_w, dot_h)
     out: list[tuple[int, int, str]] = []
     for p in points:
         x = inset_x + int((p.lon - lon_min) / (lon_max - lon_min) * usable_w)
@@ -141,41 +233,26 @@ def _rasterise_trace(
     canvas: BrailleCanvas,
     points: list[TracePoint],
     projected: list[tuple[int, int, str]],
+    gap_secs: float,
 ) -> None:
     """Draw the trace with solid source-coloured segments; jumps in
-    timestamp longer than ``_GAP_SECS`` become dashed amber so a
-    signal-loss gap is visible on the map."""
+    timestamp longer than ``gap_secs`` become dashed amber so a
+    signal-loss gap is visible on the map.
+
+    No-ops if ``projected`` is empty (F8): the projector returns ``[]``
+    for a degenerate dot grid even when ``points`` is nonempty, and
+    indexing into it here would otherwise raise.
+    """
+    if not projected:
+        return
     for i in range(len(points) - 1):
         x0, y0, src = projected[i]
         x1, y1, _ = projected[i + 1]
         dt = points[i + 1].ts - points[i].ts
-        if dt > _GAP_SECS:
-            _dashed_line(canvas, x0, y0, x1, y1, ACCENT_AMBER)
+        if dt > gap_secs:
+            canvas.line(x0, y0, x1, y1, ACCENT_AMBER, dash=(2, 2))
         else:
             canvas.line(x0, y0, x1, y1, _SOURCE_COLOUR.get(src, FG_0))
-
-
-def _dashed_line(canvas: BrailleCanvas, x0: int, y0: int, x1: int, y1: int, colour: str) -> None:
-    """Bresenham variant that plots every third dot (dash 2, gap 2)."""
-    dx = abs(x1 - x0)
-    dy = -abs(y1 - y0)
-    sx = 1 if x0 < x1 else -1
-    sy = 1 if y0 < y1 else -1
-    err = dx + dy
-    step = 0
-    while True:
-        if step % 4 < 2:
-            canvas.set(x0, y0, colour)
-        step += 1
-        if x0 == x1 and y0 == y1:
-            return
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            x0 += sx
-        if e2 <= dx:
-            err += dx
-            y0 += sy
 
 
 # ---------------------------------------------------------------------------
@@ -183,31 +260,66 @@ def _dashed_line(canvas: BrailleCanvas, x0: int, y0: int, x1: int, y1: int, colo
 # ---------------------------------------------------------------------------
 
 
-def _place_text(
-    cells: list[list[str | None]],
-    row: int,
-    col: int,
-    text: str,
-    colour: str,
-) -> None:
-    """Write ``text`` into the cell grid starting at ``(row, col)``.
+@dataclass
+class _Grid:
+    """Character + per-cell colour grid the compositor paints into.
 
-    Each char becomes one cell, silently truncated at the right edge.
-    Spaces are stored as a literal ``" "`` so background dots don't
-    bleed through through gaps in labels.
+    Kept as two parallel arrays rather than per-cell markup strings so
+    the final render can coalesce runs of same-coloured characters into
+    a handful of ``rich.text.Text`` spans instead of emitting one markup
+    tag per character (~10k tags for a full pane).
     """
-    if row < 0 or row >= len(cells):
+
+    rows: int
+    cols: int
+    chars: list[list[str]] = field(init=False)
+    colour: list[list[str | None]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.chars = [[" "] * self.cols for _ in range(self.rows)]
+        self.colour = [[None] * self.cols for _ in range(self.rows)]
+
+    def set(self, row: int, col: int, ch: str, colour: str | None) -> None:
+        if 0 <= row < self.rows and 0 <= col < self.cols:
+            self.chars[row][col] = ch
+            self.colour[row][col] = colour
+
+    def to_text(self) -> Text:
+        text = Text()
+        for r in range(self.rows):
+            if r:
+                text.append("\n")
+            char_row = self.chars[r]
+            colour_row = self.colour[r]
+            col = 0
+            while col < self.cols:
+                run_colour = colour_row[col]
+                start = col
+                while col < self.cols and colour_row[col] == run_colour:
+                    col += 1
+                run = "".join(char_row[start:col])
+                text.append(run, style=run_colour or "")
+        return text
+
+
+def _place_text(grid: _Grid, row: int, col: int, text: str, colour: str) -> None:
+    """Write ``text`` into the grid starting at ``(row, col)``.
+
+    Each char becomes one cell, silently truncated at the pane edge.
+    Spaces are written with no colour so background dots don't bleed
+    through gaps in labels.
+    """
+    if row < 0 or row >= grid.rows:
         return
-    width = len(cells[0])
     for i, ch in enumerate(text):
         c = col + i
-        if c < 0 or c >= width:
+        if c < 0 or c >= grid.cols:
             continue
-        cells[row][c] = " " if ch == " " else f"[{colour}]{ch}[/]"
+        grid.set(row, c, ch, None if ch == " " else colour)
 
 
 def _draw_panel(
-    cells: list[list[str | None]],
+    grid: _Grid,
     *,
     top: int,
     left: int,
@@ -220,69 +332,73 @@ def _draw_panel(
     segment sequence is concatenated horizontally into the panel's
     inner width (width - 4: 2 for the left/right borders, 2 for
     inner padding). Silently no-ops if the panel would overflow the
-    cell grid.
+    grid.
     """
     height = len(rows) + 2
-    grid_rows = len(cells)
-    grid_cols = len(cells[0]) if cells else 0
-    if top < 0 or left < 0 or top + height > grid_rows or left + width > grid_cols:
+    if top < 0 or left < 0 or top + height > grid.rows or left + width > grid.cols:
         return
     inner_left = left + 2
     inner_width = width - 4
 
     # Top border
-    cells[top][left] = f"[{BD_0}]┌[/]"
+    grid.set(top, left, "┌", BD_0)
     for c in range(left + 1, left + width - 1):
-        cells[top][c] = f"[{BD_0}]─[/]"
-    cells[top][left + width - 1] = f"[{BD_0}]┐[/]"
+        grid.set(top, c, "─", BD_0)
+    grid.set(top, left + width - 1, "┐", BD_0)
 
     # Content rows
     for i, segments in enumerate(rows):
         r = top + 1 + i
-        cells[r][left] = f"[{BD_0}]│[/]"
+        grid.set(r, left, "│", BD_0)
         # Clear inner cells so grid dots / trace don't bleed through.
         for c in range(left + 1, left + width - 1):
-            cells[r][c] = " "
-        cells[r][left + width - 1] = f"[{BD_0}]│[/]"
+            grid.set(r, c, " ", None)
+        grid.set(r, left + width - 1, "│", BD_0)
         col_cursor = inner_left
         max_col = inner_left + inner_width
         for colour, text in segments:
             if col_cursor >= max_col:
                 break
             allowed = max_col - col_cursor
-            _place_text(cells, r, col_cursor, text[:allowed], colour)
+            _place_text(grid, r, col_cursor, text[:allowed], colour)
             col_cursor += min(len(text), allowed)
 
     # Bottom border
     br = top + height - 1
-    cells[br][left] = f"[{BD_0}]└[/]"
+    grid.set(br, left, "└", BD_0)
     for c in range(left + 1, left + width - 1):
-        cells[br][c] = f"[{BD_0}]─[/]"
-    cells[br][left + width - 1] = f"[{BD_0}]┘[/]"
+        grid.set(br, c, "─", BD_0)
+    grid.set(br, left + width - 1, "┘", BD_0)
 
 
-def _draw_grid_backdrop(cells: list[list[str | None]], occupied: set[tuple[int, int]]) -> None:
+def _draw_grid_backdrop(grid: _Grid, occupied: set[tuple[int, int]]) -> None:
     """Sprinkle dim graph-paper dots across cells the trace didn't touch.
 
     ``occupied`` is the set of ``(row, col)`` that have a braille glyph
     already; we skip those so the dots don't clash with the path.
     """
-    rows = len(cells)
-    cols = len(cells[0])
-    for r in range(1, rows - 1, _GRID_ROW_STEP):
-        for c in range(2, cols - 1, _GRID_COL_STEP):
+    for r in range(1, grid.rows - 1, _GRID_ROW_STEP):
+        for c in range(2, grid.cols - 1, _GRID_COL_STEP):
             if (r, c) in occupied:
                 continue
-            cells[r][c] = f"[{BD_0}]·[/]"
+            grid.set(r, c, "·", BD_0)
 
 
-def _layers_panel(points: list[TracePoint]) -> list[list[tuple[str, str]]]:
-    """Build the LAYERS panel content: source counts with coloured markers."""
-    counts: Counter[str] = Counter(p.source for p in points)
-    total = sum(counts.values())
+def _layers_panel(counts: Counter[str], total: int) -> list[list[tuple[str, str]]]:
+    """Build the LAYERS panel content: source counts with coloured markers.
+
+    Sources not covered by any ``_SOURCE_LEGEND`` entry (unknown, mode_s,
+    the generic "other" tag) still count toward ``total``; without an
+    aggregated row for them, a trace dominated by an unlisted source
+    would show near-0% on every visible row (F3). The "other" row is
+    always present, like every other legend row, so the panel's row
+    count -- and therefore its height -- doesn't change with the data.
+    """
     rows: list[list[tuple[str, str]]] = [[(ACCENT_CYAN, "LAYERS")]]
+    accounted = 0
     for label, colour, src_keys in _SOURCE_LEGEND:
         n = sum(counts.get(key, 0) for key in src_keys)
+        accounted += n
         pct = (100.0 * n / total) if total else 0.0
         marker_colour = colour if n else BD_0
         label_colour = FG_0 if n else FG_2
@@ -293,16 +409,36 @@ def _layers_panel(points: list[TracePoint]) -> list[list[tuple[str, str]]]:
                 (FG_2, f"{pct:>5.1f}%"),
             ]
         )
+    other_n = total - accounted
+    pct = (100.0 * other_n / total) if total else 0.0
+    marker_colour = FG_2 if other_n else BD_0
+    label_colour = FG_0 if other_n else FG_2
+    rows.append(
+        [
+            (marker_colour, "● "),
+            (label_colour, f"{'other':<6}"),
+            (FG_2, f"{pct:>5.1f}%"),
+        ]
+    )
     return rows
+
+
+def _alt_range_str(alt_min: int | None, alt_max: int | None) -> str:
+    """Format the TRACE panel's altitude range.
+
+    Ground-only traces have no baro altitude reading at all (``alt_ft``
+    is None on every ground point), so ``alt_min``/``alt_max`` are both
+    None -- that means the aircraft was on the ground the whole trace,
+    not "0 .. 0 ft" (F2).
+    """
+    if alt_min is None or alt_max is None:
+        return "ground"
+    return f"{alt_min:,} .. {alt_max:,} ft"
 
 
 def _info_panel(ctx: _MapCtx) -> list[list[tuple[str, str]]]:
     """Build the TRACE info panel: bbox / count / alt range. This is the
     "WHERE in the world are we" panel."""
-    pts = ctx.points
-    lats = [p.lat for p in pts]
-    lons = [p.lon for p in pts]
-    alts = [p.alt_ft for p in pts if p.alt_ft is not None]
 
     def _lat(x: float) -> str:
         return f"{abs(x):.2f}°{'S' if x < 0 else 'N'}"
@@ -310,23 +446,18 @@ def _info_panel(ctx: _MapCtx) -> list[list[tuple[str, str]]]:
     def _lon(x: float) -> str:
         return f"{abs(x):.2f}°{'W' if x < 0 else 'E'}"
 
-    lat_min, lat_max = min(lats), max(lats)
-    lon_min, lon_max = min(lons), max(lons)
-    alt_min = min(alts) if alts else 0
-    alt_max = max(alts) if alts else 0
-
     return [
         [(ACCENT_CYAN, "TRACE")],
         [(FG_2, "date  "), (FG_0, ctx.date or "-")],
-        [(FG_2, "pts   "), (FG_0, f"{len(pts):,}")],
-        [(FG_2, "lat   "), (FG_0, f"{_lat(lat_min)} .. {_lat(lat_max)}")],
-        [(FG_2, "lon   "), (FG_0, f"{_lon(lon_min)} .. {_lon(lon_max)}")],
-        [(FG_2, "alt   "), (FG_0, f"{alt_min:,} .. {alt_max:,} ft")],
+        [(FG_2, "pts   "), (FG_0, f"{len(ctx.points):,}")],
+        [(FG_2, "lat   "), (FG_0, f"{_lat(ctx.lat_min)} .. {_lat(ctx.lat_max)}")],
+        [(FG_2, "lon   "), (FG_0, f"{_lon(ctx.lon_min)} .. {_lon(ctx.lon_max)}")],
+        [(FG_2, "alt   "), (FG_0, _alt_range_str(ctx.alt_min, ctx.alt_max))],
     ]
 
 
 def _draw_endpoint(
-    cells: list[list[str | None]],
+    grid: _Grid,
     projected_pt: tuple[int, int, str],
     label: str,
     colour: str,
@@ -335,68 +466,92 @@ def _draw_endpoint(
 
     The label sits to the right of the marker if there's room; if the
     right-hand placement would spill past the pane edge, flip to the
-    left so the label stays visible.
+    left. Placement always leaves a 1-cell gap before the marker and
+    truncates the label to fit that gap rather than clamping its start
+    position back across the marker cell (F4) -- a label that doesn't
+    fit on the left gets shortened, never repositioned onto the marker.
     """
     x, y, _ = projected_pt
     row = y // 4
     col = x // 2
-    if row < 0 or row >= len(cells) or col < 0 or col >= len(cells[0]):
+    if row < 0 or row >= grid.rows or col < 0 or col >= grid.cols:
         return
-    cells[row][col] = f"[{colour}]●[/]"
-    width = len(cells[0])
+    grid.set(row, col, "●", colour)
     right_start = col + 2
-    if right_start + len(label) <= width:
-        _place_text(cells, row, right_start, label, colour)
-    else:
-        left_start = max(0, col - 1 - len(label))
-        _place_text(cells, row, left_start, label, colour)
+    available_right = grid.cols - right_start
+    if available_right >= len(label):
+        _place_text(grid, row, right_start, label, colour)
+        return
+    available_left = col - 1  # columns [0, col-2], leaving a 1-cell gap
+    if available_left <= 0:
+        return
+    text = label[:available_left]
+    left_start = col - 1 - len(text)
+    _place_text(grid, row, left_start, text, colour)
 
 
-def _compose(ctx: _MapCtx, cols: int, rows: int) -> str:
-    """Compose grid + trace + panels + labels into a Rich-markup string."""
-    cells: list[list[str | None]] = [[None] * cols for _ in range(rows)]
+def _footer_legend(deg_per_cell: float) -> str:
+    """Build the bottom legend from ``_SOURCE_LEGEND`` -- the single
+    source of truth for the source -> colour mapping (F7) -- plus the
+    live degrees-per-cell scale (F1)."""
+    parts: list[str] = []
+    for label, colour, _ in _SOURCE_LEGEND:
+        short = label.lower().replace("-", "")
+        suffix = _FOOTER_SUFFIX.get(label)
+        text = f"{short} / {suffix}" if suffix else short
+        parts.append(f"[{colour}]● {text}[/]")
+    parts.append(f"[{FG_1}]grid ~{deg_per_cell:.3f}°/cell[/]")
+    return "   ".join(parts)
+
+
+def _compose(ctx: _MapCtx, cols: int, rows: int) -> Text:
+    """Compose grid + trace + panels + labels into a coalesced Text."""
+    grid = _Grid(rows=rows, cols=cols)
 
     # Pass 1: rasterise the trace onto the braille canvas.
     canvas = BrailleCanvas(cols=cols, rows=rows)
-    projected = _project_to_dots(ctx.points, canvas.dot_width, canvas.dot_height)
-    _rasterise_trace(canvas, ctx.points, projected)
+    projected = _project_to_dots(
+        ctx.points, ctx.lat_min, ctx.lat_max, ctx.lon_min, ctx.lon_max, canvas.dot_width, canvas.dot_height
+    )
+    _rasterise_trace(canvas, ctx.points, projected, ctx.gap_secs)
 
-    # Extract occupied cells for grid-dot suppression AND copy braille
-    # glyphs into the cell grid.
+    # Copy braille glyphs into the grid via the public cell iterator
+    # (not canvas._bits/_colours) and remember which cells they touched
+    # so the grid backdrop skips them.
     occupied: set[tuple[int, int]] = set()
-    for r in range(rows):
-        for c in range(cols):
-            mask = canvas._bits[r][c]
-            if mask:
-                ch = chr(0x2800 + mask)
-                colour = canvas._colours.get((r, c), FG_0)
-                cells[r][c] = f"[{colour}]{ch}[/]"
-                occupied.add((r, c))
+    for r, c, ch, colour in canvas.cells():
+        grid.set(r, c, ch, colour)
+        occupied.add((r, c))
 
     # Pass 2: grid backdrop (only where trace didn't draw).
-    _draw_grid_backdrop(cells, occupied)
+    _draw_grid_backdrop(grid, occupied)
 
     # Pass 3: overlay panels. Only draw them if the pane is wide/tall
     # enough; otherwise the map gets buried under chrome.
-    if cols >= 56 and rows >= 9:
-        _draw_panel(cells, top=0, left=1, width=22, rows=_layers_panel(ctx.points))
+    if cols >= _MIN_PANEL_COLS and rows >= 9:
+        _draw_panel(
+            grid,
+            top=0,
+            left=_PANEL_MARGIN,
+            width=_LAYERS_PANEL_WIDTH,
+            rows=_layers_panel(ctx.source_counts, len(ctx.points)),
+        )
         info_rows = _info_panel(ctx)
-        info_width = 32
-        _draw_panel(cells, top=0, left=max(1, cols - info_width - 1), width=info_width, rows=info_rows)
+        _draw_panel(
+            grid,
+            top=0,
+            left=max(_PANEL_MARGIN, cols - _INFO_PANEL_WIDTH - _PANEL_MARGIN),
+            width=_INFO_PANEL_WIDTH,
+            rows=info_rows,
+        )
 
-    # Pass 4: endpoint markers + labels. Place after panels so labels
-    # don't disappear under a panel; but if the endpoint lands in a
-    # panel zone, the marker still overwrites that cell, so push the
-    # label to the opposite side.
+    # Pass 4: endpoint markers + labels, placed after panels so labels
+    # stay visible even where they overlap a panel region.
     if projected:
-        _draw_endpoint(cells, projected[0], f"start {ctx.start_label}", ACCENT_OK)
-        _draw_endpoint(cells, projected[-1], f"end {ctx.end_label}", ACCENT_CYAN)
+        _draw_endpoint(grid, projected[0], f"start {ctx.start_label}", ACCENT_OK)
+        _draw_endpoint(grid, projected[-1], f"end {ctx.end_label}", ACCENT_CYAN)
 
-    # Render
-    lines: list[str] = []
-    for row in cells:
-        lines.append("".join(cell if cell is not None else " " for cell in row))
-    return "\n".join(lines)
+    return grid.to_text()
 
 
 # ---------------------------------------------------------------------------
@@ -436,12 +591,11 @@ class MapCanvas(Widget):
                 f"[{FG_2}]no trace points available. select an aircraft (1) with trace data, then hit 5.[/]"
             )
         body = _compose(ctx, cols=w, rows=grid_h)
-        legend = (
-            f"[{ACCENT_OK}]● adsb[/]   [{FG_2}]● mlat[/]   [{ACCENT_AMBER}]● tisb / gap[/]   "
-            f"[{ACCENT_CYAN}]● adsr / end[/]   [{ACCENT_VIOLET}]● adsc[/]   "
-            f"[{FG_1}]grid 0.01°/cell approx[/]"
-        )
-        return Text.from_markup(f"{body}\n{legend}")
+        dot_w, dot_h = w * 2, grid_h * 4
+        scale = _scale_deg_per_cell(ctx.lat_min, ctx.lat_max, ctx.lon_min, ctx.lon_max, dot_w, dot_h)
+        body.append("\n")
+        body.append_text(Text.from_markup(_footer_legend(scale)))
+        return body
 
 
 class MapView(Vertical):
@@ -451,6 +605,7 @@ class MapView(Vertical):
         super().__init__(id="view-map")
         self._icao: str | None = None
         self._date: str | None = None
+        self._cfg = Config()
         self._header = PageHeader("map", crumb="select an aircraft first", widget_id="map-header")
         self._canvas = MapCanvas()
 
@@ -501,12 +656,11 @@ class MapView(Vertical):
                 )
             start_label = self._airport_or_coords(db, points[0])
             end_label = self._airport_or_coords(db, points[-1])
-            ctx = _MapCtx(points=points, date=date, start_label=start_label, end_label=end_label)
-            lats = [p.lat for p in points]
-            lons = [p.lon for p in points]
+            ctx = _build_ctx(points, date, start_label, end_label, self._cfg.map_trace_gap_secs)
             crumb = f"map / {date}   {start_label} > {end_label}"
             trailing = (
-                f"{len(points):,} points   bbox ({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
+                f"{len(points):,} points   "
+                f"bbox ({ctx.lat_min:.3f},{ctx.lon_min:.3f})-({ctx.lat_max:.3f},{ctx.lon_max:.3f})"
             )
             return _MapLoadResult(icao=icao, date=date, ctx=ctx, crumb=crumb, trailing=trailing)
         finally:
@@ -529,10 +683,14 @@ class MapView(Vertical):
             self.app.notify(f"failed to load map: {event.worker.error}", severity="error")
 
     def _airport_or_coords(self, db: Database, point: TracePoint) -> str:
-        """Return the nearest airport ident, or a lat/lon fallback."""
+        """Return the nearest airport ident, or a lat/lon fallback.
+
+        Narrowed to ``sqlite3.Error`` (F5): a bug in ``find_nearest_airport``
+        should surface as a crash, not silently fall back to raw coords.
+        """
         try:
-            match = find_nearest_airport(db, point.lat, point.lon, Config())
-        except Exception:
+            match = find_nearest_airport(db, point.lat, point.lon, self._cfg)
+        except sqlite3.Error:
             match = None
         if match and match.ident:
             return match.ident

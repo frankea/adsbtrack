@@ -22,6 +22,7 @@ Codepoint = 0x2800 + sum of bit flags, where dot N maps to bit N-1.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 
 # Map (dx, dy) in 2x4 dot coordinates to the Unicode braille bit index.
@@ -72,20 +73,38 @@ class BrailleCanvas:
         self._bits[row][col] |= 1 << _DOT_BITS[(x % 2, y % 4)]
         self._colours[(row, col)] = colour
 
-    def line(self, x0: int, y0: int, x1: int, y1: int, colour: str) -> None:
+    def line(
+        self,
+        x0: int,
+        y0: int,
+        x1: int,
+        y1: int,
+        colour: str,
+        *,
+        dash: tuple[int, int] | None = None,
+    ) -> None:
         """Bresenham line between two dot-coordinates.
 
         Draws one dot per step along the longer axis. Endpoints are
         inclusive, so a zero-length ``(x0 == x1, y0 == y1)`` segment
         still lights one dot.
+
+        ``dash``, if given, is an ``(on, off)`` dot-count pattern: only
+        the first ``on`` dots of every ``on + off`` step are plotted,
+        producing a dashed line (used for signal-loss gaps on the map)
+        without a separate copy of this Bresenham walk.
         """
         dx = abs(x1 - x0)
         dy = -abs(y1 - y0)
         sx = 1 if x0 < x1 else -1
         sy = 1 if y0 < y1 else -1
         err = dx + dy
+        period = sum(dash) if dash else 0
+        step = 0
         while True:
-            self.set(x0, y0, colour)
+            if dash is None or step % period < dash[0]:
+                self.set(x0, y0, colour)
+            step += 1
             if x0 == x1 and y0 == y1:
                 return
             e2 = 2 * err
@@ -98,18 +117,25 @@ class BrailleCanvas:
 
     # --- rendering ---
 
-    def render(self) -> str:
-        """Return the canvas as Rich-markup text, one line per row."""
-        lines: list[str] = []
+    def cells(self) -> Iterator[tuple[int, int, str, str]]:
+        """Yield ``(row, col, glyph, colour)`` for every non-empty cell.
+
+        ``colour`` is always present for a lit cell: every ``set()`` call
+        that lights a dot also records that cell's colour, so a nonzero
+        bitmask always has a matching ``_colours`` entry. This is the
+        single place that turns the dot bitmap into glyphs; ``render()``
+        and callers outside this module (the map view's compositor) both
+        go through it instead of reaching into ``_bits``/``_colours``.
+        """
         for r in range(self.rows):
-            cells: list[str] = []
             for c in range(self.cols):
                 mask = self._bits[r][c]
-                if mask == 0:
-                    cells.append(" ")
-                    continue
-                ch = chr(0x2800 + mask)
-                colour = self._colours.get((r, c), "#ffffff")
-                cells.append(f"[{colour}]{ch}[/]")
-            lines.append("".join(cells))
-        return "\n".join(lines)
+                if mask:
+                    yield r, c, chr(0x2800 + mask), self._colours[(r, c)]
+
+    def render(self) -> str:
+        """Return the canvas as Rich-markup text, one line per row."""
+        grid = [[" "] * self.cols for _ in range(self.rows)]
+        for r, c, ch, colour in self.cells():
+            grid[r][c] = f"[{colour}]{ch}[/]"
+        return "\n".join("".join(row) for row in grid)

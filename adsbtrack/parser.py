@@ -242,10 +242,12 @@ def _stitch_fragments(
     coverage gaps that are normal on their operational missions.
 
     Merging is destructive: the merged flight inherits prev.takeoff_* (if
-    observed) and next.last_*, and its metrics are taken from the next
-    fragment (since the classifier needs the tail of the trace). The
-    takeoff_type of the merged flight becomes "observed" if prev observed
-    its takeoff, otherwise "found_mid_flight".
+    observed) and next.landing_*/last_*, and its metrics are the earlier
+    fragment's FlightMetrics with the later fragment folded in via
+    FlightMetrics.merge() (see the per-field strategy table declared next to
+    each field in classifier.py). The takeoff_type of the merged flight
+    becomes "observed" if prev observed its takeoff, otherwise
+    "found_mid_flight".
     """
     if len(flights) < 2:
         return flights, metrics_list
@@ -309,77 +311,23 @@ def _stitch_fragments(
                         stitched.takeoff_date = flight.takeoff_date
                         stitched.callsign = flight.callsign or next_flight.callsign
 
-                        # Metrics: carry forward sources and takeoff type
-                        next_metrics.sources |= metrics.sources
-                        if metrics.takeoff_type == "observed":
-                            next_metrics.takeoff_type = "observed"
-                            next_metrics.ground_points_at_takeoff = metrics.ground_points_at_takeoff
-                        # Use the earliest first_point_ts so duration covers
-                        # the full span including the coverage gap.
-                        if (
-                            metrics.first_point_ts is not None
-                            and next_metrics.first_point_ts is not None
-                            and metrics.first_point_ts < next_metrics.first_point_ts
-                        ):
-                            next_metrics.first_point_ts = metrics.first_point_ts
-
-                        # merge every accumulator so stitched flights
-                        # don't silently undercount. Path length sums,
-                        # phase counters sum, peak rates take the extremum,
-                        # squawk/callsign histories union.
-                        next_metrics.data_points += metrics.data_points
-                        next_metrics.adsb_points += metrics.adsb_points
-                        next_metrics.mlat_points += metrics.mlat_points
-                        next_metrics.tisb_points += metrics.tisb_points
-                        next_metrics.path_length_km += metrics.path_length_km
-                        next_metrics.max_distance_from_origin_km = max(
-                            next_metrics.max_distance_from_origin_km,
-                            metrics.max_distance_from_origin_km,
-                        )
-                        next_metrics.climb_secs += metrics.climb_secs
-                        next_metrics.descent_secs += metrics.descent_secs
-                        next_metrics.level_secs += metrics.level_secs
-                        next_metrics.level_buf = metrics.level_buf + next_metrics.level_buf
-                        if metrics.peak_climb_fpm > next_metrics.peak_climb_fpm:
-                            next_metrics.peak_climb_fpm = metrics.peak_climb_fpm
-                        if metrics.peak_descent_fpm < next_metrics.peak_descent_fpm:
-                            next_metrics.peak_descent_fpm = metrics.peak_descent_fpm
-                        if metrics.max_hover_secs > next_metrics.max_hover_secs:
-                            next_metrics.max_hover_secs = metrics.max_hover_secs
-                        next_metrics.hover_episodes += metrics.hover_episodes
-                        next_metrics.squawk_1200_count += metrics.squawk_1200_count
-                        next_metrics.squawk_total_count += metrics.squawk_total_count
-                        if next_metrics.squawk_first is None:
-                            next_metrics.squawk_first = metrics.squawk_first
-                        next_metrics.squawk_changes += metrics.squawk_changes
-                        next_metrics.emergency_squawks_seen |= metrics.emergency_squawks_seen
-                        for cs in metrics.callsigns_seen:
-                            if cs not in next_metrics.callsigns_seen:
-                                next_metrics.callsigns_seen.insert(0, cs)
-                        next_metrics.callsign_changes += metrics.callsign_changes
-                        for cat, cnt in metrics.category_counts.items():
-                            next_metrics.category_counts[cat] = next_metrics.category_counts.get(cat, 0) + cnt
-                        if next_metrics.autopilot_target_alt_ft is None:
-                            next_metrics.autopilot_target_alt_ft = metrics.autopilot_target_alt_ft
-                        if next_metrics.emergency_flag is None and metrics.emergency_flag is not None:
-                            next_metrics.emergency_flag = metrics.emergency_flag
-                        # Max altitude of the merged flight: take the max of
-                        # both dual-track peaks so the derived max_altitude
-                        # property continues to prefer persisted over raw
-                        # after the stitch (preserves the AP-validated
-                        # channel across fragment merges).
-                        if metrics._raw_max_altitude > next_metrics._raw_max_altitude:
-                            next_metrics._raw_max_altitude = metrics._raw_max_altitude
-                        if metrics._persisted_max_altitude > next_metrics._persisted_max_altitude:
-                            next_metrics._persisted_max_altitude = metrics._persisted_max_altitude
-                        next_metrics.baro_error_points += metrics.baro_error_points
-                        next_metrics.total_ground_points += metrics.total_ground_points
-                        next_metrics.ground_speed_while_ground += metrics.ground_speed_while_ground
-                        # accumulate fragment count across stitches
-                        next_metrics.fragments_stitched += metrics.fragments_stitched
-                        # carry signal_gap_count through stitching.
-                        # Also add 1 for the coverage hole we just bridged.
-                        next_metrics.signal_gap_count += metrics.signal_gap_count + 1
+                        # Metrics: fold the later fragment (next_metrics) into
+                        # the earlier one (metrics). FlightMetrics.merge
+                        # applies the explicit per-field strategy declared
+                        # next to each field in classifier.py (sum / max /
+                        # min / union / keep-first / keep-last / ...), so
+                        # every accumulator - including other_points,
+                        # adsc_points, and squawk_durations, which used to
+                        # fall through unmerged here - combines correctly,
+                        # and takeoff-side fields (takeoff_tracks,
+                        # takeoff_points, ...) stay with the fragment that
+                        # actually observed the takeoff instead of being
+                        # silently overwritten by the later, fictitious
+                        # "found mid-flight" fragment's takeoff data.
+                        metrics.merge(next_metrics)
+                        # +1 for the coverage hole this stitch just bridged,
+                        # on top of whatever gaps each fragment already saw.
+                        metrics.signal_gap_count += 1
 
                         # Recompute duration on the merged flight. extract_flights
                         # computes duration_minutes before stitching using the
@@ -387,11 +335,11 @@ def _stitch_fragments(
                         # first_point_ts we need to refresh the Flight field to
                         # cover the whole stitched span (including the coverage
                         # gap between the two fragments).
-                        if next_metrics.first_point_ts is not None and next_metrics.last_point_ts is not None:
-                            span = next_metrics.last_point_ts - next_metrics.first_point_ts
+                        if metrics.first_point_ts is not None and metrics.last_point_ts is not None:
+                            span = metrics.last_point_ts - metrics.first_point_ts
                             stitched.duration_minutes = round(span / 60.0, 1)
 
-                        merged.append((stitched, next_metrics))
+                        merged.append((stitched, metrics))
                         i += 2
                         continue
 

@@ -913,6 +913,74 @@ def test_stitch_fragments_increments_fragments_stitched():
 
 
 # ---------------------------------------------------------------------------
+# A2: FlightMetrics.merge - other_pct/adsc_pct must cover both fragments
+# ---------------------------------------------------------------------------
+
+
+def test_stitch_fragments_merges_other_points_for_whole_flight_pct():
+    """Before A2, _stitch_fragments never merged other_points/adsc_points,
+    so a stitched flight's other_pct/adsc_pct (parser.py, computed as
+    other_points * 100 / data_points) used tail-only numerators over a
+    whole-flight denominator. Pin the fix at the parser level: after
+    stitching, other_points/adsc_points/data_points must all reflect BOTH
+    fragments, so the percentage parser.py computes from them is correct
+    for the whole stitched flight, not just the tail fragment.
+    """
+    t0 = _ts("2022-06-16", hour=12, minute=43, second=27)
+    f1_end = t0 + (7 * 60)
+    f2_start = t0 + (2 * 60 + 43) * 60 + 18
+    f2_end = f2_start + (3 * 60)
+
+    f1, m1 = _make_signal_lost_fragment(
+        icao="ae07b3",
+        start_ts=t0,
+        end_ts=f1_end,
+        start_lat=35.03,
+        start_lon=-117.93,
+        end_lat=35.59,
+        end_lon=-117.46,
+        end_alt_ft=17575,
+    )
+    m1.data_points = 100
+    m1.other_points = 20
+    m1.adsc_points = 5
+
+    f2, m2 = _make_found_mid_flight_fragment(
+        icao="ae07b3",
+        start_ts=f2_start,
+        end_ts=f2_end,
+        start_lat=37.08,
+        start_lon=-116.31,
+        start_alt_ft=19925,
+        end_lat=37.39,
+        end_lon=-116.03,
+    )
+    m2.data_points = 50
+    m2.other_points = 10
+    m2.adsc_points = 0
+
+    config = Config()
+    config.type_endurance_minutes = {**config.type_endurance_minutes, "K35R": 720.0}
+
+    stitched, metrics = _stitch_fragments([f1, f2], [m1, m2], config, type_code="K35R")
+    assert len(stitched) == 1
+    merged = metrics[0]
+
+    # Whole-flight sums, not just the tail fragment's.
+    assert merged.data_points == 150
+    assert merged.other_points == 30
+    assert merged.adsc_points == 5
+
+    # Mirrors the exact formula parser.py uses to compute flight.other_pct /
+    # flight.adsc_pct (parser.py ~L1179) so this test fails if that formula
+    # and the merged accumulators ever drift apart again.
+    other_pct = round(merged.other_points * 100.0 / merged.data_points, 2)
+    adsc_pct = round(merged.adsc_points * 100.0 / merged.data_points, 2)
+    assert other_pct == round(30 * 100.0 / 150, 2)
+    assert adsc_pct == round(5 * 100.0 / 150, 2)
+
+
+# ---------------------------------------------------------------------------
 # B3: landing_time > takeoff_time guard in parser
 # ---------------------------------------------------------------------------
 

@@ -24,7 +24,8 @@ from __future__ import annotations
 import math
 import statistics
 from collections import deque
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import Field, dataclass, field, fields
 
 from .geo import haversine_m as _haversine_m
 from .models import LandingType
@@ -92,166 +93,251 @@ class _PointSample:
         return self.baro_alt if self.baro_alt is not None else self.geom_alt
 
 
+def _merge_max(a: float | None, b: float | None) -> float | None:
+    """None-safe max: a missing side loses, never wins."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a >= b else b
+
+
+def _merge_min(a: float | None, b: float | None) -> float | None:
+    """None-safe min: a missing side loses, never wins."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if a <= b else b
+
+
+# ----------------------------------------------------------------------
+# FlightMetrics.merge() strategy vocabulary (A2)
+# ----------------------------------------------------------------------
+# Every dataclass field on FlightMetrics declares its own merge strategy via
+# field(..., metadata={"merge": ...}), right next to that field's own
+# definition. FlightMetrics.merge() walks that metadata field-by-field, and
+# a field whose "merge" key is missing or unrecognized makes merge() raise
+# instead of silently dropping that field's data on a stitch - this is the
+# guardrail against the next accumulator getting added without anyone
+# deciding how two stitched fragments should combine it (which is exactly
+# how other_points / adsc_points / squawk_durations went unmerged before
+# this fix, and how takeoff-side fields ended up coming from the wrong
+# fragment).
+_MERGE_SUM = "sum"  # numeric counter: self + other
+_MERGE_MAX = "max"  # peak: greater of the two (None-safe)
+_MERGE_MIN = "min"  # floor: lesser of the two (None-safe)
+_MERGE_UNION = "union"  # set: self |= other
+_MERGE_EXTEND = "extend"  # list: self + other, chronological order (self is earlier)
+_MERGE_EXTEND_DEDUP = "extend_dedup"  # list: self's own order kept, then other's new items appended
+_MERGE_SUM_DICT = "sum_dict"  # dict[str, number]: per-key numeric addition
+_MERGE_KEEP_FIRST = "keep_first"  # takeoff-side: self (earlier fragment) already holds the right value
+_MERGE_KEEP_LAST = "keep_last"  # landing-side / tail-state: self.field = other.field
+_MERGE_COALESCE_FIRST = "coalesce_first"  # self's value wins unless it is None
+_MERGE_COALESCE_LAST = "coalesce_last"  # other's value wins unless it is None
+_MERGE_CUSTOM = "custom"  # bespoke handling inside merge() itself (squawk run handoff)
+_MERGE_EXCLUDE = "exclude"  # transient record_point-only working state; never carried across a merge
+
+_MERGE_STRATEGIES = frozenset(
+    {
+        _MERGE_SUM,
+        _MERGE_MAX,
+        _MERGE_MIN,
+        _MERGE_UNION,
+        _MERGE_EXTEND,
+        _MERGE_EXTEND_DEDUP,
+        _MERGE_SUM_DICT,
+        _MERGE_KEEP_FIRST,
+        _MERGE_KEEP_LAST,
+        _MERGE_COALESCE_FIRST,
+        _MERGE_COALESCE_LAST,
+        _MERGE_CUSTOM,
+        _MERGE_EXCLUDE,
+    }
+)
+
+
+def _undeclared_merge_fields(flds: Iterable[Field]) -> list[str]:
+    return [f.name for f in flds if f.metadata.get("merge") not in _MERGE_STRATEGIES]
+
+
 @dataclass
 class FlightMetrics:
     """Raw signal metrics accumulated during trace processing."""
 
-    data_points: int = 0
-    total_ground_points: int = 0  # any point where classify_ground_state said "ground"
-    baro_error_points: int = 0  # baro=ground but geom or gs disagreed (see record_point)
-    sources: set[str] = field(default_factory=set)
+    data_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    # any point where classify_ground_state said "ground"
+    total_ground_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    # baro=ground but geom or gs disagreed (see record_point)
+    baro_error_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    sources: set[str] = field(default_factory=set, metadata={"merge": _MERGE_UNION})
     # Position source tallies (readsb type/src field). Every recorded point
     # is bucketed by its position_source so per-flight percentages line up
     # with data_points. adsc_points covers CPDLC/ADS-C oceanic reports;
     # other_points is the catch-all for anything the named buckets don't
     # claim (e.g. readsb's "other" and "mode_s"). Points with no source
     # tag are not counted.
-    adsb_points: int = 0
-    mlat_points: int = 0
-    tisb_points: int = 0
-    other_points: int = 0
-    adsc_points: int = 0
+    adsb_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    mlat_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    tisb_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    other_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    adsc_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
     # Dual-track raw and persisted peaks. The raw value is updated every
     # point (warmup fallback). The persisted value is updated only when
     # the persistence filter has >= min_samples points in its window.
     # max_altitude / max_gs_kt are computed properties: persisted wins
     # when > 0, else raw. Deriving rather than writing through closes a
     # class of bug where a code path updates _raw_/_persisted_ and
-    # forgets to re-assign the public field.
-    _raw_max_altitude: int = 0
-    _persisted_max_altitude: int = 0
-    _raw_max_gs_kt: int = 0
-    _persisted_max_gs_kt: int = 0
-    _alt_persist_window: deque = field(default_factory=deque)
-    _gs_persist_window: deque = field(default_factory=deque)
+    # forgets to re-assign the public field. merge() combines the
+    # underlying _raw_/_persisted_ fields with "max" and never touches the
+    # properties themselves (they aren't dataclass fields at all).
+    _raw_max_altitude: int = field(default=0, metadata={"merge": _MERGE_MAX})
+    _persisted_max_altitude: int = field(default=0, metadata={"merge": _MERGE_MAX})
+    _raw_max_gs_kt: int = field(default=0, metadata={"merge": _MERGE_MAX})
+    _persisted_max_gs_kt: int = field(default=0, metadata={"merge": _MERGE_MAX})
+    _alt_persist_window: deque = field(default_factory=deque, metadata={"merge": _MERGE_EXCLUDE})
+    _gs_persist_window: deque = field(default_factory=deque, metadata={"merge": _MERGE_EXCLUDE})
     # count of inter-point gaps longer than path_max_segment_secs
     # observed while airborne. Used to produce signal_gap_count on the flight.
-    signal_gap_count: int = 0
+    signal_gap_count: int = field(default=0, metadata={"merge": _MERGE_SUM})
     # number of raw fragments this metric represents. Non-stitched
     # flights are 1 by definition; _stitch_fragments bumps this on merge.
-    fragments_stitched: int = 1
+    fragments_stitched: int = field(default=1, metadata={"merge": _MERGE_SUM})
     # last observed raw callsign (distinct from callsigns_seen which
     # is the distinct-in-order list). Needed to tell a real transition from
     # a flicker where [-1] of the distinct list is not the most recent.
-    _last_callsign: str | None = None
-    last_airborne_alt: int | None = None  # last airborne baro altitude
-    last_airborne_geom: int | None = None
-    last_airborne_gs: float | None = None
-    last_airborne_baro_rate: float | None = None
-    ground_points_at_takeoff: int = 0
-    ground_points_at_landing: int = 0
-    ground_speed_while_ground: int = 0  # baro=ground with gs > landing threshold
-    landing_lats: list[float] = field(default_factory=list)
-    landing_lons: list[float] = field(default_factory=list)
+    # Transient record_point bookkeeping only - unused once both fragments'
+    # own point streams have already finished.
+    _last_callsign: str | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
+    # last airborne baro altitude
+    last_airborne_alt: int | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    last_airborne_geom: int | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    last_airborne_gs: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    last_airborne_baro_rate: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    ground_points_at_takeoff: int = field(default=0, metadata={"merge": _MERGE_KEEP_FIRST})
+    ground_points_at_landing: int = field(default=0, metadata={"merge": _MERGE_KEEP_LAST})
+    # baro=ground with gs > landing threshold
+    ground_speed_while_ground: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    landing_lats: list[float] = field(default_factory=list, metadata={"merge": _MERGE_KEEP_LAST})
+    landing_lons: list[float] = field(default_factory=list, metadata={"merge": _MERGE_KEEP_LAST})
     # Rolling wall-clock window of recent points for descent analysis.
     # Bumped from 40 to 240 in v3 so go-around detection can walk back 600s.
-    recent_points: deque = field(default_factory=lambda: deque(maxlen=240))
+    recent_points: deque = field(default_factory=lambda: deque(maxlen=240), metadata={"merge": _MERGE_KEEP_LAST})
     # Dedicated (ts, alt) deque for go-around detection. Separate from
     # recent_points so the two use-cases don't constrain each other.
-    approach_alts: deque = field(default_factory=lambda: deque(maxlen=240))
+    approach_alts: deque = field(default_factory=lambda: deque(maxlen=240), metadata={"merge": _MERGE_KEEP_LAST})
     # Takeoff category: "observed" (saw ground -> airborne) or "found_mid_flight"
-    takeoff_type: str = "unknown"
+    takeoff_type: str = field(default="unknown", metadata={"merge": _MERGE_KEEP_FIRST})
     # First/last observed point timestamps - used to compute duration for
     # signal_lost / dropped_on_approach flights that never transitioned to ground.
-    first_point_ts: float | None = None
-    last_point_ts: float | None = None
+    first_point_ts: float | None = field(default=None, metadata={"merge": _MERGE_MIN})
+    last_point_ts: float | None = field(default=None, metadata={"merge": _MERGE_MAX})
     # Last-seen snapshot (may be airborne or ground). For confirmed landings
     # this ends up equal to the landing point; for signal_lost it is where
     # coverage dropped.
-    last_seen_lat: float | None = None
-    last_seen_lon: float | None = None
-    last_seen_alt_ft: int | None = None
-    last_seen_ts: float | None = None
+    last_seen_lat: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    last_seen_lon: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    last_seen_alt_ft: int | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    last_seen_ts: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
     # Transition timestamp of the airborne -> ground landing event. Used by
     # the classifier to pick a pre-flare descent window.
-    landing_transition_ts: float | None = None
+    landing_transition_ts: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
 
     # --- v3 accumulators ---
 
     # Squawk tracking
-    squawk_first: str | None = None
-    squawk_last: str | None = None
-    squawk_changes: int = 0
-    squawk_1200_count: int = 0
-    squawk_total_count: int = 0
-    emergency_squawks_seen: set[str] = field(default_factory=set)
+    squawk_first: str | None = field(default=None, metadata={"merge": _MERGE_COALESCE_FIRST})
+    squawk_last: str | None = field(default=None, metadata={"merge": _MERGE_COALESCE_LAST})
+    squawk_changes: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    squawk_1200_count: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    squawk_total_count: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    emergency_squawks_seen: set[str] = field(default_factory=set, metadata={"merge": _MERGE_UNION})
 
     # --- Squawk duration attribution (for primary_squawk + squawks_observed) ---
     # Per-squawk cumulative seconds. record_point credits each inter-point
     # interval to the then-held squawk. flush_open_squawk() closes the final
     # run using the last observed ts (called from compute_squawk_summary).
-    squawk_durations: dict[str, float] = field(default_factory=dict)
-    _current_squawk: str | None = None
-    _current_squawk_started_ts: float | None = None
+    squawk_durations: dict[str, float] = field(default_factory=dict, metadata={"merge": _MERGE_SUM_DICT})
+    # _current_squawk / _current_squawk_started_ts track whichever squawk run
+    # is still open. merge() handles these itself (strategy "custom"): it
+    # flushes self's dangling run into squawk_durations using self's own
+    # pre-merge last_point_ts, then adopts other's open run as the new tail
+    # state - see merge() below for why that ordering matters.
+    _current_squawk: str | None = field(default=None, metadata={"merge": _MERGE_CUSTOM})
+    _current_squawk_started_ts: float | None = field(default=None, metadata={"merge": _MERGE_CUSTOM})
 
     # Callsign history (observed callsigns across the flight in order of
     # first appearance; distinct only)
-    callsigns_seen: list[str] = field(default_factory=list)
-    callsign_changes: int = 0
+    callsigns_seen: list[str] = field(default_factory=list, metadata={"merge": _MERGE_EXTEND_DEDUP})
+    callsign_changes: int = field(default=0, metadata={"merge": _MERGE_SUM})
 
     # Path length and position tracking
-    origin_lat: float | None = None
-    origin_lon: float | None = None
-    path_length_km: float = 0.0
-    max_distance_from_origin_km: float = 0.0
-    _prev_path_lat: float | None = None
-    _prev_path_lon: float | None = None
-    _prev_path_ts: float | None = None
+    origin_lat: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_FIRST})
+    origin_lon: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_FIRST})
+    path_length_km: float = field(default=0.0, metadata={"merge": _MERGE_SUM})
+    max_distance_from_origin_km: float = field(default=0.0, metadata={"merge": _MERGE_MAX})
+    _prev_path_lat: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
+    _prev_path_lon: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
+    _prev_path_ts: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
 
     # Phase of flight: integer-second counters for climb/descent/level;
     # cruise is computed in a post-pass from level_buf once max_altitude is known
-    climb_secs: float = 0.0
-    descent_secs: float = 0.0
-    level_secs: float = 0.0
+    climb_secs: float = field(default=0.0, metadata={"merge": _MERGE_SUM})
+    descent_secs: float = field(default=0.0, metadata={"merge": _MERGE_SUM})
+    level_secs: float = field(default=0.0, metadata={"merge": _MERGE_SUM})
     # Each entry: (dt_secs, alt_ft, gs_kt). Only level-phase samples.
-    level_buf: list[tuple[float, int, float | None]] = field(default_factory=list)
+    level_buf: list[tuple[float, int, float | None]] = field(default_factory=list, metadata={"merge": _MERGE_EXTEND})
 
     # Peak climb/descent over a rolling 30s window. The window is maintained
     # during record_point as (ts, rate_fpm) tuples; rate is chosen as
     # geom_rate > baro_rate > derived. Peaks are best 30s-mean observed.
-    _rate_window: deque = field(default_factory=deque)
-    peak_climb_fpm: float = 0.0
-    peak_descent_fpm: float = 0.0
+    _rate_window: deque = field(default_factory=deque, metadata={"merge": _MERGE_EXCLUDE})
+    peak_climb_fpm: float = field(default=0.0, metadata={"merge": _MERGE_MAX})
+    peak_descent_fpm: float = field(default=0.0, metadata={"merge": _MERGE_MIN})
 
     # Hover state machine
-    _hover_start_ts: float | None = None
-    max_hover_secs: float = 0.0
-    hover_episodes: int = 0
+    _hover_start_ts: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
+    max_hover_secs: float = field(default=0.0, metadata={"merge": _MERGE_MAX})
+    hover_episodes: int = field(default=0, metadata={"merge": _MERGE_SUM})
 
     # DO-260 category histogram
-    category_counts: dict[str, int] = field(default_factory=dict)
+    category_counts: dict[str, int] = field(default_factory=dict, metadata={"merge": _MERGE_SUM_DICT})
 
     # Autopilot target altitude: last nav_altitude_mcp seen before the first
     # sustained descent (heuristic for "intended cruise alt").
-    _sustained_descent_hit: bool = False
-    autopilot_target_alt_ft: int | None = None
+    _sustained_descent_hit: bool = field(default=False, metadata={"merge": _MERGE_EXCLUDE})
+    autopilot_target_alt_ft: int | None = field(default=None, metadata={"merge": _MERGE_COALESCE_LAST})
 
     # Emergency field (distinct from squawk). Holds the latest non-"none" value.
-    emergency_flag: str | None = None
+    emergency_flag: str | None = field(default=None, metadata={"merge": _MERGE_COALESCE_LAST})
 
     # Night-at-point counter (incremented externally via record_solar if used)
-    night_point_count: int = 0
-    day_point_count: int = 0
+    night_point_count: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    day_point_count: int = field(default=0, metadata={"merge": _MERGE_SUM})
 
     # Tracks near takeoff / landing, for heading computation. Stored as
     # (ts, track_deg, gs) tuples for later filtering in features.compute_headings.
-    takeoff_tracks: list[tuple[float, float, float | None]] = field(default_factory=list)
-    landing_tracks: deque[tuple[float, float, float | None]] = field(default_factory=lambda: deque(maxlen=240))
+    takeoff_tracks: list[tuple[float, float, float | None]] = field(
+        default_factory=list, metadata={"merge": _MERGE_KEEP_FIRST}
+    )
+    landing_tracks: deque[tuple[float, float, float | None]] = field(
+        default_factory=lambda: deque(maxlen=240), metadata={"merge": _MERGE_KEEP_LAST}
+    )
     # First-N-window samples captured for takeoff-runway detection. Unlike
     # recent_points (which is a tail-only deque), takeoff_points is a
     # monotonically-growing list bounded by a time window and a sample cap.
     # Capped at 240 samples OR 600 seconds from first_point_ts, whichever
     # first. Consumed by adsbtrack.takeoff_runway.
-    takeoff_points: list[_PointSample] = field(default_factory=list)
+    takeoff_points: list[_PointSample] = field(default_factory=list, metadata={"merge": _MERGE_KEEP_FIRST})
     # Full per-flight point stream for analyses that need the whole route,
     # not just a tail or head window. Consumed by adsbtrack.navaid_alignment
     # via the parser's navaid_track helper. Unbounded (grows with the flight).
-    all_points: list[_PointSample] = field(default_factory=list)
+    all_points: list[_PointSample] = field(default_factory=list, metadata={"merge": _MERGE_EXTEND})
     # Resolved per-sample thresholds (populated on first record_point call).
-    _thresholds: _RecordPointThresholds | None = None
+    _thresholds: _RecordPointThresholds | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
     # recent airborne positions for bearing-based heading fallback
     # when track data is unavailable (helicopter hover approaches).
-    _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30))
+    _recent_positions: deque = field(default_factory=lambda: deque(maxlen=30), metadata={"merge": _MERGE_KEEP_LAST})
 
     @property
     def max_altitude(self) -> int:
@@ -740,6 +826,86 @@ class FlightMetrics:
             if d > max_jump:
                 max_jump = d
         return max_jump
+
+    def merge(self, other: FlightMetrics) -> None:
+        """Fold a LATER fragment (`other`) into this EARLIER fragment (`self`).
+
+        Used by parser._stitch_fragments in place of ~25 hand-written field
+        merges that used to live far from these field declarations and
+        silently dropped a few accumulators (other_points, adsc_points,
+        squawk_durations), while taking takeoff-side fields from the wrong
+        (later) fragment. Every field above declares its own strategy via
+        field(metadata={"merge": ...}); a field with no recognized strategy
+        makes this raise instead of silently dropping its data on a stitch -
+        that is the guardrail against the next accumulator added without
+        anyone deciding how two stitched fragments combine it.
+
+        max_altitude / max_gs_kt are @property accessors over the
+        _raw_*/_persisted_* fields, not dataclass fields themselves, so
+        `fields(self)` never sees them and this method never touches them
+        directly - merging the underlying fields keeps the derived
+        properties correct.
+        """
+        all_fields = fields(self)
+        undeclared = _undeclared_merge_fields(all_fields)
+        if undeclared:
+            raise ValueError("FlightMetrics.merge: no merge strategy declared for field(s): " + ", ".join(undeclared))
+
+        # --- Custom handling that must run before the generic pass below ---
+        # Close self's own still-open squawk run using self's own (pre-merge)
+        # last_point_ts, then adopt other's open run as the new tail state.
+        # Doing this before the generic pass overwrites last_point_ts with
+        # max(self, other) means the trailing seconds of self's fragment get
+        # credited against self's own timestamp instead of either being lost
+        # or mis-credited against other's much later last_point_ts.
+        self.flush_open_squawk()
+        self._current_squawk = other._current_squawk
+        self._current_squawk_started_ts = other._current_squawk_started_ts
+
+        for f in all_fields:
+            strategy = f.metadata.get("merge")
+            if strategy in (_MERGE_CUSTOM, _MERGE_EXCLUDE, _MERGE_KEEP_FIRST):
+                # custom: handled above; exclude: transient, never carried
+                # across a merge; keep_first: self already holds the right
+                # (earlier-fragment) value, nothing to do.
+                continue
+            name = f.name
+            self_val = getattr(self, name)
+            other_val = getattr(other, name)
+            if strategy == _MERGE_SUM:
+                setattr(self, name, self_val + other_val)
+            elif strategy == _MERGE_MAX:
+                setattr(self, name, _merge_max(self_val, other_val))
+            elif strategy == _MERGE_MIN:
+                setattr(self, name, _merge_min(self_val, other_val))
+            elif strategy == _MERGE_UNION:
+                self_val |= other_val
+            elif strategy == _MERGE_EXTEND:
+                setattr(self, name, self_val + other_val)
+            elif strategy == _MERGE_EXTEND_DEDUP:
+                merged_list = list(self_val)
+                for item in other_val:
+                    if item not in merged_list:
+                        merged_list.append(item)
+                setattr(self, name, merged_list)
+            elif strategy == _MERGE_SUM_DICT:
+                for key, value in other_val.items():
+                    self_val[key] = self_val.get(key, 0) + value
+            elif strategy == _MERGE_KEEP_LAST:
+                setattr(self, name, other_val)
+            elif strategy == _MERGE_COALESCE_FIRST:
+                if self_val is None:
+                    setattr(self, name, other_val)
+            elif strategy == _MERGE_COALESCE_LAST and other_val is not None:
+                setattr(self, name, other_val)
+
+
+# Import-time guardrail: fail immediately (not just on first merge() call) if
+# any FlightMetrics field was added without a recognized "merge" strategy.
+_undeclared = _undeclared_merge_fields(fields(FlightMetrics))
+if _undeclared:
+    raise ValueError("FlightMetrics: no merge strategy declared for field(s): " + ", ".join(_undeclared))
+del _undeclared
 
 
 # Minimal protocol so FlightMetrics.record_point can accept a Config-like

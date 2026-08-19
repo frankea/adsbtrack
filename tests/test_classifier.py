@@ -7,7 +7,7 @@ counters are built up.
 
 import pytest
 
-from adsbtrack.classifier import FlightMetrics, PointData
+from adsbtrack.classifier import FlightMetrics, PointData, _PointSample
 from adsbtrack.config import Config
 
 
@@ -553,3 +553,134 @@ def test_squawk_durations_no_squawk_points_stays_empty() -> None:
     metrics.record_point(p, ground_state="airborne", ground_reason="ok")
     metrics.flush_open_squawk()
     assert metrics.squawk_durations == {}
+
+
+# ---------------------------------------------------------------------------
+# A2: FlightMetrics.merge with declared per-field semantics
+# ---------------------------------------------------------------------------
+
+
+def test_merge_sums_unions_and_keeps_takeoff_side_from_earlier() -> None:
+    """merge() folds a LATER fragment into an EARLIER one in place.
+
+    Pins the three concrete bugs this task fixes: other_points/adsc_points
+    (sum counters) and squawk_durations (per-key sum) used to be dropped
+    entirely by the old hand-written _stitch_fragments merge, and
+    takeoff_points/takeoff_tracks used to wrongly end up as the later
+    fragment's (fictitious "found mid-flight") takeoff data instead of the
+    earlier fragment's real observed takeoff.
+    """
+    earlier = FlightMetrics()
+    earlier.data_points = 100
+    earlier.other_points = 5
+    earlier.adsc_points = 2
+    earlier.squawk_durations = {"1200": 30.0, "5201": 10.0}
+    earlier.takeoff_points = [_PointSample(ts=0.0, baro_alt=0, geom_alt=None, gs=0.0, baro_rate=None)]
+    earlier.takeoff_tracks = [(0.0, 90.0, 5.0)]
+    earlier.first_point_ts = 0.0
+    earlier.last_point_ts = 100.0
+
+    later = FlightMetrics()
+    later.data_points = 50
+    later.other_points = 3
+    later.adsc_points = 1
+    later.squawk_durations = {"1200": 20.0, "7700": 5.0}
+    # A found_mid_flight fragment's "takeoff" data is fictitious -- it must
+    # NOT end up as the merged flight's takeoff_points/takeoff_tracks.
+    later.takeoff_points = [_PointSample(ts=500.0, baro_alt=5000, geom_alt=None, gs=120.0, baro_rate=None)]
+    later.takeoff_tracks = [(500.0, 270.0, 120.0)]
+    later.first_point_ts = 500.0
+    later.last_point_ts = 600.0
+
+    earlier.merge(later)
+
+    # sum
+    assert earlier.data_points == 150
+    assert earlier.other_points == 8
+    assert earlier.adsc_points == 3
+    # sum-by-key (union of dict keys, numeric add on overlap)
+    assert earlier.squawk_durations == {"1200": 50.0, "5201": 10.0, "7700": 5.0}
+    # keep-first: takeoff-side fields stay the earlier fragment's real ones
+    assert earlier.takeoff_points == [_PointSample(ts=0.0, baro_alt=0, geom_alt=None, gs=0.0, baro_rate=None)]
+    assert earlier.takeoff_tracks == [(0.0, 90.0, 5.0)]
+    # min / max on the timestamps spanning both fragments
+    assert earlier.first_point_ts == 0.0
+    assert earlier.last_point_ts == 600.0
+
+
+def test_merge_flushes_dangling_open_squawk_run_across_the_stitch_boundary() -> None:
+    """squawk_durations is a "sum_dict" merge, but the currently-open squawk
+    run at the moment of merge needs custom handling: self (the earlier
+    fragment) may still have an unflushed run sitting open (no transition,
+    no flush_open_squawk() call, since that only happens once at the end of
+    the whole stitched flight). If merge() left self.last_point_ts jump
+    straight to other's (much later) timestamp before that dangling run was
+    closed, a later flush_open_squawk() would mis-credit it with the entire
+    gap-plus-later-fragment span instead of just self's own trailing
+    seconds. merge() must flush self's own run first, using self's own
+    pre-merge last_point_ts, then adopt other's still-open run as the new
+    tail state.
+    """
+
+    def _pt(ts: float, sq: str) -> PointData:
+        return PointData(
+            ts=ts,
+            lat=1.0,
+            lon=1.0,
+            baro_alt=1000,
+            gs=100.0,
+            track=90.0,
+            geom_alt=1000,
+            baro_rate=0.0,
+            geom_rate=None,
+            squawk=sq,
+            category=None,
+            nav_altitude_mcp=None,
+            nav_qnh=None,
+            emergency_field=None,
+            true_heading=None,
+            callsign=None,
+        )
+
+    # Earlier fragment: squawk 1200 held open 0..100s, never closed (no
+    # transition, no flush_open_squawk call - this fragment just ends).
+    earlier = FlightMetrics()
+    for ts in (0, 50, 100):
+        earlier.record_point(_pt(ts, "1200"), ground_state="airborne", ground_reason="ok")
+
+    # Later fragment (after an unrelated coverage gap): 1200 held 500..600s,
+    # then a transition to 4567 held 600..650s (still open at merge time).
+    later = FlightMetrics()
+    for ts, sq in ((500, "1200"), (550, "1200"), (600, "4567"), (650, "4567")):
+        later.record_point(_pt(ts, sq), ground_state="airborne", ground_reason="ok")
+
+    earlier.merge(later)
+    earlier.flush_open_squawk()
+
+    # 1200: earlier's dangling 0->100 (100s) + later's closed 500->600 (100s).
+    # 4567: later's run, still open at merge time, closed by the final
+    # flush_open_squawk() call using the correct (merged) last_point_ts.
+    assert earlier.squawk_durations == {"1200": pytest.approx(200.0), "4567": pytest.approx(50.0)}
+
+
+def test_merge_raises_for_field_without_declared_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An accumulator field with no declared merge strategy must make merge()
+    raise (naming the field) instead of silently dropping its data - this is
+    the guardrail against the next other_points/adsc_points-style bug."""
+    import dataclasses
+
+    a = FlightMetrics()
+    b = FlightMetrics()
+
+    fake_field = dataclasses.field(default=0)
+    fake_field.name = "fake_undeclared_counter"
+    fake_field.type = int
+    # dataclasses.Field validates `_field_type` is set before it behaves like
+    # a real field descriptor produced by @dataclass; mirror what the
+    # dataclass machinery assigns to a plain instance field.
+    fake_field._field_type = dataclasses._FIELD
+
+    monkeypatch.setitem(FlightMetrics.__dataclass_fields__, "fake_undeclared_counter", fake_field)
+
+    with pytest.raises(ValueError, match="fake_undeclared_counter"):
+        a.merge(b)

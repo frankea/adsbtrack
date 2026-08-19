@@ -1441,109 +1441,84 @@ def _enrich_flight(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext) 
     return True
 
 
-def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
-    if reprocess:
-        db.clear_flights(hex_code)
+def _reject_if_spoofed(flight: Flight, ctx: _EnrichContext) -> bool:
+    """Divert a spoofed broadcast into spoofed_broadcasts and report that it
+    must not be persisted as a flight.
 
-    # get_trace_days is a generator (P7); materialize it here since the
-    # stages below make multiple passes over trace_days (registry upsert,
-    # type_code/owner_operator fallback scans, iter_parsed_trace_days).
-    trace_days = list(db.get_trace_days(hex_code))
-    if not trace_days:
-        return 0
+    Runs after every derivation so the gate sees final values for
+    max_altitude / origin_icao / destination_icao / callsign. A rejected
+    flight is also kept out of the turnaround chain, so the next real
+    flight's gap is not measured against a fabricated one.
+    """
+    if not ctx.config.reject_spoofed_flights:
+        return False
+    verdict = _flight_is_spoofed(flight, ctx.spoof_scores_by_date, ctx.config)
+    if verdict is None:
+        return False
+    reason, detail = verdict
+    with contextlib.suppress(Exception):
+        ctx.db.insert_spoofed_broadcast(
+            icao=flight.icao,
+            takeoff_time=flight.takeoff_time.isoformat(),
+            landing_time=flight.landing_time.isoformat() if flight.landing_time else None,
+            takeoff_date=flight.takeoff_date,
+            callsign=flight.callsign,
+            takeoff_lat=flight.takeoff_lat,
+            takeoff_lon=flight.takeoff_lon,
+            landing_lat=flight.landing_lat,
+            landing_lon=flight.landing_lon,
+            max_altitude=flight.max_altitude,
+            data_points=flight.data_points,
+            sources=flight.sources,
+            origin_icao=flight.origin_icao,
+            destination_icao=flight.destination_icao,
+            reason=reason,
+            reason_detail=json.dumps(detail),
+        )
+    return True
 
-    type_code, owner_operator = _resolve_registry_metadata(db, hex_code, trace_days)
-    merged_days, all_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
-    pairs = _run_state_machine(
-        merged_days,
-        config,
-        hex_code=hex_code,
-        all_sources=all_sources,
-        type_code=type_code,
-    )
 
-    ctx = _EnrichContext(
-        db=db,
-        config=config,
-        hex_code=hex_code,
-        type_code=type_code,
-        owner_operator=owner_operator,
-        spoof_scores_by_date=spoof_scores_by_date,
-    )
+def _apply_sequence_fields(flight: Flight, prev_end_time: datetime | None) -> None:
+    """Set the fields that describe this flight's place in the ICAO's
+    sequence of persisted flights: turnaround from the previous one, its
+    category, and the first/last observed flags.
 
-    final_flights: list[Flight] = []
-    # track previous flight's end time for turnaround computation.
-    prev_end_time: datetime | None = None
-    for flight, metrics in pairs:
-        if not _enrich_flight(flight, metrics, ctx):
-            continue
-
-        # Spoof-rejection gate. Runs after all derivations so the gate
-        # sees final values for max_altitude / origin_icao / destination_icao
-        # / callsign. A rejected flight goes to spoofed_broadcasts and is
-        # excluded from final_flights + prev_end_time so turnaround math
-        # for the next real flight is not polluted by a fabricated gap.
-        if config.reject_spoofed_flights:
-            spoof_verdict = _flight_is_spoofed(flight, spoof_scores_by_date, config)
-            if spoof_verdict is not None:
-                reason, detail = spoof_verdict
-                with contextlib.suppress(Exception):
-                    db.insert_spoofed_broadcast(
-                        icao=flight.icao,
-                        takeoff_time=flight.takeoff_time.isoformat(),
-                        landing_time=flight.landing_time.isoformat() if flight.landing_time else None,
-                        takeoff_date=flight.takeoff_date,
-                        callsign=flight.callsign,
-                        takeoff_lat=flight.takeoff_lat,
-                        takeoff_lon=flight.takeoff_lon,
-                        landing_lat=flight.landing_lat,
-                        landing_lon=flight.landing_lon,
-                        max_altitude=flight.max_altitude,
-                        data_points=flight.data_points,
-                        sources=flight.sources,
-                        origin_icao=flight.origin_icao,
-                        destination_icao=flight.destination_icao,
-                        reason=reason,
-                        reason_detail=json.dumps(detail),
-                    )
-                continue
-
-        # turnaround_minutes from previous flight's end to this takeoff.
-        # cap at 72 hours (4320 min). Anything longer reflects a
-        # collection gap or parked aircraft, not a real turnaround. NULL
-        # these out so they don't pollute fleet utilisation averages.
-        if prev_end_time is not None:
-            turn_secs = (flight.takeoff_time - prev_end_time).total_seconds()
-            if turn_secs >= 0:
-                turn_min = round(turn_secs / 60.0, 1)
-                flight.turnaround_minutes = turn_min if turn_min <= 4320.0 else None
-            # turnaround category for distribution analysis.
-            # every flight must get a non-null category. Flights
-            # where turnaround_minutes is NULL (>72 h cap or negative
-            # turn_secs) get 'extended_gap' so the NULL bucket is empty.
-            if flight.turnaround_minutes is not None:
-                tm = flight.turnaround_minutes
-                if tm < 30:
-                    flight.turnaround_category = "quick"
-                elif tm < 240:
-                    flight.turnaround_category = "medium"
-                elif tm < 1080:
-                    flight.turnaround_category = "overnight"
-                else:
-                    flight.turnaround_category = "multi_day"
+    turnaround_minutes is capped at 72 hours (4320 min); anything longer is
+    a collection gap or a parked aircraft, not a real turnaround, and would
+    pollute fleet utilisation averages. Every flight gets a non-null
+    category: the ones whose turnaround is NULL (over the cap, or a
+    negative gap) fall into 'extended_gap'.
+    """
+    if prev_end_time is not None:
+        turn_secs = (flight.takeoff_time - prev_end_time).total_seconds()
+        if turn_secs >= 0:
+            turn_min = round(turn_secs / 60.0, 1)
+            flight.turnaround_minutes = turn_min if turn_min <= 4320.0 else None
+        if flight.turnaround_minutes is not None:
+            tm = flight.turnaround_minutes
+            if tm < 30:
+                flight.turnaround_category = "quick"
+            elif tm < 240:
+                flight.turnaround_category = "medium"
+            elif tm < 1080:
+                flight.turnaround_category = "overnight"
             else:
-                flight.turnaround_category = "extended_gap"
-            flight.is_first_observed_flight = 0
+                flight.turnaround_category = "multi_day"
         else:
-            # first observed flight for this ICAO
-            flight.is_first_observed_flight = 1
-            flight.turnaround_category = "first_observed"
-        # default to 0; the post-loop pass sets the last flight to 1.
-        flight.is_last_observed_flight = 0
-        prev_end_time = flight.landing_time or flight.last_seen_time
+            flight.turnaround_category = "extended_gap"
+        flight.is_first_observed_flight = 0
+    else:
+        # first observed flight for this ICAO
+        flight.is_first_observed_flight = 1
+        flight.turnaround_category = "first_observed"
+    # default to 0; _run_post_passes sets the last flight to 1.
+    flight.is_last_observed_flight = 0
 
-        db.insert_flight(flight)
-        final_flights.append(flight)
+
+def _run_post_passes(ctx: _EnrichContext, final_flights: list[Flight]) -> None:
+    """ICAO-wide passes that can only run once every flight is written."""
+    db = ctx.db
+    hex_code = ctx.hex_code
 
     # mark the last flight for this ICAO and assign 'last_observed'
     # turnaround category when the category is still NULL (turnaround_minutes
@@ -1601,4 +1576,67 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         with contextlib.suppress(Exception):
             db.purge_zero_flight_registry(hex_code)
 
-    return len(final_flights)
+
+def _persist(pairs: list[tuple[Flight, FlightMetrics]], ctx: _EnrichContext) -> list[Flight]:
+    """Enrich, gate and write each flight in trace order, then run the
+    ICAO-wide post-passes. Returns the flights that reached the DB.
+
+    The chain is sequential on purpose: only a flight that survives both
+    _enrich_flight's noise guards and the spoof gate gets sequence fields,
+    a row, and the right to become the previous flight the next turnaround
+    is measured from.
+    """
+    final_flights: list[Flight] = []
+    prev_end_time: datetime | None = None
+    for flight, metrics in pairs:
+        if not _enrich_flight(flight, metrics, ctx):
+            continue
+        if _reject_if_spoofed(flight, ctx):
+            continue
+
+        _apply_sequence_fields(flight, prev_end_time)
+        prev_end_time = flight.landing_time or flight.last_seen_time
+
+        ctx.db.insert_flight(flight)
+        final_flights.append(flight)
+
+    _run_post_passes(ctx, final_flights)
+    return final_flights
+
+
+def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
+    """Extract this ICAO's flight history from its stored trace days and
+    write it to the flights table. Returns the number of flights written.
+
+    Four stages, each a module-private function below: resolve the aircraft
+    metadata, load and merge the trace days, run the ground/airborne state
+    machine over them, then enrich and persist the fragments it emitted.
+    """
+    if reprocess:
+        db.clear_flights(hex_code)
+
+    # get_trace_days is a generator (P7); materialize it here since the
+    # stages below make multiple passes over trace_days (registry upsert,
+    # type_code/owner_operator fallback scans, iter_parsed_trace_days).
+    trace_days = list(db.get_trace_days(hex_code))
+    if not trace_days:
+        return 0
+
+    type_code, owner_operator = _resolve_registry_metadata(db, hex_code, trace_days)
+    merged_days, all_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
+    pairs = _run_state_machine(
+        merged_days,
+        config,
+        hex_code=hex_code,
+        all_sources=all_sources,
+        type_code=type_code,
+    )
+    ctx = _EnrichContext(
+        db=db,
+        config=config,
+        hex_code=hex_code,
+        type_code=type_code,
+        owner_operator=owner_operator,
+        spoof_scores_by_date=spoof_scores_by_date,
+    )
+    return len(_persist(pairs, ctx))

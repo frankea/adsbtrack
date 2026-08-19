@@ -177,7 +177,19 @@ class FlightsView(Vertical):
     # --- public API ---
 
     def set_icao(self, icao: str) -> None:
+        """Switch the aircraft this view is scoped to.
+
+        Clears the filter Input as part of the switch: a needle typed for
+        the previous aircraft has no reason to apply to a different one,
+        and leaving it in place would either silently narrow (or empty
+        out) the new aircraft's table with no visible explanation, since
+        the box and the table must always agree (see A4's fix in
+        ``on_worker_state_changed`` below, which re-applies whatever the
+        box holds -- this keeps that "whatever" honest across an aircraft
+        switch too).
+        """
         self._icao = icao
+        self._filter.input_widget.value = ""
         self.refresh_data()
 
     def refresh_data(self) -> None:

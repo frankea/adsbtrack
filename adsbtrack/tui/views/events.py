@@ -114,7 +114,19 @@ class EventsView(Vertical):
         self._table.add_column("SUMMARY")
 
     def set_icao(self, icao: str | None) -> None:
+        """Switch (or clear) the aircraft this view is scoped to.
+
+        Clears the filter Input as part of the switch: a needle typed for
+        the previous scope has no reason to apply to the new one, and
+        leaving it in place would either silently narrow (or empty out)
+        the new scope's table with no visible explanation, since the box
+        and the table must always agree (see A4's fix in
+        ``on_worker_state_changed`` below, which re-applies whatever the
+        box holds -- this keeps that "whatever" honest across a scope
+        switch too).
+        """
         self._icao = icao
+        self._filter.input_widget.value = ""
         self.refresh_data()
 
     def refresh_data(self) -> None:

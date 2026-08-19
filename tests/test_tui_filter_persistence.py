@@ -153,6 +153,76 @@ def _seed_two_flights_one_aircraft(db_path) -> None:
         db.commit()
 
 
+def _seed_two_aircraft_two_flights_each(db_path) -> None:
+    """Two distinct aircraft, each with two distinguishable flights -- for
+    proving a filter typed while viewing aircraft A doesn't leak into
+    aircraft B's table after switching."""
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="aaa111",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+                landing_time=datetime(2026, 3, 1, 14, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="UAL1",
+                destination_icao="KBOS",
+                origin_icao="KEWR",
+                duration_minutes=120.0,
+            )
+        )
+        db.insert_flight(
+            Flight(
+                icao="aaa111",
+                takeoff_time=datetime(2026, 3, 2, 9, 0, tzinfo=UTC),
+                takeoff_lat=41.0,
+                takeoff_lon=-75.0,
+                takeoff_date="2026-03-02",
+                landing_time=datetime(2026, 3, 2, 10, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="DAL2",
+                destination_icao="KLAX",
+                origin_icao="KORD",
+                duration_minutes=60.0,
+            )
+        )
+        db.insert_flight(
+            Flight(
+                icao="bbb222",
+                takeoff_time=datetime(2026, 3, 3, 8, 0, tzinfo=UTC),
+                takeoff_lat=42.0,
+                takeoff_lon=-76.0,
+                takeoff_date="2026-03-03",
+                landing_time=datetime(2026, 3, 3, 9, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="SWA3",
+                destination_icao="KMDW",
+                origin_icao="KDEN",
+                duration_minutes=90.0,
+            )
+        )
+        db.insert_flight(
+            Flight(
+                icao="bbb222",
+                takeoff_time=datetime(2026, 3, 4, 7, 0, tzinfo=UTC),
+                takeoff_lat=43.0,
+                takeoff_lon=-77.0,
+                takeoff_date="2026-03-04",
+                landing_time=datetime(2026, 3, 4, 8, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                callsign="JBU4",
+                destination_icao="KJFK",
+                origin_icao="KBOS",
+                duration_minutes=45.0,
+            )
+        )
+        db.refresh_aircraft_stats("aaa111")
+        db.refresh_aircraft_stats("bbb222")
+        db.commit()
+
+
 def test_aircraft_filter_survives_refresh(tmp_path):
     db_path = tmp_path / "aircraft_filter_persistence.db"
     _seed_two_aircraft(db_path)
@@ -244,5 +314,82 @@ def test_flights_filter_survives_refresh(tmp_path):
 
             assert table.row_count == 1, "a background refresh must not discard the typed filter"
             assert view._filter.input_widget.value == "ual1", "the Input must still show what was typed"
+
+    asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Controller ruling: a needle typed while viewing aircraft A must NOT
+# silently narrow (or hide) aircraft B's table after switching to B. The
+# fix above (preserve the filter across a same-aircraft refresh) makes
+# that failure mode worse if left alone: set_icao would carry the stale
+# needle straight into the newly-fetched rows for the new aircraft, which
+# could show a confusingly empty table or the wrong subset with no
+# indication why. FlightsView.set_icao / EventsView.set_icao must clear
+# the filter Input as part of switching aircraft.
+# ---------------------------------------------------------------------------
+
+
+def test_flights_filter_cleared_when_icao_switches(tmp_path):
+    db_path = tmp_path / "flights_filter_switch.db"
+    _seed_two_aircraft_two_flights_each(db_path)
+
+    async def scenario() -> None:
+        app = AdsbtrackApp(db_path)
+        async with app.run_test() as pilot:
+            await _settle(app, pilot)
+            app._open_icao("aaa111")
+            await _settle(app, pilot)
+
+            view = app.query_one(FlightsView)
+            table = app.query_one("#flights-table", DataTable)
+            assert table.row_count == 2, "aircraft A should start with both its flights visible"
+
+            view.focus_filter()
+            await pilot.pause()
+            for ch in "ual1":
+                await pilot.press(ch)
+            await pilot.pause()
+            assert table.row_count == 1, "typing should narrow aircraft A's table first"
+
+            app._open_icao("bbb222")
+            await _settle(app, pilot)
+
+            assert view._filter.input_widget.value == "", "switching aircraft must clear the stale filter box"
+            assert table.row_count == 2, "table must show B's flights unfiltered, not silently narrowed by A's needle"
+
+    asyncio.run(scenario())
+
+
+def test_events_filter_cleared_when_icao_switches(tmp_path):
+    db_path = tmp_path / "events_filter_switch.db"
+    _seed_two_emergency_aircraft(db_path)
+
+    async def scenario() -> None:
+        app = AdsbtrackApp(db_path)
+        async with app.run_test() as pilot:
+            await _settle(app, pilot)
+            app._open_icao("aaa111")
+            await _settle(app, pilot)
+
+            view = app.query_one(EventsView)
+            table = app.query_one("#events-table", DataTable)
+            # aaa111 has an emergency_squawk flight with no destination, so
+            # it produces both an emergency_squawk and an off_airport_landing
+            # event once scoped to just this icao.
+            assert table.row_count == 2, "aircraft A should start with both its own events visible"
+
+            view.focus_filter()
+            await pilot.pause()
+            for ch in "emergency":
+                await pilot.press(ch)
+            await pilot.pause()
+            assert table.row_count == 1, "typing should narrow aircraft A's events first"
+
+            app._open_icao("ccc333")
+            await _settle(app, pilot)
+
+            assert view._filter.input_widget.value == "", "switching aircraft must clear the stale filter box"
+            assert table.row_count == 2, "table must show C's events unfiltered, not silently narrowed by A's needle"
 
     asyncio.run(scenario())

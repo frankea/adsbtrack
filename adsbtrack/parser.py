@@ -671,7 +671,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
     # Decode every row's trace_json exactly once. The parsed pairs feed
     # both the spoof-scoring pass and the per-date merge below, instead of
     # each pass calling json.loads on the same rows independently.
-    parsed_days = list(iter_parsed_trace_days(trace_days))
+    parsed_days = list(iter_parsed_trace_days(trace_days, hex_code))
 
     # Compute per-date bimodal-integrity spoof scores up front so the
     # rejection step below can query without re-scanning trace_json.

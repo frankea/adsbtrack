@@ -709,14 +709,26 @@ def decode_trace_json(raw_trace_json: str) -> list | None:
     return parsed if isinstance(parsed, list) else None
 
 
-def iter_parsed_trace_days(rows: Iterable[sqlite3.Row]) -> Iterator[tuple[sqlite3.Row, list]]:
+def iter_parsed_trace_days(rows: Iterable[sqlite3.Row], icao: str) -> Iterator[tuple[sqlite3.Row, list]]:
     """Yield (row, parsed_trace) for each row, decoding trace_json exactly
-    once per row via decode_trace_json. Rows with malformed trace_json are
-    skipped."""
+    once per row via decode_trace_json.
+
+    A row with malformed trace_json is warned about (naming icao/date/source
+    so the bad row can be found and re-fetched) and skipped rather than
+    raised -- one corrupt row must not abort an otherwise-good multi-year
+    extract or gap scan. ``icao`` is accepted explicitly rather than read
+    from the row because not every caller's query selects an icao column
+    (events._detect_spoof_events does not).
+    """
     for row in rows:
         parsed = decode_trace_json(row["trace_json"])
-        if parsed is not None:
-            yield row, parsed
+        if parsed is None:
+            print(
+                f"  WARNING: {icao} trace_days row for {row['date']} (source={row['source']}) "
+                "has malformed trace_json; skipping"
+            )
+            continue
+        yield row, parsed
 
 
 class Database:

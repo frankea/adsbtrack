@@ -239,7 +239,7 @@ def detect_gaps(
     # of parser._merge_trace_rows that skips the Config.dedup_* fine-tuning
     # since we only need "same point within a second" detection.
     abs_points: list[tuple[float, dict[str, Any]]] = []
-    for row, trace in iter_parsed_trace_days(rows):
+    for row, trace in iter_parsed_trace_days(rows, icao):
         base_ts = row["timestamp"]
         for raw_point in trace:
             pt = _extract_point_dict(raw_point)

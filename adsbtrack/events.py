@@ -76,7 +76,7 @@ def _detect_spoof_events(db: Database, icao: str, since: datetime | None, config
     sql += " ORDER BY date, source"
 
     rows = db.conn.execute(sql, params).fetchall()
-    flagged = pool_spoof_scores(iter_parsed_trace_days(rows), config)
+    flagged = pool_spoof_scores(iter_parsed_trace_days(rows, icao), config)
 
     events: list[Event] = []
     for date_str, agg in sorted(flagged.items()):

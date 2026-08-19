@@ -64,6 +64,28 @@ def _make_trace_row(date_str, timestamp, trace, source="adsbx", hex_code="aaaaaa
     return mock_row
 
 
+def _make_corrupt_trace_row(date_str, timestamp, source="adsbx", hex_code="aaaaaa"):
+    """Row whose trace_json is malformed JSON, for warn-and-skip tests."""
+    row = {
+        "date": date_str,
+        "timestamp": timestamp,
+        "trace_json": "{not valid json!!",
+        "source": source,
+        "registration": "N12345",
+        "type_code": "C172",
+        "description": "CESSNA 172",
+        "owner_operator": "Test Owner",
+        "year": "2020",
+        "point_count": 0,
+        "fetched_at": "2024-01-01T00:00:00",
+        "icao": hex_code,
+    }
+    mock_row = MagicMock()
+    mock_row.__getitem__ = lambda self, key: row[key]
+    mock_row.keys = lambda: row.keys()
+    return mock_row
+
+
 def _make_db_mock(trace_rows=None):
     """Create a mock Database that returns the given trace rows."""
     db = MagicMock()
@@ -1254,6 +1276,33 @@ def test_extract_flights_parses_trace_json_once_per_row_with_spoof_checks():
         extract_flights(db, config, "aaaaaa", reprocess=True)
 
     assert len(calls) == 3
+
+
+def test_extract_flights_skips_corrupt_trace_json_row_with_warning(capsys):
+    """A trace_days row with malformed trace_json must be warned about and
+    skipped, not crash the whole extract and not silently vanish -- the
+    warning must name the corrupt row's date, and the other valid day's
+    flight must still be extracted."""
+    config = _make_config()
+    valid_trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.001, -74.0, 1000, gs=120),
+        _make_trace_point(600, 40.5, -74.5, "ground", gs=5),
+    ]
+    rows = [
+        _make_corrupt_trace_row("2024-06-15", _ts("2024-06-15")),
+        _make_trace_row("2024-06-16", _ts("2024-06-16"), valid_trace),
+    ]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        count = extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert count == 1  # the valid 2024-06-16 day still extracted a flight
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.out
+    assert "aaaaaa" in captured.out
+    assert "2024-06-15" in captured.out
 
 
 def test_extract_flights_uses_alt_min_anchor_for_destination():

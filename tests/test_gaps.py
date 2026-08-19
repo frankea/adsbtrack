@@ -319,6 +319,51 @@ def test_detect_gaps_returns_empty_for_unknown_icao(populated_db):
     assert gaps == []
 
 
+def test_detect_gaps_skips_corrupt_trace_json_row_with_warning(tmp_path, capsys):
+    """A trace_days row with malformed trace_json must be warned about and
+    skipped, not raised -- the warning must name the corrupt row's date,
+    and the gap on the other, valid day must still be found."""
+    db_path = tmp_path / "corrupt_gaps.db"
+    base_ts = 1700000000.0
+    trace = []
+    for i in range(30):
+        alt = min(35000, 1000 + i * 1200)
+        lat = 29.5 + i * 0.01
+        lon = -98.5 + i * 0.02
+        trace.append(_trace_point(i * 30.0, lat, lon, alt, 400.0, "adsb_icao"))
+    gap_end_offset = 30 * 30.0 + 600.0
+    for i in range(20):
+        lat = 29.80 + i * 0.01
+        lon = -97.86 + i * 0.02
+        trace.append(_trace_point(gap_end_offset + i * 30.0, lat, lon, 35000, 400.0, "adsb_icao"))
+
+    with Database(db_path) as db:
+        db.conn.execute(
+            """INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type, iata_code, municipality)
+               VALUES ('KSAT', 'San Antonio Intl', 29.533699, -98.469803, 'large_airport', 'SAT', 'San Antonio')"""
+        )
+        db.insert_trace_day(
+            "corrupt1",
+            "2023-11-14",
+            {"timestamp": base_ts, "trace": trace, "r": "N12345", "t": "C172"},
+            source="adsbx",
+        )
+        # Plant a second, corrupt row for a different date on the same icao.
+        db.conn.execute(
+            """INSERT INTO trace_days (icao, date, source, timestamp, trace_json, point_count, fetched_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            ("corrupt1", "2023-11-15", "adsbx", base_ts + 86400, "{not valid json!!", 0, "2023-11-15T00:00:00"),
+        )
+        db.commit()
+        gaps = detect_gaps(db, "corrupt1", min_gap_secs=300, config=Config())
+
+    assert len(gaps) == 1  # the gap on the valid 2023-11-14 day is still found
+    captured = capsys.readouterr()
+    assert "WARNING" in captured.out
+    assert "corrupt1" in captured.out
+    assert "2023-11-15" in captured.out
+
+
 def _inter_day_populated_db(tmp_path):
     """Two single-point 'days' separated by 3 days: this simulates an
     aircraft that flew, parked for 3 days, then flew again. The

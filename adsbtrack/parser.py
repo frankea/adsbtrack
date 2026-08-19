@@ -21,7 +21,7 @@ from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
 from .db import Database, iter_parsed_trace_days
 from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments
 from .integrity import count_v2_integrity
-from .landing_anchor import compute_landing_anchor
+from .landing_anchor import LandingAnchor, compute_landing_anchor
 from .models import Flight, LandingType
 from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
 
@@ -1085,7 +1085,7 @@ def _match_airports(
     metrics: FlightMetrics,
     ctx: _EnrichContext,
     *,
-    anchor,
+    anchor: LandingAnchor | None,
     has_landing: bool,
 ) -> None:
     """D1: match both ends of the flight to airports and identify the
@@ -1226,7 +1226,9 @@ def _apply_type_caps(flight: Flight, ctx: _EnrichContext) -> None:
             flight.cruise_gs_kt = gs_cap
 
 
-def _infer_probable_destination(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext, *, anchor) -> None:
+def _infer_probable_destination(
+    flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext, *, anchor: LandingAnchor | None
+) -> None:
     """v3 destination inference for dropped / signal_lost flights.
 
     Queries candidates around the alt-min anchor (falling back to

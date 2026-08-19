@@ -16,6 +16,9 @@ import pytest
 from adsbtrack.db import Database
 from adsbtrack.models import Flight
 from adsbtrack.tui.queries import (
+    FlightRow,
+    _display_destination,
+    _display_origin,
     _render_flags,
     count_aircraft,
     count_flights,
@@ -87,6 +90,77 @@ def test_list_flights_carries_nearest_origin_and_probable_destination(tmp_path):
     assert len(flights) == 1
     assert flights[0].nearest_origin_icao == "KTNX"
     assert flights[0].probable_destination_icao == "KTNX"
+
+
+# ---------------------------------------------------------------------------
+# _display_origin / _display_destination: endpoint display fallbacks
+# (issue #18). Pure functions of a FlightRow -- relocated here from
+# views/flights.py so views/flights.py and views/map.py's route crumb
+# can both consume them without a cross-view import.
+# ---------------------------------------------------------------------------
+
+
+def _flight_row(**overrides) -> FlightRow:
+    fields = dict(
+        takeoff_time="2026-03-01T12:00:00+00:00",
+        takeoff_date="2026-03-01",
+        origin_icao="KEWR",
+        destination_icao="KBOS",
+        duration_minutes=120.0,
+        callsign="UAL1",
+        mission_type="transport",
+        max_altitude=35000,
+        cruise_gs_kt=430,
+        landing_type="confirmed",
+        landing_confidence=0.9,
+        emergency_squawk=None,
+        had_go_around=None,
+        max_hover_secs=None,
+        nearest_origin_icao=None,
+        probable_destination_icao=None,
+    )
+    fields.update(overrides)
+    return FlightRow(**fields)
+
+
+def test_display_origin_prefers_real_icao():
+    row = _flight_row(origin_icao="KEWR", nearest_origin_icao="KTNX")
+    assert _display_origin(row) == "KEWR"
+
+
+def test_display_origin_falls_back_to_nearest_when_origin_null():
+    row = _flight_row(origin_icao=None, nearest_origin_icao="KTNX")
+    assert _display_origin(row) == "~KTNX"
+
+
+def test_display_origin_none_when_neither_set():
+    row = _flight_row(origin_icao=None, nearest_origin_icao=None)
+    assert _display_origin(row) is None
+
+
+def test_display_destination_prefers_real_icao():
+    row = _flight_row(destination_icao="KBOS", probable_destination_icao="KTNX", landing_type="signal_lost")
+    assert _display_destination(row) == "KBOS"
+
+
+def test_display_destination_falls_back_for_signal_lost():
+    row = _flight_row(destination_icao=None, probable_destination_icao="KTNX", landing_type="signal_lost")
+    assert _display_destination(row) == "~KTNX"
+
+
+def test_display_destination_falls_back_for_dropped_on_approach():
+    row = _flight_row(destination_icao=None, probable_destination_icao="KTNX", landing_type="dropped_on_approach")
+    assert _display_destination(row) == "~KTNX"
+
+
+def test_display_destination_signal_lost_no_probable_shows_literal():
+    row = _flight_row(destination_icao=None, probable_destination_icao=None, landing_type="signal_lost")
+    assert _display_destination(row) == "sig lost"
+
+
+def test_display_destination_none_when_uncertain_no_probable():
+    row = _flight_row(destination_icao=None, probable_destination_icao=None, landing_type="uncertain")
+    assert _display_destination(row) is None
 
 
 def test_list_flights_unknown_icao(seeded_db):

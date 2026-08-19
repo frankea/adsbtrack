@@ -298,6 +298,41 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
     ]
 
 
+def _display_origin(row: FlightRow) -> str | None:
+    """Origin cell content: the real ICAO, else a ``~NEAREST`` fallback
+    (issue #18) when only a near-match airport (2-10 km, kept out of
+    origin_icao by the on-field gate) was found, else ``None`` so the
+    caller can render a dash.
+
+    Pure function of a ``FlightRow``, so it lives alongside the
+    dataclass it formats rather than in a specific view -- both the
+    flights table (``views/flights.py``) and the map's route crumb
+    (``views/map.py``) need the exact same ~ICAO fallback so a flight
+    renders consistently in both places.
+    """
+    if row.origin_icao:
+        return row.origin_icao
+    if row.nearest_origin_icao:
+        return f"~{row.nearest_origin_icao}"
+    return None
+
+
+def _display_destination(row: FlightRow) -> str | None:
+    """Destination cell content: the real ICAO, else a ``~PROBABLE``
+    fallback (issue #18) for signal_lost/dropped_on_approach flights with
+    an inferred destination, else the literal "sig lost" marker for
+    signal_lost flights with no inference, else ``None``. See
+    ``_display_origin`` for why this lives here rather than in a view.
+    """
+    if row.destination_icao:
+        return row.destination_icao
+    if row.probable_destination_icao and row.landing_type in ("signal_lost", "dropped_on_approach"):
+        return f"~{row.probable_destination_icao}"
+    if row.landing_type == "signal_lost":
+        return "sig lost"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Event feed (delegates to events.collect_events)
 # ---------------------------------------------------------------------------

@@ -39,7 +39,14 @@ from textual.worker import Worker, WorkerState
 from ...airports import find_nearest_airport
 from ...db import Database
 from ..braille import BrailleCanvas
-from ..queries import TracePoint, distinct_dates_for_icao, list_flights, load_trace_points
+from ..queries import (
+    TracePoint,
+    _display_destination,
+    _display_origin,
+    distinct_dates_for_icao,
+    list_flights,
+    load_trace_points,
+)
 from ..widgets import (
     ACCENT_AMBER,
     ACCENT_CYAN,
@@ -52,10 +59,6 @@ from ..widgets import (
     FG_2,
     PageHeader,
 )
-
-# Reused (not reimplemented) so a near-match-only endpoint renders as the
-# same ~ICAO marker here as it does in the flights table (issue #18).
-from .flights import _display_destination, _display_origin
 
 _SOURCE_COLOUR = {
     "adsb_icao": ACCENT_OK,
@@ -568,11 +571,12 @@ def _route_for(db: Database, icao: str, date: str) -> str | None:
     nearest-airport lookup against the raw trace endpoints -- the two can
     disagree on a multi-leg day, since the trace's absolute first/last
     point isn't necessarily this flight's takeoff/landing. Reuses
-    ``views.flights._display_origin`` / ``_display_destination`` (issue
-    #18's ~ICAO near-match fallback) instead of reimplementing that
-    fallback logic, so a flight whose real origin_icao missed the
-    on-field match threshold still shows a route here, consistent with
-    how the flights table renders that same flight.
+    ``queries._display_origin`` / ``_display_destination`` (issue #18's
+    ~ICAO near-match fallback, also used by the flights table in
+    ``views/flights.py``) instead of reimplementing that fallback logic,
+    so a flight whose real origin_icao missed the on-field match
+    threshold still shows a route here, consistent with how the flights
+    table renders that same flight.
     """
     day_flights = [f for f in list_flights(db, icao) if f.takeoff_date == date]
     if not day_flights:

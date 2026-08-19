@@ -2,14 +2,21 @@
 
 import json
 import math
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from unittest.mock import MagicMock, patch
 
 from adsbtrack.airports import AirportMatch
 from adsbtrack.classifier import FlightMetrics
 from adsbtrack.config import Config
+from adsbtrack.db import Database
 from adsbtrack.models import Flight
-from adsbtrack.parser import _extract_point_fields, _stitch_fragments, extract_flights
+from adsbtrack.parser import (
+    EXTRACTOR_VERSION,
+    _extract_point_fields,
+    _find_extract_boundary,
+    _stitch_fragments,
+    extract_flights,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -2788,3 +2795,249 @@ def test_extract_point_fields_equivalence_across_shapes():
         assert actual == expected, (
             f"mismatch on point shape len={len(point)}: {point!r}\n actual={actual}\n expected={expected}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Incremental extraction
+# ---------------------------------------------------------------------------
+
+
+def _make_incremental_config() -> Config:
+    """Config for the incremental tests. Unlike _make_config these keep the
+    real gap thresholds -- the boundary rule is derived from them -- and only
+    widen the path-segment cap so the sparse synthetic traces below still
+    accumulate a path length."""
+    return Config(path_max_segment_secs=10_000.0)
+
+
+def _one_flight_trace(callsign: str | None = None) -> list[list]:
+    """One ground -> airborne -> ground cycle, points 1-10 minutes apart so
+    the default intra-trace gap splitter leaves it as a single flight."""
+    detail = {"flight": callsign} if callsign else {}
+    return [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.0, -74.0, "ground", gs=5),
+        _make_trace_point(120, 40.001, -74.0, 1000, gs=120, detail=detail),
+        _make_trace_point(600, 40.2, -74.2, 5000, gs=200),
+        _make_trace_point(1200, 40.4, -74.4, 5000, gs=200),
+        _make_trace_point(1800, 40.5, -74.5, "ground", gs=10),
+        _make_trace_point(1860, 40.5, -74.5, "ground", gs=0),
+    ]
+
+
+def _insert_day(db, hex_code: str, date_str: str, trace: list[list], source: str = "adsbx") -> None:
+    db.insert_trace_day(
+        hex_code,
+        date_str,
+        {
+            "r": "N12345",
+            "t": "C172",
+            "desc": "CESSNA 172",
+            "ownOp": "Test Owner",
+            "year": "2020",
+            "timestamp": _ts(date_str, 0, 0, 0),
+            "trace": trace,
+        },
+        source=source,
+    )
+
+
+def _seed_pre_gap_days(db, hex_code: str = "aaaaaa") -> None:
+    """Three contiguous days, one flight each, all broadcasting a callsign.
+    A second source contributes the same first day, so the aircraft's source
+    set is wider than anything the post-gap window can see."""
+    for day in ("2026-04-01", "2026-04-02", "2026-04-03"):
+        _insert_day(db, hex_code, day, _one_flight_trace(callsign="TSTCS1"))
+    _insert_day(db, hex_code, "2026-04-01", _one_flight_trace(callsign="TSTCS1"), source="adsblol")
+    db.commit()
+
+
+def _seed_post_gap_days(db, hex_code: str = "aaaaaa") -> None:
+    """Two contiguous days five days after the pre-gap block, broadcasting no
+    callsign of their own -- a full extract stamps them with the callsign it
+    is still carrying from 2026-04-03."""
+    for day in ("2026-04-08", "2026-04-09"):
+        _insert_day(db, hex_code, day, _one_flight_trace())
+    db.commit()
+
+
+def _flight_rows(db, hex_code: str = "aaaaaa") -> list[dict]:
+    """Every persisted flight column except the autoincrement id."""
+    rows = db.conn.execute("SELECT * FROM flights WHERE icao = ? ORDER BY takeoff_time", (hex_code,)).fetchall()
+    out = []
+    for row in rows:
+        values = dict(row)
+        values.pop("id", None)
+        out.append(values)
+    return out
+
+
+def test_incremental_extract_matches_full_reprocess(tmp_path):
+    """The acceptance bar: rebuilding only the days after a coverage gap
+    reproduces the full reprocess row for row, column for column."""
+    config = _make_incremental_config()
+
+    with Database(tmp_path / "full.db") as full_db:
+        _seed_pre_gap_days(full_db)
+        _seed_post_gap_days(full_db)
+        full_count = extract_flights(full_db, config, "aaaaaa", reprocess=True)
+        full_db.commit()
+        baseline = _flight_rows(full_db)
+
+    assert full_count >= 5, "fixture should produce a flight per trace day"
+
+    with Database(tmp_path / "incremental.db") as db:
+        _seed_pre_gap_days(db)
+        _seed_post_gap_days(db)
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+        db.commit()
+        # Damage the tail so a no-op incremental run cannot pass this test.
+        db.conn.execute(
+            "UPDATE flights SET max_altitude = 99999, callsign = 'WRONG' WHERE takeoff_date >= '2026-04-08'"
+        )
+        db.conn.execute("DELETE FROM flights WHERE takeoff_date = '2026-04-09'")
+        db.commit()
+
+        tail_count = extract_flights(db, config, "aaaaaa", since_date=date(2026, 4, 8))
+        db.commit()
+
+        assert _flight_rows(db) == baseline
+        # Only the post-gap window was rebuilt, not the whole history.
+        assert 0 < tail_count < full_count
+
+
+def test_incremental_extract_leaves_pre_boundary_flights_untouched(tmp_path):
+    """Rows before the boundary are neither deleted nor rewritten."""
+    config = _make_incremental_config()
+    with Database(tmp_path / "keep.db") as db:
+        _seed_pre_gap_days(db)
+        _seed_post_gap_days(db)
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+        db.commit()
+        db.conn.execute("UPDATE flights SET origin_name = 'SENTINEL' WHERE takeoff_date < '2026-04-08'")
+        db.commit()
+
+        extract_flights(db, config, "aaaaaa", since_date=date(2026, 4, 8))
+        db.commit()
+
+        kept = db.conn.execute(
+            "SELECT origin_name FROM flights WHERE icao = 'aaaaaa' AND takeoff_date < '2026-04-08'"
+        ).fetchall()
+        assert kept, "pre-boundary flights should survive an incremental extract"
+        assert all(row["origin_name"] == "SENTINEL" for row in kept)
+
+
+def test_incremental_extract_moves_the_last_observed_flag(tmp_path):
+    """The real fetch shape: extract, then new days land after the gap. The
+    flag has to move off the old final flight onto the new one."""
+    config = _make_incremental_config()
+    with Database(tmp_path / "flag.db") as db:
+        _seed_pre_gap_days(db)
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+        db.commit()
+
+        _seed_post_gap_days(db)
+        extract_flights(db, config, "aaaaaa", since_date=date(2026, 4, 8))
+        db.commit()
+
+        rows = db.conn.execute(
+            "SELECT takeoff_date, is_last_observed_flight FROM flights WHERE icao = 'aaaaaa' ORDER BY takeoff_time"
+        ).fetchall()
+        flagged = [row["takeoff_date"] for row in rows if row["is_last_observed_flight"]]
+        assert flagged == ["2026-04-09"]
+
+
+def test_incremental_falls_back_when_extractor_version_differs(tmp_path, capsys):
+    """A row from another extractor generation forces a full reprocess so one
+    aircraft never mixes algorithm generations."""
+    config = _make_incremental_config()
+    with Database(tmp_path / "version.db") as db:
+        _seed_pre_gap_days(db)
+        _seed_post_gap_days(db)
+        full_count = extract_flights(db, config, "aaaaaa", reprocess=True)
+        db.commit()
+        db.conn.execute("UPDATE flights SET extractor_version = NULL WHERE takeoff_date = '2026-04-01'")
+        db.commit()
+
+        count = extract_flights(db, config, "aaaaaa", since_date=date(2026, 4, 8))
+        db.commit()
+
+        out = capsys.readouterr().out
+        assert "full reprocess" in out
+        assert "extractor version" in out
+        assert count == full_count
+        stale = db.conn.execute(
+            "SELECT COUNT(*) AS cnt FROM flights WHERE icao = 'aaaaaa' AND extractor_version IS NOT ?",
+            (EXTRACTOR_VERSION,),
+        ).fetchone()["cnt"]
+        assert stale == 0
+
+
+def test_incremental_falls_back_when_no_flights_exist_yet(tmp_path, capsys):
+    """Nothing to extend: an incremental run on a never-extracted aircraft
+    would silently drop its whole pre-boundary history."""
+    config = _make_incremental_config()
+    with Database(tmp_path / "empty.db") as db:
+        _seed_pre_gap_days(db)
+        _seed_post_gap_days(db)
+
+        count = extract_flights(db, config, "aaaaaa", since_date=date(2026, 4, 8))
+        db.commit()
+
+        assert "full reprocess" in capsys.readouterr().out
+        assert count == len(_flight_rows(db))
+        assert any(row["takeoff_date"] < "2026-04-08" for row in _flight_rows(db))
+
+
+def test_incremental_falls_back_for_ae69_military_hex(tmp_path, capsys):
+    """The MIL_FW promotion counts votes across the whole history, so an
+    ae69xx aircraft cannot be extended a window at a time."""
+    config = _make_incremental_config()
+    with Database(tmp_path / "mil.db") as db:
+        _seed_pre_gap_days(db, "ae6901")
+        _seed_post_gap_days(db, "ae6901")
+        full_count = extract_flights(db, config, "ae6901", reprocess=True)
+        db.commit()
+
+        count = extract_flights(db, config, "ae6901", since_date=date(2026, 4, 8))
+        db.commit()
+
+        assert "full reprocess" in capsys.readouterr().out
+        assert count == full_count
+
+
+def test_find_extract_boundary_stops_after_a_state_resetting_gap():
+    config = _make_incremental_config()
+    dates = ["2026-04-01", "2026-04-02", "2026-04-03", "2026-04-08", "2026-04-09"]
+
+    # The 04-03 -> 04-08 gap resets the state machine, so the walk stops there.
+    assert _find_extract_boundary(dates, date(2026, 4, 8), config, type_code="C172") == "2026-04-08"
+    # Contiguous days carry state, so a later start walks back to the same day.
+    assert _find_extract_boundary(dates, date(2026, 4, 9), config, type_code="C172") == "2026-04-08"
+    # No safe gap before the start date: rebuild everything.
+    assert _find_extract_boundary(dates, date(2026, 4, 3), config, type_code="C172") == "2026-04-01"
+    # A start date the data does not reach yet: nothing to rebuild.
+    assert _find_extract_boundary(dates, date(2026, 4, 10), config, type_code="C172") is None
+
+
+def test_find_extract_boundary_ignores_gaps_the_state_machine_survives():
+    """max_day_gap_days is 2, so a single missing day is not a boundary: the
+    state machine keeps its pending flight across it."""
+    config = _make_incremental_config()
+    dates = ["2026-04-01", "2026-04-03", "2026-04-06"]
+
+    assert _find_extract_boundary(dates, date(2026, 4, 3), config, type_code="C172") == "2026-04-01"
+    assert _find_extract_boundary(dates, date(2026, 4, 6), config, type_code="C172") == "2026-04-06"
+
+
+def test_find_extract_boundary_widens_past_a_long_stitch_window():
+    """A gap that resets the state machine is still not safe when the stitch
+    pass would merge fragments across it."""
+    config = Config(stitch_max_gap_minutes=6000.0)
+    dates = ["2026-04-01", "2026-04-06", "2026-04-07"]
+
+    # 04-01 -> 04-06 leaves at least four days between the last point of one
+    # and the first of the other (5760 minutes), inside a 6000-minute window.
+    assert _find_extract_boundary(dates, date(2026, 4, 7), config, type_code=None) == "2026-04-01"
+    # The same gap is a safe boundary under the default stitch window.
+    assert _find_extract_boundary(dates, date(2026, 4, 7), _make_incremental_config(), type_code=None) == "2026-04-06"

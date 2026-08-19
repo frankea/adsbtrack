@@ -3,10 +3,11 @@ import json
 import math
 import re
 import sqlite3
+from bisect import bisect_left
 from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from . import features
 from .airports import find_nearest_airport, haversine_km
@@ -32,6 +33,24 @@ from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
 # which revision produced them. Legacy rows written before this column
 # existed stay NULL.
 EXTRACTOR_VERSION = 1
+
+
+def _detail_callsign(detail: dict | None) -> str | None:
+    """The callsign a trace point's detail object broadcasts, or None for a
+    missing or blank one.
+
+    Split out of _extract_point_fields so the incremental extract can
+    reconstruct the callsign the state machine carries into its window
+    (see _carried_callsign) by the same rule the state machine applies.
+    """
+    if not detail:
+        return None
+    flight = detail.get("flight", "")
+    if flight:
+        flight = flight.strip()
+        if flight:
+            return flight
+    return None
 
 
 def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> PointData:
@@ -111,11 +130,7 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
         th = detail.get("true_heading")
         if isinstance(th, (int, float)):
             true_heading = float(th)
-        fl = detail.get("flight", "")
-        if fl:
-            fl = fl.strip()
-            if fl:
-                callsign = fl
+        callsign = _detail_callsign(detail)
         # Fall back to detail.alt_geom when the slot index 10 wasn't present
         if geom_alt is None:
             alt_geom = detail.get("alt_geom")
@@ -221,6 +236,27 @@ def _merge_trace_rows(rows: list[tuple[sqlite3.Row, list]], config: Config) -> t
     return rows[0][0]["date"], base_timestamp, result_trace, source_names
 
 
+def _effective_stitch_gap_minutes(config: Config, type_code: str | None) -> float:
+    """The widest fragment gap _stitch_fragments will merge across for this
+    type. Shared with the incremental boundary walk, which has to know how
+    far a stitch can reach before it can call a coverage gap a safe cut."""
+    endurance_minutes = config.type_endurance_minutes.get(type_code or "", config.max_endurance_minutes)
+    return max(config.stitch_max_gap_minutes, endurance_minutes * config.stitch_endurance_ratio)
+
+
+def _day_gap_resets_state(prev_date: str, curr_date: str, config: Config) -> bool:
+    """True when the coverage gap between two consecutive trace days is wide
+    enough that the state machine drops whatever flight it was holding.
+
+    The single definition of that rule: _scan_state_machine applies it while
+    walking the days, and the incremental boundary walk applies it in
+    reverse to find a day the machine is guaranteed to start clean on.
+    """
+    return datetime.fromisoformat(curr_date) - datetime.fromisoformat(prev_date) > timedelta(
+        days=config.max_day_gap_days
+    )
+
+
 def _stitch_fragments(
     flights: list[Flight],
     metrics_list: list[FlightMetrics],
@@ -262,12 +298,7 @@ def _stitch_fragments(
     if len(flights) < 2:
         return flights, metrics_list
 
-    endurance_minutes = config.type_endurance_minutes.get(type_code or "", config.max_endurance_minutes)
-    effective_gap_minutes = max(
-        config.stitch_max_gap_minutes,
-        endurance_minutes * config.stitch_endurance_ratio,
-    )
-    max_gap_secs = effective_gap_minutes * 60.0
+    max_gap_secs = _effective_stitch_gap_minutes(config, type_code) * 60.0
     max_alt_delta = config.stitch_max_alt_delta_ft
     cruise_speed_kt = config.stitch_cruise_speed_kts
     slack = config.stitch_distance_slack
@@ -417,14 +448,14 @@ def pool_spoof_scores(parsed_rows: Iterable[tuple[sqlite3.Row, list]], config: C
             agg["timestamp"] = row["timestamp"]
 
     flagged: dict[str, dict] = {}
-    for date, agg in by_date.items():
+    for date_str, agg in by_date.items():
         v2 = agg["v2"]
         if v2 < config.spoof_min_v2_samples:
             continue
         sil_pct = 100.0 * agg["sil0"] / v2
         if sil_pct < config.spoof_v2_sil0_pct:
             continue
-        flagged[date] = {
+        flagged[date_str] = {
             "v2_samples": v2,
             "v2_sil0_pct": sil_pct,
             "v2_nic0_pct": 100.0 * agg["nic0"] / v2,
@@ -661,14 +692,20 @@ def _scan_state_machine(
     *,
     hex_code: str,
     all_sources: set[str],
+    seed_callsign: str | None = None,
 ) -> tuple[list[Flight], list[FlightMetrics]]:
     """Walk the merged days point by point through the ground/airborne state
     machine, emitting one (Flight, FlightMetrics) pair per detected fragment.
 
     Fragments come out raw: no duration, no noise filtering and no
     stitching - _run_state_machine layers those on top.
+
+    ``seed_callsign`` is the callsign the walk starts out carrying. It is
+    always None for a full extract, which starts before any trace day; an
+    incremental extract passes what the full walk would have been holding
+    when it reached the window's first day, because a coverage gap resets
+    the flight state but not the last callsign heard.
     """
-    max_day_gap = timedelta(days=config.max_day_gap_days)
     max_point_gap_secs = config.max_point_gap_minutes * 60.0
     post_landing_window_secs = config.post_landing_window_secs
     post_landing_max_points = config.post_landing_max_points
@@ -681,7 +718,7 @@ def _scan_state_machine(
     prev_ground_point = None  # (lat, lon, abs_time, day_date)
     pending_flight: Flight | None = None
     pending_metrics: FlightMetrics | None = None
-    current_callsign: str | None = None
+    current_callsign: str | None = seed_callsign
     prev_day_date: str | None = None
     ground_count_before_takeoff = 0
     prev_point_ts: float | None = None
@@ -708,12 +745,9 @@ def _scan_state_machine(
 
     for day_date, day_timestamp, trace in merged_days:
         # Reset state on large cross-day gap
-        if prev_day_date is not None:
-            prev = datetime.fromisoformat(prev_day_date)
-            curr = datetime.fromisoformat(day_date)
-            if curr - prev > max_day_gap:
-                _close_pending()
-                prev_point_ts = None
+        if prev_day_date is not None and _day_gap_resets_state(prev_day_date, day_date, config):
+            _close_pending()
+            prev_point_ts = None
 
         prev_day_date = day_date
 
@@ -955,6 +989,7 @@ def _run_state_machine(
     hex_code: str,
     all_sources: set[str],
     type_code: str | None,
+    seed_callsign: str | None = None,
 ) -> list[tuple[Flight, FlightMetrics]]:
     """Turn merged trace days into the flight fragments enrichment will see.
 
@@ -968,6 +1003,7 @@ def _run_state_machine(
         config,
         hex_code=hex_code,
         all_sources=all_sources,
+        seed_callsign=seed_callsign,
     )
 
     # Compute durations for every flight from first/last trace point.
@@ -1034,6 +1070,9 @@ class _EnrichContext:
     type_code: str | None
     owner_operator: str | None
     spoof_scores_by_date: dict[str, dict]
+    # True when this run rebuilds only part of the aircraft's history, so
+    # the ICAO-wide post-passes have to account for rows they never saw.
+    incremental: bool = False
     airport_elev_cache: dict[str, int | None] = field(default_factory=dict)
     runway_cache: dict[str, list] = field(default_factory=dict)
     navaid_cache: dict[tuple[int, int, int, int], list] = field(default_factory=dict)
@@ -1533,6 +1572,13 @@ def _run_post_passes(ctx: _EnrichContext, final_flights: list[Flight]) -> None:
             last.turnaround_category = "last_observed"
         db.update_last_observed_flag(last)
 
+    # An incremental run only sees its own window, so the flag may still sit
+    # on a surviving row from before the boundary - and a window that
+    # produced nothing at all still has to hand the flag to whatever row is
+    # now newest. Settle it against the table rather than the window.
+    if ctx.incremental:
+        db.refresh_last_observed_flag(hex_code)
+
     # registry-level MIL_FW promotion. If an ae69xx ICAO has >= 3
     # flights classified MIL_FW, the registry type is wrong -- update it
     # and back-fill the remaining flights so ceiling/GS caps use the
@@ -1579,7 +1625,12 @@ def _run_post_passes(ctx: _EnrichContext, final_flights: list[Flight]) -> None:
             db.purge_zero_flight_registry(hex_code)
 
 
-def _persist(pairs: list[tuple[Flight, FlightMetrics]], ctx: _EnrichContext) -> list[Flight]:
+def _persist(
+    pairs: list[tuple[Flight, FlightMetrics]],
+    ctx: _EnrichContext,
+    *,
+    prev_end_time: datetime | None = None,
+) -> list[Flight]:
     """Enrich, gate and write each flight in trace order, then run the
     ICAO-wide post-passes. Returns the flights that reached the DB.
 
@@ -1587,9 +1638,13 @@ def _persist(pairs: list[tuple[Flight, FlightMetrics]], ctx: _EnrichContext) -> 
     _enrich_flight's noise guards and the spoof gate gets sequence fields,
     a row, and the right to become the previous flight the next turnaround
     is measured from.
+
+    ``prev_end_time`` starts that chain. It is None for a full extract - the
+    first flight written is the first one ever observed - and, for an
+    incremental extract, the end of the last flight before the boundary, so
+    the chain continues across the window edge instead of restarting.
     """
     final_flights: list[Flight] = []
-    prev_end_time: datetime | None = None
     for flight, metrics in pairs:
         if not _enrich_flight(flight, metrics, ctx):
             continue
@@ -1606,14 +1661,234 @@ def _persist(pairs: list[tuple[Flight, FlightMetrics]], ctx: _EnrichContext) -> 
     return final_flights
 
 
-def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
+def _is_safe_extract_boundary(prev_date: str, curr_date: str, config: Config, *, type_code: str | None) -> bool:
+    """True when nothing the extractor computes can tie a flight ending on or
+    before ``prev_date`` to one starting on or after ``curr_date``.
+
+    Two independent linkages have to be ruled out:
+
+    1. The state machine carries a pending flight from day to day, and only
+       a gap of more than max_day_gap_days makes it drop one.
+    2. _stitch_fragments then merges an unlanded fragment into the next
+       found-mid-flight one purely on the wall-clock gap between them, with
+       no regard for day boundaries. The narrowest gap two days this far
+       apart can produce is (gap_days - 1) full days -- the last point of
+       one day right before midnight, the first point of the other right
+       after it -- so that has to exceed the stitch window as well.
+
+    Turnaround chaining (_apply_sequence_fields) is a third link between
+    flights, but no gap width breaks it: it reaches back to the previous
+    flight however long ago that was. An incremental extract restores it
+    from the database instead (see db.get_last_flight_end_before).
+    """
+    if not _day_gap_resets_state(prev_date, curr_date, config):
+        return False
+    gap_days = (date.fromisoformat(curr_date) - date.fromisoformat(prev_date)).days
+    minutes_between = (gap_days - 1) * 24 * 60
+    return minutes_between > _effective_stitch_gap_minutes(config, type_code)
+
+
+def _find_extract_boundary(
+    dates: list[str], since_date: date, config: Config, *, type_code: str | None = None
+) -> str | None:
+    """The earliest trace day an incremental extract has to re-process for
+    new data landing on ``since_date``.
+
+    ``dates`` is the ICAO's distinct trace-day dates, ascending. The walk
+    starts at the first day at or after ``since_date`` and steps backwards
+    while the day it is standing on could still be linked to the one before
+    it, stopping at the first safe cut (or at the start of data, which makes
+    the "incremental" extract a full one). Returns None when the aircraft
+    has no trace day at or after ``since_date`` -- nothing landed inside the
+    history, so there is nothing to rebuild.
+    """
+    index = bisect_left(dates, since_date.isoformat())
+    if index >= len(dates):
+        return None
+    while index > 0 and not _is_safe_extract_boundary(dates[index - 1], dates[index], config, type_code=type_code):
+        index -= 1
+    return dates[index]
+
+
+@dataclass
+class _CarriedState:
+    """What a full extract is already holding by the time it reaches an
+    incremental window's first day, and therefore what that window has to be
+    handed to produce the same rows.
+
+    Empty for a full extract, which starts before the aircraft's first trace
+    day and so carries nothing.
+    """
+
+    # Every source that ever contributed a trace day. Stamped on each
+    # flight's metrics, so a window that only saw one source would otherwise
+    # write a narrower `sources` column than a full run.
+    sources: set[str] = field(default_factory=set)
+    # Last callsign broadcast before the window. The state machine keeps
+    # carrying one across a coverage gap even though it drops the flight.
+    callsign: str | None = None
+    # End of the last flight before the window, which the turnaround chain
+    # measures the window's first flight against.
+    prev_end_time: datetime | None = None
+
+
+def _last_callsign_of_day(rows: list[sqlite3.Row], hex_code: str, config: Config) -> str | None:
+    """The last callsign broadcast on one trace day, or None if it had none.
+
+    Merges the day's sources exactly as the extract pipeline does, so the
+    answer is the same point the state machine would have seen last.
+    """
+    parsed = list(iter_parsed_trace_days(rows, hex_code))
+    if not parsed:
+        return None
+    _date_str, _base_ts, trace, _sources = _merge_trace_rows(parsed, config)
+    for point in reversed(trace):
+        detail = point[8] if len(point) > 8 and isinstance(point[8], dict) else None
+        callsign = _detail_callsign(detail)
+        if callsign is not None:
+            return callsign
+    return None
+
+
+def _carried_callsign(db: Database, config: Config, hex_code: str, days_before: list[str]) -> str | None:
+    """The callsign a full extract would still be carrying when it reaches
+    the boundary: the last one broadcast on any earlier trace day.
+
+    ``days_before`` is the aircraft's trace days before the boundary, in
+    ascending order. Reads them newest first and stops at the first one with
+    a callsign, which is nearly always the day right before the boundary.
+    Aircraft that never broadcast a callsign are the worst case and cost one
+    pass over their (by definition callsign-free) history.
+    """
+    for day in reversed(days_before):
+        callsign = _last_callsign_of_day(db.get_trace_day(hex_code, day), hex_code, config)
+        if callsign is not None:
+            return callsign
+    return None
+
+
+def _incremental_refusal(db: Database, hex_code: str) -> str | None:
+    """Why this ICAO cannot be extended one window at a time, or None when it
+    can. Every answer here is a case where a partial rebuild would leave the
+    flights table holding something no full reprocess would ever produce.
+    """
+    if hex_code.startswith("ae69"):
+        # _run_post_passes promotes an ae69xx registry to MIL_FW on a vote of
+        # 3+ flights and back-fills type_override across the whole history.
+        # A window can neither count those votes nor re-cap the rows it
+        # cannot see.
+        return "ae69xx MIL_FW promotion votes across the whole history"
+    if db.get_flight_count(hex_code) == 0:
+        return "no flights extracted yet"
+    stale = db.count_stale_extractor_flights(hex_code, EXTRACTOR_VERSION)
+    if stale:
+        return f"{stale} existing flight(s) from another extractor version"
+    return None
+
+
+def _extract_window(
+    db: Database,
+    config: Config,
+    hex_code: str,
+    trace_days: list,
+    *,
+    type_code: str | None,
+    owner_operator: str | None,
+    carried: _CarriedState,
+    incremental: bool = False,
+) -> int:
+    """Load, merge, walk and persist one set of trace days. The whole history
+    for a full extract, the days from the boundary onward for an incremental
+    one. Returns the number of flights written."""
+    merged_days, window_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
+    pairs = _run_state_machine(
+        merged_days,
+        config,
+        hex_code=hex_code,
+        all_sources=window_sources | carried.sources,
+        type_code=type_code,
+        seed_callsign=carried.callsign,
+    )
+    ctx = _EnrichContext(
+        db=db,
+        config=config,
+        hex_code=hex_code,
+        type_code=type_code,
+        owner_operator=owner_operator,
+        spoof_scores_by_date=spoof_scores_by_date,
+        incremental=incremental,
+    )
+    return len(_persist(pairs, ctx, prev_end_time=carried.prev_end_time))
+
+
+def _extract_incremental(db: Database, config: Config, hex_code: str, since_date: date) -> int:
+    """Rebuild only the trace days that new data on ``since_date`` can
+    affect, leaving earlier flights in place. Returns the number of flights
+    written, which is the window's count and not the aircraft's total.
+    """
+    refusal = _incremental_refusal(db, hex_code)
+    if refusal is not None:
+        print(f"  incremental extract of {hex_code} not possible ({refusal}); doing a full reprocess")
+        return extract_flights(db, config, hex_code, reprocess=True)
+
+    # Registry resolution votes over every trace day the aircraft has, not
+    # just the window: type_code drives endurance, ceilings and the stitch
+    # window, so narrowing the vote could hand the window a different type
+    # than the full extract used. These rows carry no trace_json, so the
+    # full-history pass stays cheap.
+    metadata_rows = db.get_trace_day_metadata(hex_code)
+    if not metadata_rows:
+        return 0
+    type_code, owner_operator = _resolve_registry_metadata(db, hex_code, metadata_rows)
+
+    dates = sorted({row["date"] for row in metadata_rows})
+    boundary = _find_extract_boundary(dates, since_date, config, type_code=type_code)
+    if boundary is None:
+        return 0
+    trace_days = list(db.get_trace_days(hex_code, since=boundary))
+    if not trace_days:
+        return 0
+
+    prev_end = db.get_last_flight_end_before(hex_code, boundary)
+    carried = _CarriedState(
+        sources={row["source"] for row in metadata_rows},
+        callsign=_carried_callsign(db, config, hex_code, [day for day in dates if day < boundary]),
+        prev_end_time=datetime.fromisoformat(prev_end) if prev_end else None,
+    )
+    db.clear_flights_since(hex_code, boundary)
+    return _extract_window(
+        db,
+        config,
+        hex_code,
+        trace_days,
+        type_code=type_code,
+        owner_operator=owner_operator,
+        carried=carried,
+        incremental=True,
+    )
+
+
+def extract_flights(
+    db: Database, config: Config, hex_code: str, reprocess: bool = False, since_date: date | None = None
+):
     """Extract this ICAO's flight history from its stored trace days and
     write it to the flights table. Returns the number of flights written.
 
     Four stages, each a module-private function below: resolve the aircraft
     metadata, load and merge the trace days, run the ground/airborne state
     machine over them, then enrich and persist the fragments it emitted.
+
+    ``since_date`` switches to an incremental extract: only the trace days
+    that new data on that date can affect are re-processed, and only the
+    flights those days produced are deleted first. The rows it writes are
+    identical to the ones a full reprocess would write; where they could not
+    be, _incremental_refusal falls back to a full reprocess instead. Without
+    it, behavior is unchanged: ``reprocess`` clears the history and rebuilds
+    it, and a plain call re-writes every flight over the existing rows.
     """
+    if since_date is not None:
+        return _extract_incremental(db, config, hex_code, since_date)
+
     if reprocess:
         db.clear_flights(hex_code)
 
@@ -1625,20 +1900,12 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         return 0
 
     type_code, owner_operator = _resolve_registry_metadata(db, hex_code, trace_days)
-    merged_days, all_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
-    pairs = _run_state_machine(
-        merged_days,
+    return _extract_window(
+        db,
         config,
-        hex_code=hex_code,
-        all_sources=all_sources,
-        type_code=type_code,
-    )
-    ctx = _EnrichContext(
-        db=db,
-        config=config,
-        hex_code=hex_code,
+        hex_code,
+        trace_days,
         type_code=type_code,
         owner_operator=owner_operator,
-        spoof_scores_by_date=spoof_scores_by_date,
+        carried=_CarriedState(),
     )
-    return len(_persist(pairs, ctx))

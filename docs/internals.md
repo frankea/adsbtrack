@@ -139,6 +139,27 @@ After extraction, a post-processing pass walks each aircraft's flights chronolog
 
 The stitched flight inherits the original takeoff position and time, which recovers the actual origin airport for flights that would otherwise be classified as mid-flight fragments. Duration is recomputed after merging so the wall-clock span covers the coverage gap.
 
+## Incremental extraction
+
+`fetch` re-extracts once its downloads are stored, and `extract --since DATE` exposes the same path by hand. Rather than rebuilding an aircraft's whole history, both re-process only the trace days the new data can change.
+
+The window starts at a **boundary day**, found by walking backwards from the first trace day at or after the given date until the gap to the previous day of coverage is wide enough that nothing can link across it. Two links have to break there:
+
+- the state machine carries a pending flight from day to day and only drops it on a gap of more than `max_day_gap_days` (2);
+- fragment stitching then merges an unlanded fragment into the next found-mid-flight one on wall-clock gap alone, with no regard for dates, so the narrowest gap two days that far apart can produce - `(gap_days - 1)` full days, the last point of one day just before midnight and the first point of the other just after it - has to exceed the stitch window as well.
+
+Contiguous coverage never offers such a gap, so an aircraft fetched daily walks all the way back and rebuilds in full. Incremental extraction pays off on the sparse histories where the gaps exist.
+
+Everything from the boundary onward - flights and spoof rejections both, since re-extraction decides again which of the two a fragment becomes - is deleted and rebuilt. Three pieces of state a full run would already be holding at that point are restored so the rebuilt rows come out identical to a full reprocess:
+
+- the union of every source that ever contributed a trace day, which is stamped on each flight;
+- the last callsign broadcast before the boundary, because a coverage gap resets the pending flight but not the callsign the state machine carries;
+- the end of the last flight before the boundary, which the turnaround chain measures the first rebuilt flight against. No gap width breaks that link - it reaches back however long ago the previous flight was - so it is the one linkage the boundary rule cannot handle by itself.
+
+`is_last_observed_flight` is a whole-history property, so it is re-settled against the table afterwards rather than against the window.
+
+The run falls back to a full reprocess, printing why, whenever that guarantee cannot be made: an aircraft with no flights extracted yet, any flight row stamped with a different `extractor_version` (never mix algorithm generations within one aircraft), or an `ae69xx` hex, whose MIL_FW registry promotion counts votes across the entire history and back-fills rows a window cannot see.
+
 ## Altitude cross-validation
 
 `max_altitude` uses a three-layer defence against corrupt altitude spikes from pressure-datum swaps and geometric-altitude errors:

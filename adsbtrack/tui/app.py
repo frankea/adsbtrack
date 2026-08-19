@@ -44,6 +44,14 @@ class AdsbtrackApp(App):
     # can't carry its own DEFAULT_CSS. Merged into the app's CSS here.
     CSS = FILTER_BAR_CSS
     TITLE = "adsbtrack"
+    # Textual's default AUTO_FOCUS ("*") grabs the first focusable widget
+    # on mount -- the aircraft view's filter Input, since it composes
+    # before the DataTable. That swallows every digit keypress as text
+    # instead of letting it bubble to the view-switch BINDINGS below, so
+    # 1-6/f do nothing on a fresh launch until the user tabs or clicks
+    # away. Disable auto-focus; "/" (action_focus_filter) still focuses
+    # a view's filter explicitly when the user wants it.
+    AUTO_FOCUS = None
 
     BINDINGS = [
         Binding("1", "goto('aircraft')", "Aircraft"),

@@ -30,6 +30,7 @@ from .classifier import FlightMetrics, _PointSample
 from .geo import bearing_deg as _bearing_deg
 from .geo import haversine_m as _haversine_m
 from .geo import smallest_angle_deg as _smallest_angle
+from .geo import split_on_gaps
 
 
 @dataclass(frozen=True)
@@ -105,21 +106,18 @@ def _alignment_for_runway(
     if not kept:
         return []
 
-    # Split on gaps larger than split_gap_secs.
-    segments: list[list[tuple[float, float, _PointSample]]] = [[kept[0]]]
-    for prev, cur in zip(kept, kept[1:], strict=False):
-        if cur[0] - prev[0] > split_gap_secs:
-            segments.append([cur])
-        else:
-            segments[-1].append(cur)
+    segments = split_on_gaps(
+        kept,
+        ts=lambda item: item[0],
+        split_gap_secs=split_gap_secs,
+        min_duration_secs=min_duration_secs,
+    )
 
     # Emit every segment meeting the duration floor.
     results: list[IlsAlignmentResult] = []
     runway_name = str(runway.get("runway_name", ""))
     for seg in segments:
         dur = seg[-1][0] - seg[0][0]
-        if dur < min_duration_secs:
-            continue
         results.append(
             IlsAlignmentResult(
                 runway_name=runway_name,

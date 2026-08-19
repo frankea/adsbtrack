@@ -254,5 +254,13 @@ def detect_navaid_alignments(
                 )
             )
 
-    out.sort(key=lambda s: s.start_ts)
+    # Secondary key on navaid_ident: two navaids can qualify from the exact
+    # same first sample (a start_ts tie). Without a tiebreaker, relative
+    # order between them falls out of dict-insertion order, which differs
+    # between the grid path (cell-traversal order) and the direct-scan path
+    # (navaid-list order) -- an observable, path-dependent difference that
+    # would violate this function's identical-results-regardless-of-path
+    # contract. The ident key makes tie order deterministic and identical
+    # across both paths.
+    out.sort(key=lambda s: (s.start_ts, s.navaid_ident))
     return out

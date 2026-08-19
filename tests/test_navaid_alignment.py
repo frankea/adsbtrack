@@ -325,6 +325,56 @@ def test_at_or_above_grid_threshold_uses_clamped_grid_and_matches_brute_force(mo
     assert len(grid_init_calls) == 1, "grid should be built exactly once at/above grid_min_count"
 
 
+def test_start_ts_tie_across_different_cells_is_deterministic_both_paths():
+    """Two navaids that qualify from the exact same first sample (a
+    start_ts tie) but land in different grid cells. Without a secondary
+    sort key, relative order between tied segments falls out of dict
+    insertion order, which differs between the direct-scan path (navaid
+    list order) and the grid path (cell-traversal order) -- an
+    observable, path-dependent difference in output that the
+    grid_min_count parameter must not introduce (it's documented as
+    perf-only). Pins the deterministic (start_ts, navaid_ident) order
+    through both paths explicitly.
+
+    cell_size_deg=0.1 puts the two navaids (lon 0.5 vs 0.6, same lat) in
+    different grid cells (col 5 vs col 6) despite their near-identical
+    bearing from the sample point, so the grid path's cell-traversal order
+    does not coincide with navaid-list order by construction. BBB is
+    listed before AAA so a naive list-order tiebreak would put BBB first;
+    only the (start_ts, ident) sort key should decide the order, and it
+    must decide it the same way regardless of which path ran.
+
+    (Verified directly against this task's pre-fix code: before the
+    secondary sort key was added, the direct-scan path returned
+    ['BBB', 'AAA'] here while the grid path returned ['AAA', 'BBB'] --
+    the exact divergence this test guards against.)
+    """
+    point = [_sample(ts=1000.0, lat=0.0, lon=0.0, track=90.0)]
+    navaids = [
+        {"ident": "BBB", "latitude_deg": 0.0, "longitude_deg": 0.6, "type": "VOR"},
+        {"ident": "AAA", "latitude_deg": 0.0, "longitude_deg": 0.5, "type": "VOR"},
+    ]
+
+    below = detect_navaid_alignments(
+        point,
+        navaids=navaids,
+        min_duration_secs=0.0,
+        cell_size_deg=0.1,
+        grid_min_count=100,  # len(navaids)=2 < 100 -> direct-scan path
+    )
+    above = detect_navaid_alignments(
+        point,
+        navaids=navaids,
+        min_duration_secs=0.0,
+        cell_size_deg=0.1,
+        grid_min_count=0,  # len(navaids)=2 >= 0 -> grid path
+    )
+
+    assert [s.navaid_ident for s in below] == ["AAA", "BBB"]
+    assert [s.navaid_ident for s in above] == ["AAA", "BBB"]
+    assert below == above
+
+
 def test_detect_matches_brute_force_and_completes_under_budget():
     """Stress test: 5000 points × 500 navaids covering a transcontinental
     flight with a realistic post-bbox-filter candidate set.

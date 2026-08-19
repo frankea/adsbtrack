@@ -502,6 +502,37 @@ def test_sync_wrapper_signature_unchanged(tmp_db, fast_config, monkeypatch, _no_
     assert stats["errors"] == 0
 
 
+def test_fetch_traces_with_injected_progress_reuses_it(tmp_db, fast_config, monkeypatch, _no_real_sleep):
+    """When called with an externally owned Progress, fetch_traces must add
+    its task to that instance instead of constructing (and owning the
+    lifecycle of) its own -- this is what lets --source all render every
+    source as a line inside one shared display."""
+    from adsbtrack import fetcher as fetcher_mod
+
+    day = date(2024, 6, 15)
+    script = {day.isoformat(): [(200, _trace_payload(day), {})]}
+    transport = _ScriptedTransport(script)
+    _patch_transport(monkeypatch, transport)
+
+    original_progress_cls = fetcher_mod.Progress
+    construct_count = {"n": 0}
+
+    class _CountingProgress(original_progress_cls):
+        def __init__(self, *a, **kw):
+            construct_count["n"] += 1
+            super().__init__(*a, **kw)
+
+    monkeypatch.setattr(fetcher_mod, "Progress", _CountingProgress)
+
+    external_progress = original_progress_cls()
+    with external_progress:
+        stats = fetch_traces(tmp_db, fast_config, "abc123", day, day, source="adsbx", progress=external_progress)
+
+    assert construct_count["n"] == 0, "fetch_traces must not construct its own Progress when given one"
+    assert len(external_progress.task_ids) == 1
+    assert stats["fetched"] == 1
+
+
 def test_concurrency_one_is_serial(tmp_db, fast_config, monkeypatch, _no_real_sleep):
     """concurrency=1 must produce peak_concurrency=1 — byte-identical
     request pattern to the old synchronous code."""

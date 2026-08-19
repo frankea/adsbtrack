@@ -384,6 +384,7 @@ async def _fetch_traces_async(
     end_date: date,
     source: str,
     concurrency: int,
+    progress: Progress | None = None,
 ) -> dict:
     base_url = SOURCE_URLS[source]
     already_fetched = db.get_fetched_dates(hex_code, source=source)
@@ -414,6 +415,22 @@ async def _fetch_traces_async(
     queue: asyncio.Queue[_DayResult | None] = asyncio.Queue()
     semaphore = asyncio.Semaphore(max(1, concurrency))
 
+    # An externally supplied Progress (e.g. --source all sharing one display
+    # across per-source threads) is borrowed, not owned: we add our task to
+    # it but leave start/stop to the caller. Otherwise we create and own one
+    # exactly as before.
+    owns_progress = progress is None
+    progress_cm = (
+        Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+        )
+        if owns_progress
+        else contextlib.nullcontext(progress)
+    )
+
     async with (
         httpx.AsyncClient(
             http2=True,
@@ -422,12 +439,7 @@ async def _fetch_traces_async(
             follow_redirects=True,
         ) as client,
     ):
-        with Progress(
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
+        with progress_cm as progress:
             task_id = progress.add_task(f"Fetching {hex_code} ({source})", total=len(to_fetch))
             writer = asyncio.create_task(
                 _db_writer(queue, db, hex_code, source, stats, progress, task_id, state, circuit_tripped)
@@ -478,7 +490,8 @@ async def _fetch_traces_async(
                 db.commit()
 
             if circuit_tripped.is_set():
-                progress.stop()
+                if owns_progress:
+                    progress.stop()
                 raise RuntimeError(
                     f"HTTP 403 for {source} on {state.max_403_days} consecutive days. "
                     "The source is likely blocking automated requests. "
@@ -498,6 +511,7 @@ def fetch_traces(
     source: str = "adsbx",
     *,
     concurrency: int | None = None,
+    progress: Progress | None = None,
 ) -> dict:
     """Fetch readsb-format traces for ``hex_code`` from ``source``.
 
@@ -506,6 +520,14 @@ def fetch_traces(
     ``{"fetched", "with_data", "skipped", "errors"}``. ``concurrency``
     defaults to ``config.fetch_concurrency`` (4). A value of 1 is
     byte-identical to serial behavior.
+
+    ``progress``, when given, is an externally owned ``rich.progress.Progress``
+    that this call adds its own task to instead of creating and managing one
+    itself. This lets a caller fetching multiple sources concurrently (e.g.
+    ``fetch --source all``, one thread per source) render every source as its
+    own line inside a single shared display -- Rich's Progress is thread-safe
+    for task updates. When omitted, behavior is unchanged: a Progress is
+    created and owned for the duration of this call.
 
     Rate limit is enforced between request STARTS, not completions, so
     on a cooperative source concurrency can overlap in-flight requests
@@ -516,7 +538,9 @@ def fetch_traces(
     """
     if concurrency is None:
         concurrency = getattr(config, "fetch_concurrency", 4)
-    return asyncio.run(_fetch_traces_async(db, config, hex_code, start_date, end_date, source, concurrency))
+    return asyncio.run(
+        _fetch_traces_async(db, config, hex_code, start_date, end_date, source, concurrency, progress=progress)
+    )
 
 
 def fetch_traces_adsblol(db: Database, config: Config, hex_code: str, start_date: date, end_date: date) -> dict:

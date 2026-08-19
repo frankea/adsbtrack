@@ -470,6 +470,50 @@ def test_acars_cli_fetches_and_stores_messages(tmp_path, monkeypatch):
         assert flt["message_count"] == 1
 
 
+def test_acars_cli_wires_progress_callback(tmp_path, monkeypatch):
+    """`acars` wires a Rich progress bar through fetch_acars's progress_callback,
+    and the bar description surfaces the client's rate-limit remaining counts
+    when the client has populated them. Pipeline is mocked (no network); this
+    is a smoke test that the callback plumbing doesn't crash and reaches
+    completion."""
+    from adsbtrack import cli as cli_module
+
+    db_path = tmp_path / "a.db"
+    Database(db_path).close()
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.minute_remaining = 42
+            self.daily_remaining = 900
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+    def fake_fetch_acars(db, client, icao, *, start_date, end_date, progress_callback=None):
+        if progress_callback is not None:
+            for i in range(1, 4):
+                progress_callback(i, 3)
+        return {"flights_fetched": 3, "flights_skipped": 0, "messages_inserted": 5, "flights_with_oooi": 1}
+
+    monkeypatch.setenv("AIRFRAMES_API_KEY", "test-key")
+    monkeypatch.setattr(cli_module, "AirframesClient", FakeClient)
+    monkeypatch.setattr(cli_module, "fetch_acars", fake_fetch_acars)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["acars", "--hex", "06a0a5", "--start", "2026-04-01", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Flights fetched: 3" in result.output
+    # Bar description surfaced the client's rate-limit counters.
+    assert "42" in result.output
+    assert "900" in result.output
+
+
 def test_acars_cli_errors_without_api_key(monkeypatch):
     """With no env var and no credentials file, the CLI should exit non-zero with a clear error.
 
@@ -681,6 +725,35 @@ def test_enrich_hex_military_flags_military(tmp_path):
     assert result.exit_code == 0, result.output
     assert "Military" in result.output
     assert "United States" in result.output
+
+
+def test_enrich_all_cli_wires_progress_callback(tmp_path, monkeypatch):
+    """`enrich all` wires a Rich progress bar through enrich_all's
+    progress_callback (hexes processed / total). Pipeline is mocked; this is
+    a smoke test that the callback plumbing doesn't crash and reaches
+    completion. enrich_all_cmd imports enrich_all locally from hex_crossref
+    on each invocation, so the fake is patched on the source module."""
+
+    wired = {"progress_callback_used": False}
+
+    def fake_enrich_all(db, *, cfg=None, mictronics_cache_dir=None, use_hexdb=True, progress_callback=None):
+        assert progress_callback is not None, "enrich all must wire a progress_callback"
+        wired["progress_callback_used"] = True
+        for i in range(1, 6):
+            progress_callback(i, 5)
+        return {"processed": 5, "written": 3, "no_data": 2, "conflicts": 0}
+
+    monkeypatch.setattr("adsbtrack.hex_crossref.enrich_all", fake_enrich_all)
+
+    db_path = tmp_path / "t.db"
+    Database(db_path).close()
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["enrich", "all", "--no-hexdb", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert wired["progress_callback_used"]
+    assert "Processed 5" in result.output
+    assert "wrote 3" in result.output
 
 
 def test_mil_hex_reports_range(tmp_path):
@@ -1340,6 +1413,63 @@ def test_fetch_cli_omits_failed_days_header_when_empty(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert "Failed days" not in result.output
+
+
+def test_fetch_cli_source_all_prints_per_source_stats(tmp_path, monkeypatch):
+    """`fetch --source all` fans out to every readsb source in its own thread.
+    Each source must get its own stats line in the summary (not just the
+    summed total), and fetch_traces must be given a shared Progress so
+    concurrent per-source bars don't race for the terminal."""
+    from adsbtrack import cli as cli_module
+
+    per_source_returns = {
+        "adsbx": {"fetched": 5, "with_data": 4, "skipped": 0, "errors": 1, "failed_days": []},
+        "adsbfi": {"fetched": 3, "with_data": 3, "skipped": 0, "errors": 0, "failed_days": []},
+        "airplaneslive": {"fetched": 2, "with_data": 2, "skipped": 0, "errors": 0, "failed_days": []},
+        "adsblol": {"fetched": 1, "with_data": 1, "skipped": 0, "errors": 0, "failed_days": []},
+        "theairtraffic": {"fetched": 0, "with_data": 0, "skipped": 1, "errors": 0, "failed_days": []},
+    }
+    seen_progress_objects = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx", progress=None):
+        seen_progress_objects.append(progress)
+        return per_source_returns[source]
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "abcdef",
+            "--source",
+            "all",
+            "--start",
+            "2026-05-01",
+            "--end",
+            "2026-05-01",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    for source, stats in per_source_returns.items():
+        assert f"{source}: {stats['fetched']} fetched" in result.output, result.output
+
+    # Every call got a progress object, and it's the same shared instance
+    # across all sources (one Progress, one task line per source).
+    assert len(seen_progress_objects) == len(per_source_returns)
+    assert all(p is not None for p in seen_progress_objects)
+    assert len({id(p) for p in seen_progress_objects}) == 1
 
 
 # ---------------------------------------------------------------------------

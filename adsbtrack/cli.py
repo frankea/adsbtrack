@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 import click
 from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
 from .acars import fetch_acars
@@ -302,28 +303,51 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
 
         if len(sources_to_fetch) > 1:
             # Parallel fetch: each source in its own thread with its own
-            # DB connection (SQLite WAL supports concurrent writers).
+            # DB connection (SQLite WAL supports concurrent writers). All
+            # readsb-source threads share one Progress so each source
+            # renders as its own task line instead of racing to start
+            # separate Live displays on the same console.
             import threading
 
             lock = threading.Lock()
+            per_source_stats: dict[str, dict] = {}
 
-            def _fetch_one(src: str) -> None:
-                with Database(Path(db_path)) as thread_db:
-                    thread_config = Config(db_path=Path(db_path))
-                    thread_config.rate_limit = rate
-                    thread_config.fetch_concurrency = concurrency
-                    if src == "opensky":
-                        stats = fetch_traces_opensky(thread_db, thread_config, hex_code, start, end)
-                    else:
-                        stats = fetch_traces(thread_db, thread_config, hex_code, start, end, source=src)
-                    with lock:
-                        _accumulate(stats)
+            with Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeRemainingColumn(),
+            ) as shared_progress:
 
-            threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
+                def _fetch_one(src: str) -> None:
+                    with Database(Path(db_path)) as thread_db:
+                        thread_config = Config(db_path=Path(db_path))
+                        thread_config.rate_limit = rate
+                        thread_config.fetch_concurrency = concurrency
+                        if src == "opensky":
+                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, start, end)
+                        else:
+                            stats = fetch_traces(
+                                thread_db, thread_config, hex_code, start, end, source=src, progress=shared_progress
+                            )
+                        with lock:
+                            per_source_stats[src] = stats
+                            _accumulate(stats)
+
+                threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join()
+
+            for src in sources_to_fetch:
+                s = per_source_stats.get(src)
+                if s is None:
+                    continue
+                console.print(
+                    f"  [dim]{src}:[/] {s['fetched']} fetched, {s['with_data']} with data, "
+                    f"{s['skipped']} skipped, {s['errors']} errors"
+                )
         else:
             src = sources_to_fetch[0]
             if src == "opensky":
@@ -434,8 +458,26 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
         hex_code = hex_code.lower()
 
         console.print(f"Fetching ACARS for [bold]{hex_code}[/] from {start} to {end}")
-        with AirframesClient(api_key=api_key) as client:
-            stats = fetch_acars(db, client, hex_code, start_date=start, end_date=end)
+        with (
+            AirframesClient(api_key=api_key) as client,
+            Progress(
+                TextColumn("[bold blue]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeRemainingColumn(),
+            ) as progress,
+        ):
+            task_id = progress.add_task(f"ACARS {hex_code}", total=None)
+
+            def _on_progress(done: int, total: int) -> None:
+                description = f"ACARS {hex_code}"
+                minute_remaining = getattr(client, "minute_remaining", None)
+                daily_remaining = getattr(client, "daily_remaining", None)
+                if minute_remaining is not None or daily_remaining is not None:
+                    description += f" (minute remaining: {minute_remaining}, daily remaining: {daily_remaining})"
+                progress.update(task_id, completed=done, total=total, description=description)
+
+            stats = fetch_acars(db, client, hex_code, start_date=start, end_date=end, progress_callback=_on_progress)
 
         console.print(
             f"[green]Done.[/] Flights fetched: {stats['flights_fetched']}, "
@@ -1398,12 +1440,26 @@ def enrich_all_cmd(db_path, mictronics_dir, no_hexdb, download_mictronics):
         console.print(f"Downloading Mictronics DB into {resolved_mictronics}...")
         dl_mictronics(cfg, cache_dir=resolved_mictronics)
 
-    with Database(cfg.db_path) as db:
+    with (
+        Database(cfg.db_path) as db,
+        Progress(
+            TextColumn("[bold blue]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeRemainingColumn(),
+        ) as progress,
+    ):
+        task_id = progress.add_task("Enriching hex_crossref", total=None)
+
+        def _on_progress(done: int, total: int) -> None:
+            progress.update(task_id, completed=done, total=total)
+
         stats = enrich_all(
             db,
             cfg=cfg,
             mictronics_cache_dir=resolved_mictronics,
             use_hexdb=not no_hexdb,
+            progress_callback=_on_progress,
         )
     console.print(
         f"[green]Enrich complete.[/] Processed {stats['processed']}, "

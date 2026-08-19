@@ -2,7 +2,7 @@ import json
 import os
 import re
 from collections.abc import Callable
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from urllib.parse import urlparse
@@ -298,6 +298,10 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
             sources_to_fetch = [source]
             console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
 
+        # Marks this run's trace_days rows, whichever source writes them, so
+        # the auto-extract below knows where its new data starts.
+        run_started_at = datetime.now(UTC).isoformat()
+
         total_stats = {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
 
         def _accumulate(stats: dict) -> None:
@@ -372,9 +376,15 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
             failed_str = ", ".join(f"{d} ({status})" for d, status in total_stats["failed_days"])
             console.print(f"[yellow]Failed days (will retry on next run):[/] {failed_str}")
 
-        # Auto-extract flights
+        # Auto-extract flights, re-processing only what the new trace days
+        # can affect. A day that landed nothing (204/404, or every day
+        # already fetched) changes no flight, so there is nothing to redo.
+        earliest_new = db.get_earliest_trace_date_since(hex_code, run_started_at)
+        if earliest_new is None:
+            console.print("\n[dim]No new trace days; leaving flights as they are.[/]")
+            return
         console.print("\nExtracting flights...")
-        count = extract_flights(db, config, hex_code, reprocess=True)
+        count = extract_flights(db, config, hex_code, since_date=date.fromisoformat(earliest_new))
         console.print(f"[green]Found {count} flights[/]")
         try:
             enriched = enrich_helipad_names(db, config)
@@ -388,14 +398,31 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--reprocess", is_flag=True, help="Clear and rebuild all flights")
+@click.option(
+    "--since",
+    "since_str",
+    default=None,
+    help="Rebuild only the trace days that new data on this date (YYYY-MM-DD) can affect, "
+    "keeping the flights before them. Falls back to a full reprocess when the history "
+    "cannot be extended safely.",
+)
 @_db_option()
-def extract(hex_code, tail_number, reprocess, db_path):
+def extract(hex_code, tail_number, reprocess, since_str, db_path):
     """Process raw traces into flights."""
+    if reprocess and since_str:
+        raise click.UsageError("Provide either --reprocess or --since, not both.")
+    since_date = None
+    if since_str:
+        try:
+            since_date = date.fromisoformat(since_str)
+        except ValueError:
+            console.print(f"[red]Invalid --since '{since_str}'; use YYYY-MM-DD.[/]")
+            return
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         config = _load_config(db_path)
         ensure_airports(db, config)
-        count = extract_flights(db, config, hex_code, reprocess=reprocess)
+        count = extract_flights(db, config, hex_code, reprocess=reprocess, since_date=since_date)
         console.print(f"[green]Extracted {count} flights[/]")
         # v12 N13: enrich generic helipad names from OurAirports heliport data.
         try:

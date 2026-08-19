@@ -2003,3 +2003,110 @@ def test_events_default_output_unchanged_with_table_title(tmp_path):
     result = CliRunner().invoke(cli, ["events", "--hex", "aaa001", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "Events for aaa001" in result.output
+
+
+# ---------------------------------------------------------------------------
+# fetch -> extract glue (incremental extraction)
+# ---------------------------------------------------------------------------
+
+
+def _seed_airport(db_path: Path) -> None:
+    """One airport so ensure_airports() does not try to download the CSV."""
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.commit()
+
+
+def _fake_extract(calls: list):
+    """Stand-in for parser.extract_flights that records how it was called."""
+
+    def fake_extract_flights(db, config, hex_code, reprocess=False, since_date=None):
+        calls.append({"hex": hex_code, "reprocess": reprocess, "since_date": since_date})
+        return 0
+
+    return fake_extract_flights
+
+
+def test_fetch_extracts_incrementally_from_the_earliest_new_day(tmp_path, monkeypatch):
+    """A fetch that lands one new trace day re-extracts from that day, not
+    from the beginning of the aircraft's history."""
+    from adsbtrack import cli as cli_module
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        db.insert_trace_day(
+            hex_code,
+            "2026-05-03",
+            {"r": "N1", "t": "C172", "timestamp": 1777766400.0, "trace": []},
+            source=source,
+        )
+        db.commit()
+        return {"fetched": 1, "with_data": 1, "skipped": 0, "errors": 0, "failed_days": []}
+
+    calls: list = []
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+    monkeypatch.setattr(cli_module, "extract_flights", _fake_extract(calls))
+
+    db_path = tmp_path / "fetch.db"
+    _seed_airport(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "abcdef", "--start", "2026-05-02", "--end", "2026-05-03", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [{"hex": "abcdef", "reprocess": False, "since_date": date(2026, 5, 3)}]
+
+
+def test_fetch_skips_extract_when_no_trace_day_landed(tmp_path, monkeypatch):
+    """Nothing new on disk means nothing to re-extract."""
+    from adsbtrack import cli as cli_module
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        return {"fetched": 1, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    calls: list = []
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+    monkeypatch.setattr(cli_module, "extract_flights", _fake_extract(calls))
+
+    db_path = tmp_path / "fetch.db"
+    _seed_airport(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "abcdef", "--start", "2026-05-02", "--end", "2026-05-03", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == []
+    assert "No new trace days" in result.output
+
+
+def test_extract_since_passes_the_date_to_the_parser(tmp_path, monkeypatch):
+    from adsbtrack import cli as cli_module
+
+    calls: list = []
+    monkeypatch.setattr(cli_module, "extract_flights", _fake_extract(calls))
+
+    db_path = tmp_path / "extract.db"
+    _seed_airport(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["extract", "--hex", "abcdef", "--since", "2026-05-03", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [{"hex": "abcdef", "reprocess": False, "since_date": date(2026, 5, 3)}]
+
+
+def test_extract_rejects_since_with_reprocess(tmp_path):
+    db_path = tmp_path / "extract.db"
+    _seed_airport(db_path)
+
+    result = CliRunner().invoke(
+        cli,
+        ["extract", "--hex", "abcdef", "--since", "2026-05-03", "--reprocess", "--db", str(db_path)],
+    )
+    assert result.exit_code != 0
+    assert "--reprocess" in result.output and "--since" in result.output

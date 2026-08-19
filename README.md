@@ -107,6 +107,8 @@ uv run python -m adsbtrack.cli extract --hex a66ad3 --reprocess
 
 Rebuilds the flight table from raw trace data after code changes.
 
+`--since 2026-04-08` rebuilds only the trace days that new data on that date can affect and leaves the earlier flights alone - what `fetch` does automatically for the days it just downloaded. See [Incremental extraction](docs/internals.md#incremental-extraction) for how far back "can affect" reaches and when it falls back to a full rebuild.
+
 ## FAA aircraft registry
 
 Load the FAA bulk registry (`ReleasableAircraft.zip`) so hex codes resolve to registrant name, address, certificate dates, and deregistration history. Install with the `faa` extra so the download can bypass the Akamai TLS-fingerprint block:
@@ -291,4 +293,4 @@ CI runs on push and pull requests (Python 3.12 and 3.13).
 - Data availability depends on ADS-B receiver coverage. Flights over oceans or remote areas will have gaps - those show up as `signal_lost` or `dropped_on_approach` rather than as missing flights.
 - Different receiver networks have different coverage, so fetching from multiple sources gives the best results.
 - Rate limiting is adaptive: 429s increase the delay, consecutive successes recover it.
-- `extract --reprocess` clears and rebuilds all flights from raw traces. Schema migrates automatically.
+- `extract --reprocess` clears and rebuilds all flights from raw traces. Schema migrates automatically. `fetch` no longer does that on every run: it re-extracts from the earliest day it actually downloaded, and prints why when it has to fall back to a full rebuild.

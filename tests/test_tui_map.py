@@ -218,6 +218,103 @@ def test_airport_or_coords_does_not_swallow_other_exceptions(tmp_path, monkeypat
 
 
 # ---------------------------------------------------------------------------
+# Route crumb (ports PR #16): "KSPG > KHKY" for the displayed date's
+# first flight, reusing the flights view's issue #18 ~ICAO fallback so
+# a near-match-only endpoint renders consistently in both places.
+# ---------------------------------------------------------------------------
+
+
+def _insert_flight(db: Database, **overrides) -> None:
+    fields = dict(
+        icao="aaa111",
+        takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+        takeoff_lat=40.0,
+        takeoff_lon=-74.0,
+        takeoff_date="2026-03-01",
+    )
+    fields.update(overrides)
+    db.insert_flight(Flight(**fields))
+
+
+def test_route_for_returns_first_flight_route_for_date(tmp_path):
+    from adsbtrack.tui.views.map import _route_for
+
+    with Database(tmp_path / "route.db") as db:
+        _insert_flight(db, origin_icao="KSPG", destination_icao="KHKY")
+        route = _route_for(db, "aaa111", "2026-03-01")
+    assert route == "KSPG > KHKY"
+
+
+def test_route_for_picks_earliest_flight_when_multiple_that_date(tmp_path):
+    from adsbtrack.tui.views.map import _route_for
+
+    with Database(tmp_path / "route_multi.db") as db:
+        _insert_flight(
+            db,
+            takeoff_time=datetime(2026, 3, 1, 18, 0, tzinfo=UTC),
+            origin_icao="KHKY",
+            destination_icao="KJFK",
+        )
+        _insert_flight(
+            db,
+            takeoff_time=datetime(2026, 3, 1, 6, 0, tzinfo=UTC),
+            origin_icao="KSPG",
+            destination_icao="KHKY",
+        )
+        route = _route_for(db, "aaa111", "2026-03-01")
+    assert route == "KSPG > KHKY", "must be the earliest takeoff_time on the date, not insertion order"
+
+
+def test_route_for_none_when_no_flight_that_date(tmp_path):
+    from adsbtrack.tui.views.map import _route_for
+
+    with Database(tmp_path / "route_none.db") as db:
+        _insert_flight(db, origin_icao="KSPG", destination_icao="KHKY", takeoff_date="2026-03-02")
+        route = _route_for(db, "aaa111", "2026-03-01")
+    assert route is None
+
+
+def test_route_for_uses_near_match_tilde_fallback_for_origin(tmp_path):
+    """Issue #18: origin_icao missed the on-field match threshold but a
+    nearest_origin_icao was found -- the route crumb must show the same
+    ~ICAO marker the flights table shows for this exact flight."""
+    from adsbtrack.tui.views.map import _route_for
+
+    with Database(tmp_path / "route_tilde_origin.db") as db:
+        _insert_flight(db, origin_icao=None, nearest_origin_icao="KTNX", destination_icao="KHKY")
+        route = _route_for(db, "aaa111", "2026-03-01")
+    assert route == "~KTNX > KHKY"
+
+
+def test_route_for_uses_near_match_tilde_fallback_for_signal_lost_destination(tmp_path):
+    from adsbtrack.tui.views.map import _route_for
+
+    with Database(tmp_path / "route_tilde_dest.db") as db:
+        _insert_flight(
+            db,
+            origin_icao="KSPG",
+            destination_icao=None,
+            probable_destination_icao="KTNX",
+            landing_type="signal_lost",
+        )
+        route = _route_for(db, "aaa111", "2026-03-01")
+    assert route == "KSPG > ~KTNX"
+
+
+def test_route_for_none_when_destination_unresolvable(tmp_path):
+    """No real destination, no probable fallback, and a landing_type that
+    isn't signal_lost/dropped_on_approach: _display_destination returns
+    None, so the whole route is dropped rather than showing a bare
+    origin with nothing after it."""
+    from adsbtrack.tui.views.map import _route_for
+
+    with Database(tmp_path / "route_unresolvable.db") as db:
+        _insert_flight(db, origin_icao="KSPG", destination_icao=None, landing_type="uncertain")
+        route = _route_for(db, "aaa111", "2026-03-01")
+    assert route is None
+
+
+# ---------------------------------------------------------------------------
 # F6: gap threshold lives in Config
 # ---------------------------------------------------------------------------
 
@@ -428,6 +525,35 @@ def test_map_view_renders_after_f7_refactor(tmp_path):
             # LAYERS/TRACE panel text should show up somewhere once the
             # pane is wide enough (Pilot's default test size is 80x24).
             assert "LAYERS" in plain or "TRACE" in plain
+
+    asyncio.run(scenario())
+
+
+def test_map_view_header_crumb_shows_route_for_seeded_flight(tmp_path):
+    """_seed_map_aircraft's flight has origin_icao=KEWR, destination_icao=KBOS
+    on 2026-03-01; the header crumb for that date must surface that route
+    instead of (or alongside) the nearest-airport-to-trace-endpoint labels."""
+    db_path = tmp_path / "map_route.db"
+    _seed_map_aircraft(db_path)
+
+    async def scenario() -> None:
+        from adsbtrack.tui.views.aircraft import AircraftOpenFlights
+        from adsbtrack.tui.views.map import MapView
+
+        app = AdsbtrackApp(db_path)
+        async with app.run_test() as pilot:
+            await _settle(app, pilot)
+            aircraft_view = app.query_one("#view-aircraft")
+            aircraft_view.post_message(AircraftOpenFlights("aaa111"))
+            await pilot.pause()
+            await _settle(app, pilot)
+
+            await pilot.press("5")
+            await _settle(app, pilot)
+
+            map_view = app.query_one(MapView)
+            crumb_text = map_view._header._build().plain
+            assert "KEWR > KBOS" in crumb_text
 
     asyncio.run(scenario())
 

@@ -83,6 +83,35 @@ def _default_fetch_start() -> date:
     return date(date.today().year - 1, 1, 1)
 
 
+def _resume_start_for_all_sources(db: Database, hex_code: str) -> tuple[str | None, str | None]:
+    """Resume date for `fetch --source all`, reduced across every readsb
+    source instead of looked up under the literal (and never-matching)
+    source name "all".
+
+    Returns ``(earliest_last_fetched_date, driving_source)``: the MIN of
+    each source's own last-fetched day (success-filtered, same as the
+    single-source path), and the name of the source that produced it. A
+    source with no success-filtered history is excluded, not treated as
+    "already caught up" -- that would let it get skipped forever. Resuming
+    every source from `MIN(last_day) + 1` (the +1 is applied uniformly by
+    the caller) makes every source catch up; sources that are already
+    further ahead just skip their already-fetched days cheaply via the
+    per-day check inside fetch_traces. Returns (None, None) when no readsb
+    source has any history yet.
+    """
+    earliest_date: str | None = None
+    earliest_source: str | None = None
+    for src in SOURCE_URLS:
+        fetched_dates = db.get_fetched_dates(hex_code, source=src)
+        if not fetched_dates:
+            continue
+        last_day = max(fetched_dates)
+        if earliest_date is None or last_day < earliest_date:
+            earliest_date = last_day
+            earliest_source = src
+    return earliest_date, earliest_source
+
+
 _HEX_RE = re.compile(r"[0-9a-f]{6}")
 
 TAIL_HELP = (
@@ -239,14 +268,26 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
         # --url resolves its own source name (from the URL's netloc) further
         # below; resuming here against --source's fetch history would look up
         # the wrong source, so resume/--since-last only applies to a plain
-        # --source fetch.
+        # --source fetch. source == "all" fans out across every readsb
+        # source below, so its resume date is reduced across all of them
+        # too (db.get_fetched_dates(hex, source="all") would never match
+        # any fetch_log row -- "all" isn't a source name that gets written).
         last_fetched = None
+        resume_driver = None
         if not custom_url:
-            fetched_dates = db.get_fetched_dates(hex_code, source=source)
-            last_fetched = max(fetched_dates) if fetched_dates else None
+            if source == "all":
+                last_fetched, resume_driver = _resume_start_for_all_sources(db, hex_code)
+            else:
+                fetched_dates = db.get_fetched_dates(hex_code, source=source)
+                last_fetched = max(fetched_dates) if fetched_dates else None
 
         if since_last:
             if last_fetched is None:
+                if source == "all":
+                    raise click.UsageError(
+                        f"--since-last requested but no prior fetches found for {hex_code} via any of the "
+                        f"readsb sources under --source all ({', '.join(sorted(SOURCE_URLS))})."
+                    )
                 raise click.UsageError(
                     f"--since-last requested but no prior fetches found for {hex_code} via source {source!r}."
                 )
@@ -255,7 +296,12 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
             start = date.fromisoformat(start_date)
         elif last_fetched is not None:
             start = date.fromisoformat(last_fetched) + timedelta(days=1)
-            console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
+            if resume_driver:
+                console.print(
+                    f"[dim]Resuming from {start} ({resume_driver} is furthest behind; pass --start to override)[/]"
+                )
+            else:
+                console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
         else:
             start = _default_fetch_start()
 

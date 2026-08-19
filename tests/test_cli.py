@@ -1635,6 +1635,103 @@ def test_fetch_cli_since_last_errors_without_history(tmp_path):
     assert "no prior fetches found" in result.output.lower()
 
 
+def test_fetch_cli_source_all_resumes_from_source_furthest_behind(tmp_path, monkeypatch):
+    """`fetch --source all` (no --start/--since-last) resumes from the day
+    after the earliest last-fetched day across every readsb source, so a
+    source that's behind isn't stranded at its old resume point just
+    because another source is further along. A source with only
+    retry-exhausted (403) fetch_log rows counts as having no history, and a
+    source with zero fetch_log rows doesn't error the whole command."""
+    from adsbtrack import cli as cli_module
+
+    calls: list[tuple[str, date, date]] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx", progress=None):
+        calls.append((source, start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        # adsbx is furthest along.
+        for d in ("2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05"):
+            db.insert_fetch_log("dd44ee", d, 200, source="adsbx")
+        # adsbfi is furthest behind -- this is the source that should drive
+        # the resume date.
+        db.insert_fetch_log("dd44ee", "2026-05-01", 200, source="adsbfi")
+        # airplaneslive has only retry-exhausted rows, which don't count as
+        # history at all (same success-filtering as the single-source path).
+        db.insert_fetch_log("dd44ee", "2026-05-01", 403, source="airplaneslive")
+        # adsblol / theairtraffic: no fetch_log rows at all.
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "dd44ee", "--source", "all", "--end", "2026-05-10", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 5
+    assert {c[1] for c in calls} == {date(2026, 5, 2)}
+    assert {c[2] for c in calls} == {date(2026, 5, 10)}
+    assert "Resuming from 2026-05-02 (adsbfi is furthest behind; pass --start to override)" in result.output
+
+
+def test_fetch_cli_source_all_since_last_errors_without_any_history(tmp_path):
+    """--source all --since-last with no fetch_log rows for ANY readsb source
+    errors instead of silently picking a default start, and names the
+    per-source situation rather than the literal source 'all'."""
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli, ["fetch", "--hex", "ee55ff", "--source", "all", "--since-last", "--db", str(db_path)]
+    )
+    assert result.exit_code != 0
+    assert "no prior fetches" in result.output.lower()
+    assert "adsbx" in result.output  # names the per-source situation, not just "all"
+
+
+def test_fetch_cli_source_all_single_source_history_unaffected(tmp_path, monkeypatch):
+    """Regression: plain --source (not 'all') resume behavior is untouched by
+    the multi-source resume logic -- it still resumes off that one source's
+    own fetch_log history."""
+    from adsbtrack import cli as cli_module
+
+    calls: list[tuple] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        calls.append((start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("ff66aa", "2026-05-01", 200, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli, ["fetch", "--hex", "ff66aa", "--source", "adsbx", "--end", "2026-05-10", "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [(date(2026, 5, 2), date(2026, 5, 10))]
+    assert "Resuming from 2026-05-02 (last fetched day; pass --start to override)" in result.output
+
+
 def test_fetch_cli_default_start_is_jan_1_of_last_year(tmp_path, monkeypatch):
     """No prior fetch_log rows and no --start: default start is January 1 of
     the previous calendar year, computed at runtime rather than a frozen date."""

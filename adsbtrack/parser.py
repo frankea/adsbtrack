@@ -5,6 +5,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
 from . import features
@@ -1017,6 +1018,429 @@ def _run_state_machine(
     return list(zip(valid_flights, valid_metrics, strict=True))
 
 
+@dataclass
+class _EnrichContext:
+    """Handles and caches shared by every per-flight enrichment stage.
+
+    The caches live for one extract run. An aircraft typically has 2-5 home
+    airports that get hit over and over, so without them a fleet-sized
+    extract would issue 2N elevation/runway queries against the same ICAOs,
+    and near-duplicate routes would re-query the same navaid boxes.
+    """
+
+    db: Database
+    config: Config
+    hex_code: str
+    type_code: str | None
+    owner_operator: str | None
+    spoof_scores_by_date: dict[str, dict]
+    airport_elev_cache: dict[str, int | None] = field(default_factory=dict)
+    runway_cache: dict[str, list] = field(default_factory=dict)
+    navaid_cache: dict[tuple[int, int, int, int], list] = field(default_factory=dict)
+
+    def airport_elevation(self, icao: str) -> int | None:
+        """Field elevation in feet, or None when the airport is not in our DB.
+        A None answer is cached too, so a miss costs one query per run."""
+        if icao not in self.airport_elev_cache:
+            self.airport_elev_cache[icao] = self.db.get_airport_elevation(icao)
+        return self.airport_elev_cache[icao]
+
+    def runways(self, icao: str) -> list:
+        """Runway-end rows for an airport; empty when we have no geometry."""
+        if icao not in self.runway_cache:
+            self.runway_cache[icao] = self.db.get_runways_for_airport(icao)
+        return self.runway_cache[icao]
+
+
+def _flight_is_noise(flight: Flight, metrics: FlightMetrics, config: Config) -> bool:
+    """True for fragments that should be dropped instead of persisted.
+
+    Reads landing_type, so it can only run after classify_landing.
+    """
+    # Drop signal_lost, uncertain, and dropped_on_approach slivers that are
+    # BOTH short AND sparse. Confirmed landings (legitimate quick helicopter
+    # hops) are kept regardless of size.
+    if flight.landing_type in (
+        LandingType.SIGNAL_LOST,
+        LandingType.UNCERTAIN,
+        LandingType.DROPPED_ON_APPROACH,
+    ) and (
+        flight.duration_minutes is not None
+        and flight.duration_minutes < config.min_viable_flight_minutes
+        and metrics.data_points < config.min_viable_flight_points
+    ):
+        return True
+
+    # Stationary broadcaster (transponder left on at the ramp).
+    return (
+        metrics.path_length_km < config.stationary_path_km
+        and metrics.max_distance_from_origin_km < config.stationary_path_km
+        and metrics.max_altitude < config.stationary_max_alt_ft
+        and metrics.max_gs_kt < config.stationary_max_gs_kt
+    )
+
+
+def _match_airports(
+    flight: Flight,
+    metrics: FlightMetrics,
+    ctx: _EnrichContext,
+    *,
+    anchor,
+    has_landing: bool,
+) -> None:
+    """D1: match both ends of the flight to airports and identify the
+    departure runway. Each end splits on-field (within
+    airport_on_field_threshold_km, written to origin/destination_icao) from
+    merely nearest (written to the nearest_* columns).
+
+    The destination match is skipped for signal_lost / dropped_on_approach
+    flights; those get a probable destination inferred later instead.
+    """
+    config = ctx.config
+    db = ctx.db
+
+    origin = find_nearest_airport(db, flight.takeoff_lat, flight.takeoff_lon, config)
+    if origin:
+        if origin.distance_km <= config.airport_on_field_threshold_km:
+            flight.origin_icao = origin.ident
+            flight.origin_name = origin.name
+            flight.origin_distance_km = origin.distance_km
+        else:
+            flight.nearest_origin_icao = origin.ident
+            flight.nearest_origin_distance_km = origin.distance_km
+
+    # --- Takeoff runway identification (adsbtrack/takeoff_runway.py) ---
+    # Scales the GS floor down to takeoff_runway_min_gs_kt_low (60 kt) when
+    # the effective type is a rotorcraft (H-prefix or in
+    # config.helicopter_types) or a light piston single listed in
+    # config.takeoff_low_gs_types.
+    takeoff_origin_icao = flight.origin_icao or flight.nearest_origin_icao
+    if takeoff_origin_icao:
+        origin_elev = ctx.airport_elevation(takeoff_origin_icao)
+        origin_runways = ctx.runways(takeoff_origin_icao)
+        if origin_runways:
+            effective_type = ctx.type_code or ""
+            is_low_gs = (
+                effective_type.startswith("H")
+                or effective_type in config.takeoff_low_gs_types
+                or effective_type in config.helicopter_types
+            )
+            min_gs = config.takeoff_runway_min_gs_kt_low if is_low_gs else config.takeoff_runway_min_gs_kt_default
+            to_result: TakeoffRunwayResult | None = detect_takeoff_runway(
+                metrics,
+                # Fallback 0.0 is safe because the `if origin_runways:`
+                # guard above only fires when the airport is in our DB
+                # (runways and elevations come from the same OurAirports
+                # load, so both are present or both are absent).
+                airport_elev_ft=float(origin_elev) if origin_elev is not None else 0.0,
+                runway_ends=[dict(r) for r in origin_runways],
+                config=config,
+                min_gs_kt=min_gs,
+            )
+            if to_result is not None:
+                flight.takeoff_runway = to_result.runway_name
+
+    if has_landing and flight.landing_type not in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
+        # Use anchor (alt-min in final window) when available; fall back
+        # to landing_lat/lon only if compute_landing_anchor returned None
+        # (shouldn't happen on a has_landing flight but guards against
+        # empty recent_points).
+        dest_lat = anchor.lat if anchor is not None else flight.landing_lat
+        dest_lon = anchor.lon if anchor is not None else flight.landing_lon
+        dest = find_nearest_airport(db, dest_lat, dest_lon, config)
+        if dest:
+            if dest.distance_km <= config.airport_on_field_threshold_km:
+                flight.destination_icao = dest.ident
+                flight.destination_name = dest.name
+                flight.destination_distance_km = dest.distance_km
+            else:
+                flight.nearest_destination_icao = dest.ident
+                flight.nearest_destination_distance_km = dest.distance_km
+
+
+def _copy_metrics_to_flight(flight: Flight, metrics: FlightMetrics) -> None:
+    """Copy the accumulator's counters onto the Flight row."""
+    flight.data_points = metrics.data_points
+    flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
+    # Store raw persistence-filtered altitude; the ceiling cap is applied
+    # later, once derive_all has set type_override.
+    flight.max_altitude = metrics.max_altitude if metrics.max_altitude > 0 else None
+    flight.ground_points_at_landing = metrics.ground_points_at_landing
+    flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
+    flight.baro_error_points = metrics.baro_error_points
+
+    # Position source mix. When data_points is zero or the trace carried
+    # no source tags, leave every bucket at 0.0 so downstream queries
+    # can rely on non-null values. other_pct covers unknown/Mode-S-only
+    # rebroadcasts; adsc_pct breaks out CPDLC/ADS-C oceanic reports.
+    total = metrics.data_points
+    if total > 0:
+        flight.mlat_pct = round(metrics.mlat_points * 100.0 / total, 2)
+        flight.tisb_pct = round(metrics.tisb_points * 100.0 / total, 2)
+        flight.adsb_pct = round(metrics.adsb_points * 100.0 / total, 2)
+        flight.other_pct = round(metrics.other_points * 100.0 / total, 2)
+        flight.adsc_pct = round(metrics.adsc_points * 100.0 / total, 2)
+    else:
+        flight.mlat_pct = 0.0
+        flight.tisb_pct = 0.0
+        flight.adsb_pct = 0.0
+        flight.other_pct = 0.0
+        flight.adsc_pct = 0.0
+
+
+def _apply_type_caps(flight: Flight, ctx: _EnrichContext) -> None:
+    """Clamp altitude and ground speed to the effective type's envelope.
+
+    Must run after features.derive_all: type_override is what derive_all
+    sets, and it wins over the registry type_code here. Applying the
+    ceiling earlier (off a preliminary ae69xx altitude check) missed
+    flights that only derive_all classifies via cruise_gs.
+    """
+    effective_type = flight.type_override or ctx.type_code
+    if flight.max_altitude is not None:
+        ceiling = TYPE_CEILINGS.get(effective_type or "", 60_000)
+        # only give 10% tolerance when the flight has
+        # coherent AP data. Without AP, or when the AP target
+        # wildly disagrees with max_altitude (>5,000 ft delta --
+        # e.g. S92 a7a622 AP=3,008 vs alt=16,500), cap at exactly
+        # the book ceiling so corrupt spikes don't exceed physical
+        # limits.
+        ap = flight.autopilot_target_alt_ft
+        ap_coherent = ap is not None and abs(flight.max_altitude - ap) <= 5000
+        alt_cap = int(ceiling * 1.1) if ap_coherent else ceiling
+        if flight.max_altitude > alt_cap:
+            flight.max_altitude = alt_cap
+        # Also re-cap cruise_alt_ft after ceiling adjustment
+        if flight.cruise_alt_ft is not None and flight.cruise_alt_ft > flight.max_altitude:
+            flight.cruise_alt_ft = flight.max_altitude
+
+    if flight.max_gs_kt is not None:
+        gs_ceiling = TYPE_MAX_GS.get(effective_type or "", 800)
+        gs_cap = int(gs_ceiling * 1.1)
+        if flight.max_gs_kt > gs_cap:
+            flight.max_gs_kt = gs_cap
+        # Both cruise_gs and max_gs must share the same cap so
+        # cruise <= max always holds. The v15 removal of this line
+        # caused 3,134 flights to violate the invariant.
+        if flight.cruise_gs_kt is not None and flight.cruise_gs_kt > gs_cap:
+            flight.cruise_gs_kt = gs_cap
+
+
+def _infer_probable_destination(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext, *, anchor) -> None:
+    """v3 destination inference for dropped / signal_lost flights.
+
+    Queries candidates around the alt-min anchor (falling back to
+    last_seen), i.e. "where the aircraft was trying to land" rather than
+    where it was last observed, which may be at altitude.
+    """
+    if flight.landing_type not in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
+        return
+    ref_lat = anchor.lat if anchor is not None else flight.last_seen_lat
+    ref_lon = anchor.lon if anchor is not None else flight.last_seen_lon
+    if ref_lat is None or ref_lon is None:
+        return
+    try:
+        candidates = ctx.db.find_nearby_airports(
+            ref_lat,
+            ref_lon,
+            delta=ctx.config.prob_dest_search_delta,
+            types=ctx.config.airport_types,
+        )
+    except Exception:
+        candidates = []
+    infer = features.infer_destination(
+        flight=flight,
+        metrics=metrics,
+        candidates=list(candidates),
+        config=ctx.config,
+        anchor_lat=ref_lat,
+        anchor_lon=ref_lon,
+    )
+    flight.probable_destination_icao = infer["probable_destination_icao"]
+    flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
+    flight.probable_destination_confidence = infer["probable_destination_confidence"]
+
+
+def _apply_runway_alignment(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext) -> None:
+    """ILS alignment plus the pattern_cycles / go-around signals derived
+    from the same segment scan.
+
+    Runs after destination inference: the candidate airport is resolved in
+    priority order on-field match -> nearest hit -> probable destination,
+    and that last one only exists once _infer_probable_destination has run.
+    """
+    config = ctx.config
+    alignment_icao = flight.destination_icao or flight.nearest_destination_icao or flight.probable_destination_icao
+    alignment: IlsAlignmentResult | None = None
+    # Fallback 0.0 is safe because the `if runway_rows:` guard below only
+    # fires when the airport is in our DB (runways and elevations come from
+    # the same OurAirports load).
+    airport_elev_ft = 0.0
+    all_segments: list[IlsAlignmentResult] = []
+    if alignment_icao:
+        elev = ctx.airport_elevation(alignment_icao)
+        if elev is not None:
+            airport_elev_ft = float(elev)
+        runway_rows = ctx.runways(alignment_icao)
+        if runway_rows:
+            # Single pass: all-segments feeds both the longest-wins
+            # ILS signal and the pattern_cycles/go-around block below.
+            all_segments = detect_all_ils_alignments(
+                metrics.all_points,
+                airport_elev_ft=airport_elev_ft,
+                runway_ends=[dict(r) for r in runway_rows],
+                max_offset_m=config.ils_alignment_max_offset_m,
+                max_ft_above_airport=config.ils_alignment_max_ft_above_airport,
+                split_gap_secs=config.ils_alignment_split_gap_secs,
+                min_duration_secs=config.ils_alignment_min_duration_secs,
+            )
+            if all_segments:
+                # Longest wins; tie-break on earliest first_ts for determinism.
+                alignment = max(all_segments, key=lambda s: (s.duration_secs, -s.first_ts))
+
+    if alignment is not None:
+        flight.aligned_runway = alignment.runway_name
+        flight.aligned_seconds = alignment.duration_secs
+        flight.aligned_min_offset_m = alignment.min_offset_m
+
+        # Additive confidence bonus (clamped to 1.0). Applied only when
+        # `landing_confidence` was already set to a non-None value; don't
+        # revive a NULL landing_confidence on types that deliberately
+        # have none.
+        if flight.landing_confidence is not None:
+            if alignment.duration_secs >= config.ils_alignment_bonus_long_secs:
+                bonus = config.ils_alignment_bonus_long
+            elif alignment.duration_secs >= config.ils_alignment_bonus_short_secs:
+                bonus = config.ils_alignment_bonus_short
+            else:
+                bonus = 0.0
+            if bonus > 0.0:
+                flight.landing_confidence = round(min(1.0, flight.landing_confidence + bonus), 2)
+
+        # Classification upgrade: a signal_lost flight with a 60s+
+        # alignment segment at low altitude is indistinguishable from
+        # dropped_on_approach. Promote so downstream sees the stronger
+        # type. Altitude gate uses last_airborne_alt vs airport_elev +
+        # max_ft_above_airport to match the detector's AGL cap.
+        if (
+            flight.landing_type == LandingType.SIGNAL_LOST
+            and alignment.duration_secs >= config.ils_alignment_bonus_long_secs
+            and metrics.last_airborne_alt is not None
+            and metrics.last_airborne_alt < airport_elev_ft + config.ils_alignment_max_ft_above_airport
+        ):
+            flight.landing_type = LandingType.DROPPED_ON_APPROACH
+
+    # --- Go-around + pattern_cycles (adsbtrack/ils_alignment.py) ---
+    # An empty all_segments means no candidate airport, no runway data, or
+    # no qualifying alignment.
+    flight.pattern_cycles = len(all_segments)
+    flight.had_go_around = 1 if _any_climb_between(all_segments, metrics.all_points, threshold_ft=500.0) else 0
+
+
+def _apply_pattern_mission_override(flight: Flight) -> None:
+    """Upgrade same-airport flights with 2+ aligned segments to mission_type
+    "pattern". Only applies when the classifier already produced a generic
+    bucket (unknown / transport) or the existing pattern rule already fired
+    - more specific buckets (training, ems_hems, survey, offshore,
+    exec_charter) are preserved."""
+    if (
+        flight.origin_icao is not None
+        and flight.destination_icao is not None
+        and flight.origin_icao == flight.destination_icao
+        and flight.pattern_cycles is not None
+        and flight.pattern_cycles >= 2
+        and flight.mission_type in ("unknown", "transport", "pattern")
+    ):
+        flight.mission_type = "pattern"
+
+
+def _enrich_flight(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext) -> bool:
+    """Derive every column of one flight, and report whether it survives.
+
+    Returns False when the flight is dropped as noise; the caller must then
+    neither persist it nor let it advance the turnaround chain.
+
+    The call order below is the whole ordering contract, which used to live
+    in comments scattered through a 340-line loop body: classify_landing
+    feeds the noise guards and the airport match; airport matching feeds
+    the confidence scores and derive_all; derive_all sets type_override,
+    which the caps need; destination inference supplies the last-resort
+    airport the alignment scan falls back to; and the pattern override
+    reads the pattern_cycles that scan produces.
+    """
+    config = ctx.config
+    has_landing = flight.landing_lat is not None
+
+    flight.takeoff_type = metrics.takeoff_type
+    flight.landing_type = classify_landing(
+        metrics,
+        has_landing,
+        config=config,
+        duration_minutes=flight.duration_minutes,
+        type_code=ctx.type_code,
+    )
+
+    # Landing airport-matching anchor. Altitude-minimum point within the
+    # final N minutes is a stronger estimator than the last observed
+    # point for flights that drifted laterally or lost signal at
+    # altitude. Falls back to last_point when tail altitudes are missing.
+    anchor = compute_landing_anchor(metrics, window_minutes=config.landing_anchor_window_minutes)
+    flight.landing_anchor_method = anchor.method if anchor is not None else None
+
+    if _flight_is_noise(flight, metrics, config):
+        return False
+
+    _match_airports(flight, metrics, ctx, anchor=anchor, has_landing=has_landing)
+
+    # Single source of truth for duration_minutes. Compute from wall-clock
+    # (landing_time or last_seen_time) - takeoff_time, not from the metric
+    # span (last_point_ts - first_point_ts): the metric span misses
+    # signal-gap time on stitched flights. Must precede score_confidence
+    # and derive_all, which both read duration_minutes.
+    end_time = flight.landing_time or flight.last_seen_time
+    if end_time is not None:
+        wall_secs = (end_time - flight.takeoff_time).total_seconds()
+        if wall_secs > 0:
+            flight.duration_minutes = round(wall_secs / 60.0, 1)
+
+    takeoff_conf, landing_conf = score_confidence(
+        metrics,
+        has_landing,
+        flight.landing_type,
+        origin_distance_km=flight.origin_distance_km,
+        dest_distance_km=flight.destination_distance_km,
+        duration_minutes=flight.duration_minutes,
+    )
+    flight.takeoff_confidence = takeoff_conf
+    flight.landing_confidence = landing_conf
+
+    _copy_metrics_to_flight(flight, metrics)
+
+    features.derive_all(
+        flight,
+        metrics,
+        config=config,
+        type_code=ctx.type_code,
+        owner_operator=ctx.owner_operator,
+    )
+    _apply_type_caps(flight, ctx)
+
+    _infer_probable_destination(flight, metrics, ctx, anchor=anchor)
+    _apply_runway_alignment(flight, metrics, ctx)
+    _apply_pattern_mission_override(flight)
+
+    flight.navaid_track = _compute_navaid_track_json(
+        metrics,
+        db=ctx.db,
+        config=config,
+        navaid_cache=ctx.navaid_cache,
+    )
+    # Drop all_points after the navaid pass so per-flight buffers don't
+    # stay pinned until extract returns on multi-hundred-flight hexes.
+    metrics.all_points.clear()
+    return True
+
+
 def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
     if reprocess:
         db.clear_flights(hex_code)
@@ -1038,360 +1462,21 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
         type_code=type_code,
     )
 
-    # Classify, score confidence, match airports, and save.
-    # Order of operations (v5 plan):
-    #   classify_landing -> B7/B8 filter -> airport (D1) -> B1 duration
-    #   recompute -> derive_all (uses signal budget for B2) -> insert (B3 guard)
+    ctx = _EnrichContext(
+        db=db,
+        config=config,
+        hex_code=hex_code,
+        type_code=type_code,
+        owner_operator=owner_operator,
+        spoof_scores_by_date=spoof_scores_by_date,
+    )
+
     final_flights: list[Flight] = []
     # track previous flight's end time for turnaround computation.
     prev_end_time: datetime | None = None
-    # Cache airport elevation + runway lookups by ICAO for this extract run.
-    # Every aircraft typically has 2-5 home airports that get hit repeatedly,
-    # so batch extracts on fleets of thousands of flights would otherwise
-    # issue 2N DB queries against the same ICAOs.
-    airport_elev_cache: dict[str, int | None] = {}
-    runway_cache: dict[str, list] = {}
-    navaid_cache: dict[tuple[int, int, int, int], list] = {}
     for flight, metrics in pairs:
-        has_landing = flight.landing_lat is not None
-
-        flight.takeoff_type = metrics.takeoff_type
-
-        flight.landing_type = classify_landing(
-            metrics,
-            has_landing,
-            config=config,
-            duration_minutes=flight.duration_minutes,
-            type_code=type_code,
-        )
-
-        # Landing airport-matching anchor. Altitude-minimum point within the
-        # final N minutes is a stronger estimator than the last observed
-        # point for flights that drifted laterally or lost signal at
-        # altitude. Falls back to last_point when tail altitudes are missing.
-        anchor = compute_landing_anchor(
-            metrics,
-            window_minutes=config.landing_anchor_window_minutes,
-        )
-        flight.landing_anchor_method = anchor.method if anchor is not None else None
-
-        # tighten tiny-flight guard. Drop signal_lost, uncertain, and
-        # dropped_on_approach slivers that are BOTH short AND sparse. Keep
-        # confirmed landings (legitimate quick helicopter hops) regardless
-        # of size. Threshold raised to 3 min and dropped_on_approach added
-        # since a sub-3-min dropped fragment is noise, not a real approach.
-        if flight.landing_type in (
-            LandingType.SIGNAL_LOST,
-            LandingType.UNCERTAIN,
-            LandingType.DROPPED_ON_APPROACH,
-        ) and (
-            flight.duration_minutes is not None
-            and flight.duration_minutes < config.min_viable_flight_minutes
-            and metrics.data_points < config.min_viable_flight_points
-        ):
+        if not _enrich_flight(flight, metrics, ctx):
             continue
-
-        # drop stationary broadcasters (transponder on the ramp).
-        if (
-            metrics.path_length_km < config.stationary_path_km
-            and metrics.max_distance_from_origin_km < config.stationary_path_km
-            and metrics.max_altitude < config.stationary_max_alt_ft
-            and metrics.max_gs_kt < config.stationary_max_gs_kt
-        ):
-            continue
-
-        # D1: match airports with on-field vs nearest split.
-        origin = find_nearest_airport(db, flight.takeoff_lat, flight.takeoff_lon, config)
-        if origin:
-            if origin.distance_km <= config.airport_on_field_threshold_km:
-                flight.origin_icao = origin.ident
-                flight.origin_name = origin.name
-                flight.origin_distance_km = origin.distance_km
-            else:
-                flight.nearest_origin_icao = origin.ident
-                flight.nearest_origin_distance_km = origin.distance_km
-
-        # --- Takeoff runway identification (adsbtrack/takeoff_runway.py) ---
-        # Reuses the per-extract-run runway_cache / airport_elev_cache added
-        # for the ILS alignment milestone. Scales the GS floor down to
-        # takeoff_runway_min_gs_kt_low (60 kt) when the effective type is a
-        # rotorcraft (H-prefix or in config.helicopter_types) or a light
-        # piston single listed in config.takeoff_low_gs_types.
-        takeoff_origin_icao = flight.origin_icao or flight.nearest_origin_icao
-        if takeoff_origin_icao:
-            if takeoff_origin_icao not in airport_elev_cache:
-                airport_elev_cache[takeoff_origin_icao] = db.get_airport_elevation(takeoff_origin_icao)
-            origin_elev = airport_elev_cache[takeoff_origin_icao]
-            if takeoff_origin_icao not in runway_cache:
-                runway_cache[takeoff_origin_icao] = db.get_runways_for_airport(takeoff_origin_icao)
-            origin_runways = runway_cache[takeoff_origin_icao]
-            if origin_runways:
-                effective_type = type_code or ""
-                is_low_gs = (
-                    effective_type.startswith("H")
-                    or effective_type in config.takeoff_low_gs_types
-                    or effective_type in config.helicopter_types
-                )
-                min_gs = config.takeoff_runway_min_gs_kt_low if is_low_gs else config.takeoff_runway_min_gs_kt_default
-                to_result: TakeoffRunwayResult | None = detect_takeoff_runway(
-                    metrics,
-                    # Fallback 0.0 is safe because the `if origin_runways:`
-                    # guard above only fires when the airport is in our DB
-                    # (runways and elevations come from the same OurAirports
-                    # load, so both are present or both are absent).
-                    airport_elev_ft=float(origin_elev) if origin_elev is not None else 0.0,
-                    runway_ends=[dict(r) for r in origin_runways],
-                    config=config,
-                    min_gs_kt=min_gs,
-                )
-                if to_result is not None:
-                    flight.takeoff_runway = to_result.runway_name
-
-        if has_landing and flight.landing_type not in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
-            # Use anchor (alt-min in final window) when available; fall back
-            # to landing_lat/lon only if compute_landing_anchor returned None
-            # (shouldn't happen on a has_landing flight but guards against
-            # empty recent_points).
-            dest_lat = anchor.lat if anchor is not None else flight.landing_lat
-            dest_lon = anchor.lon if anchor is not None else flight.landing_lon
-            dest = find_nearest_airport(db, dest_lat, dest_lon, config)
-            if dest:
-                if dest.distance_km <= config.airport_on_field_threshold_km:
-                    flight.destination_icao = dest.ident
-                    flight.destination_name = dest.name
-                    flight.destination_distance_km = dest.distance_km
-                else:
-                    flight.nearest_destination_icao = dest.ident
-                    flight.nearest_destination_distance_km = dest.distance_km
-
-        # single source of truth for duration_minutes. Compute from
-        # wall-clock (landing_time or last_seen_time) - takeoff_time, not
-        # from the metric-span (last_point_ts - first_point_ts). The metric
-        # span misses signal-gap time on stitched flights.
-        end_time = flight.landing_time or flight.last_seen_time
-        if end_time is not None:
-            wall_secs = (end_time - flight.takeoff_time).total_seconds()
-            if wall_secs > 0:
-                flight.duration_minutes = round(wall_secs / 60.0, 1)
-
-        takeoff_conf, landing_conf = score_confidence(
-            metrics,
-            has_landing,
-            flight.landing_type,
-            origin_distance_km=flight.origin_distance_km,
-            dest_distance_km=flight.destination_distance_km,
-            duration_minutes=flight.duration_minutes,
-        )
-        flight.takeoff_confidence = takeoff_conf
-        flight.landing_confidence = landing_conf
-
-        flight.data_points = metrics.data_points
-        flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
-        # Store raw persistence-filtered altitude; ceiling cap is applied
-        # after derive_all so type_override is available for the lookup.
-        flight.max_altitude = metrics.max_altitude if metrics.max_altitude > 0 else None
-        flight.ground_points_at_landing = metrics.ground_points_at_landing
-        flight.ground_points_at_takeoff = metrics.ground_points_at_takeoff
-        flight.baro_error_points = metrics.baro_error_points
-
-        # Position source mix. When data_points is zero or the trace carried
-        # no source tags, leave every bucket at 0.0 so downstream queries
-        # can rely on non-null values. other_pct covers unknown/Mode-S-only
-        # rebroadcasts; adsc_pct breaks out CPDLC/ADS-C oceanic reports.
-        total = metrics.data_points
-        if total > 0:
-            flight.mlat_pct = round(metrics.mlat_points * 100.0 / total, 2)
-            flight.tisb_pct = round(metrics.tisb_points * 100.0 / total, 2)
-            flight.adsb_pct = round(metrics.adsb_points * 100.0 / total, 2)
-            flight.other_pct = round(metrics.other_points * 100.0 / total, 2)
-            flight.adsc_pct = round(metrics.adsc_points * 100.0 / total, 2)
-        else:
-            flight.mlat_pct = 0.0
-            flight.tisb_pct = 0.0
-            flight.adsb_pct = 0.0
-            flight.other_pct = 0.0
-            flight.adsc_pct = 0.0
-
-        # v3 derived features - must run AFTER classify_landing + airport
-        # matching so mission/loiter/cruise/day-night all see final values.
-        features.derive_all(
-            flight,
-            metrics,
-            config=config,
-            type_code=type_code,
-            owner_operator=owner_operator,
-        )
-
-        # ceiling + GS cap using effective type (type_override wins).
-        # Runs after derive_all so MIL_FW override is set. The ceiling
-        # was previously applied before derive_all using only a preliminary
-        # ae69xx altitude check, which missed flights classified by cruise_gs.
-        effective_type = flight.type_override or type_code
-        if flight.max_altitude is not None:
-            ceiling = TYPE_CEILINGS.get(effective_type or "", 60_000)
-            # only give 10% tolerance when the flight has
-            # coherent AP data. Without AP, or when the AP target
-            # wildly disagrees with max_altitude (>5,000 ft delta --
-            # e.g. S92 a7a622 AP=3,008 vs alt=16,500), cap at exactly
-            # the book ceiling so corrupt spikes don't exceed physical
-            # limits.
-            ap = flight.autopilot_target_alt_ft
-            ap_coherent = ap is not None and abs(flight.max_altitude - ap) <= 5000
-            alt_cap = int(ceiling * 1.1) if ap_coherent else ceiling
-            if flight.max_altitude > alt_cap:
-                flight.max_altitude = alt_cap
-            # Also re-cap cruise_alt_ft after ceiling adjustment
-            if flight.cruise_alt_ft is not None and flight.cruise_alt_ft > flight.max_altitude:
-                flight.cruise_alt_ft = flight.max_altitude
-
-        # type-based GS cap for max_gs_kt. Same pattern as altitude
-        # ceiling -- if the persistence-filtered value still exceeds the
-        # type's physical max by >10%, clamp it.
-        if flight.max_gs_kt is not None:
-            gs_ceiling = TYPE_MAX_GS.get(effective_type or "", 800)
-            gs_cap = int(gs_ceiling * 1.1)
-            if flight.max_gs_kt > gs_cap:
-                flight.max_gs_kt = gs_cap
-            # re-add type cap on cruise_gs_kt. Both cruise_gs
-            # and max_gs must share the same caps so cruise <= max
-            # always holds. The v15 removal caused 3,134 flights to
-            # violate this invariant.
-            if flight.cruise_gs_kt is not None and flight.cruise_gs_kt > gs_cap:
-                flight.cruise_gs_kt = gs_cap
-
-        # v3 destination inference for dropped / signal_lost flights.
-        # Uses the alt-min anchor (falling back to last_seen) so candidates
-        # are queried around "where the aircraft was trying to land" rather
-        # than where it was last observed (which may be at altitude).
-        if flight.landing_type in (LandingType.SIGNAL_LOST, LandingType.DROPPED_ON_APPROACH):
-            ref_lat = anchor.lat if anchor is not None else flight.last_seen_lat
-            ref_lon = anchor.lon if anchor is not None else flight.last_seen_lon
-            if ref_lat is not None and ref_lon is not None:
-                try:
-                    candidates = db.find_nearby_airports(
-                        ref_lat,
-                        ref_lon,
-                        delta=config.prob_dest_search_delta,
-                        types=config.airport_types,
-                    )
-                except Exception:
-                    candidates = []
-                infer = features.infer_destination(
-                    flight=flight,
-                    metrics=metrics,
-                    candidates=list(candidates),
-                    config=config,
-                    anchor_lat=ref_lat,
-                    anchor_lon=ref_lon,
-                )
-                flight.probable_destination_icao = infer["probable_destination_icao"]
-                flight.probable_destination_distance_km = infer["probable_destination_distance_km"]
-                flight.probable_destination_confidence = infer["probable_destination_confidence"]
-
-        # --- ILS alignment (geometric landing signal) ---
-        # Resolve the candidate airport in priority order: on-field match
-        # first, else the nearest hit, else the probable destination inferred
-        # for signal_lost / dropped flights.
-        alignment_icao = flight.destination_icao or flight.nearest_destination_icao or flight.probable_destination_icao
-        alignment: IlsAlignmentResult | None = None
-        # Fallback 0.0 is safe because the subsequent `if runway_rows:` guard
-        # only fires when the airport is in our DB (runways and elevations
-        # come from the same OurAirports load).
-        airport_elev_ft = 0.0
-        # Hoisted so the go-around / pattern_cycles block below can reuse it
-        # without another DB round-trip when the alignment ran against the
-        # same airport.
-        runway_rows: list = []
-        all_segments: list[IlsAlignmentResult] = []
-        if alignment_icao:
-            if alignment_icao not in airport_elev_cache:
-                airport_elev_cache[alignment_icao] = db.get_airport_elevation(alignment_icao)
-            elev = airport_elev_cache[alignment_icao]
-            if elev is not None:
-                airport_elev_ft = float(elev)
-            if alignment_icao not in runway_cache:
-                runway_cache[alignment_icao] = db.get_runways_for_airport(alignment_icao)
-            runway_rows = runway_cache[alignment_icao]
-            if runway_rows:
-                # Single pass: all-segments feeds both the longest-wins
-                # ILS signal and the pattern_cycles/go-around block below.
-                all_segments = detect_all_ils_alignments(
-                    metrics.all_points,
-                    airport_elev_ft=airport_elev_ft,
-                    runway_ends=[dict(r) for r in runway_rows],
-                    max_offset_m=config.ils_alignment_max_offset_m,
-                    max_ft_above_airport=config.ils_alignment_max_ft_above_airport,
-                    split_gap_secs=config.ils_alignment_split_gap_secs,
-                    min_duration_secs=config.ils_alignment_min_duration_secs,
-                )
-                if all_segments:
-                    # Longest wins; tie-break on earliest first_ts for determinism.
-                    alignment = max(all_segments, key=lambda s: (s.duration_secs, -s.first_ts))
-
-        if alignment is not None:
-            flight.aligned_runway = alignment.runway_name
-            flight.aligned_seconds = alignment.duration_secs
-            flight.aligned_min_offset_m = alignment.min_offset_m
-
-            # Additive confidence bonus (clamped to 1.0). Applied only when
-            # `landing_confidence` was already set to a non-None value; don't
-            # revive a NULL landing_confidence on types that deliberately
-            # have none.
-            if flight.landing_confidence is not None:
-                if alignment.duration_secs >= config.ils_alignment_bonus_long_secs:
-                    bonus = config.ils_alignment_bonus_long
-                elif alignment.duration_secs >= config.ils_alignment_bonus_short_secs:
-                    bonus = config.ils_alignment_bonus_short
-                else:
-                    bonus = 0.0
-                if bonus > 0.0:
-                    flight.landing_confidence = round(min(1.0, flight.landing_confidence + bonus), 2)
-
-            # Classification upgrade: a signal_lost flight with a 60s+
-            # alignment segment at low altitude is indistinguishable from
-            # dropped_on_approach. Promote so downstream sees the stronger
-            # type. Altitude gate uses last_airborne_alt vs airport_elev +
-            # max_ft_above_airport to match the detector's AGL cap.
-            if (
-                flight.landing_type == LandingType.SIGNAL_LOST
-                and alignment.duration_secs >= config.ils_alignment_bonus_long_secs
-                and metrics.last_airborne_alt is not None
-                and metrics.last_airborne_alt < airport_elev_ft + config.ils_alignment_max_ft_above_airport
-            ):
-                flight.landing_type = LandingType.DROPPED_ON_APPROACH
-
-        # --- Go-around + pattern_cycles (adsbtrack/ils_alignment.py) ---
-        # all_segments was already computed above and feeds both ILS and
-        # pattern/go-around. Empty list means no candidate airport, no
-        # runway data, or no qualifying alignment.
-        flight.pattern_cycles = len(all_segments)
-        flight.had_go_around = 1 if _any_climb_between(all_segments, metrics.all_points, threshold_ft=500.0) else 0
-
-        # --- Pattern mission override ---
-        # Upgrade same-airport flights with 2+ aligned segments to mission_type
-        # "pattern". Only applies when the classifier already produced a
-        # generic bucket (unknown / transport) or the existing pattern rule
-        # already fired - more specific buckets (training, ems_hems, survey,
-        # offshore, exec_charter) are preserved.
-        if (
-            flight.origin_icao is not None
-            and flight.destination_icao is not None
-            and flight.origin_icao == flight.destination_icao
-            and flight.pattern_cycles is not None
-            and flight.pattern_cycles >= 2
-            and flight.mission_type in ("unknown", "transport", "pattern")
-        ):
-            flight.mission_type = "pattern"
-
-        flight.navaid_track = _compute_navaid_track_json(
-            metrics,
-            db=db,
-            config=config,
-            navaid_cache=navaid_cache,
-        )
-        # Drop all_points after the navaid pass so per-flight buffers don't
-        # stay pinned until extract returns on multi-hundred-flight hexes.
-        metrics.all_points.clear()
 
         # Spoof-rejection gate. Runs after all derivations so the gate
         # sees final values for max_altitude / origin_icao / destination_icao

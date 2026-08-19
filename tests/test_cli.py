@@ -3,7 +3,7 @@
 import io
 import re
 import zipfile
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -1339,6 +1339,159 @@ def test_fetch_cli_omits_failed_days_header_when_empty(tmp_path, monkeypatch):
     )
     assert result.exit_code == 0, result.output
     assert "Failed days" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# fetch resume story: --since-last, implicit resume, runtime default start (U5)
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_cli_resumes_from_last_fetch_by_default(tmp_path, monkeypatch):
+    """No --start/--since-last, but fetch_log already has (successful) rows for
+    this hex+source: fetch resumes from the day after the last fetched day and
+    prints a one-line notice explaining why."""
+    from adsbtrack import cli as cli_module
+
+    calls: list[tuple] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        calls.append((start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        for d in ("2026-05-01", "2026-05-02", "2026-05-03"):
+            db.insert_fetch_log("aa11bb", d, 200, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "aa11bb", "--end", "2026-05-10", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [(date(2026, 5, 4), date(2026, 5, 10))]
+    assert "Resuming from 2026-05-04 (last fetched day; pass --start to override)" in result.output
+
+
+def test_fetch_cli_since_last_flag_resumes_explicitly(tmp_path, monkeypatch):
+    """--since-last computes MAX(date) + 1 day from fetch_log for this hex+source,
+    over the success-filtered dates (retry-exhausted days don't count)."""
+    from adsbtrack import cli as cli_module
+
+    calls: list[tuple] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        calls.append((start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("bb22cc", "2026-06-01", 200, source="adsbx")
+        # Retry-exhausted day: must not count toward MAX(date).
+        db.insert_fetch_log("bb22cc", "2026-06-05", 403, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "bb22cc", "--since-last", "--end", "2026-06-10", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [(date(2026, 6, 2), date(2026, 6, 10))]
+
+
+def test_fetch_cli_since_last_errors_without_history(tmp_path):
+    """--since-last with no prior (success) fetch_log rows for this hex+source
+    exits nonzero with a clear message instead of silently picking a default."""
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(cli, ["fetch", "--hex", "cc33dd", "--since-last", "--db", str(db_path)])
+    assert result.exit_code != 0
+    assert "no prior fetches found" in result.output.lower()
+
+
+def test_fetch_cli_default_start_is_jan_1_of_last_year(tmp_path, monkeypatch):
+    """No prior fetch_log rows and no --start: default start is January 1 of
+    the previous calendar year, computed at runtime rather than a frozen date."""
+    from adsbtrack import cli as cli_module
+
+    # Use a year where "computed at runtime" and the old frozen "2025-01-01"
+    # default would disagree, so this test actually distinguishes the two.
+    class FakeDate(date):
+        @classmethod
+        def today(cls):
+            return date(2028, 3, 1)
+
+    monkeypatch.setattr(cli_module, "date", FakeDate)
+
+    calls: list[tuple] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx"):
+        calls.append((start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "dd44ee", "--end", "2028-03-01", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [(date(2027, 1, 1), date(2028, 3, 1))]
+
+
+def test_status_cli_honors_adsbtrack_db_envvar(tmp_path, monkeypatch):
+    """--db reads $ADSBTRACK_DB when the flag isn't passed, so wrapper scripts
+    don't need to repeat --db on every invocation. Runs from an isolated cwd:
+    if the envvar isn't wired up, --db falls back to a relative './adsbtrack.db'
+    which must not land in (or read from) the real working directory."""
+    monkeypatch.chdir(tmp_path)
+    db_path = tmp_path / "envvar.db"
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "ee55ff",
+            "2024-01-01",
+            {
+                "r": "N512WB",
+                "t": "C172",
+                "desc": "Cessna 172",
+                "ownOp": "unknown",
+                "year": "1966",
+                "timestamp": datetime(2024, 1, 1, tzinfo=UTC).timestamp(),
+                "trace": [],
+            },
+        )
+
+    result = CliRunner().invoke(cli, ["status", "--hex", "ee55ff"], env={"ADSBTRACK_DB": str(db_path)})
+    assert result.exit_code == 0, result.output
+    assert "Status for ee55ff" in result.output
+    # Only present if the *seeded* db was actually read, not a fresh fallback one.
+    assert "N512WB" in result.output
 
 
 # ---------------------------------------------------------------------------

@@ -1,6 +1,7 @@
 import os
 import re
-from datetime import date
+from collections.abc import Callable
+from datetime import date, timedelta
 from importlib.metadata import version as pkg_version
 from pathlib import Path
 from urllib.parse import urlparse
@@ -41,6 +42,25 @@ def ensure_airports(db: Database, config: Config):
         console.print("[yellow]Airport database empty, downloading...[/]")
         count = download_airports(db, config)
         console.print(f"[green]Loaded {count} airports[/]")
+
+
+def _db_option(help_text: str = "Database path.") -> Callable:
+    """Shared --db option. Keeps the ADSBTRACK_DB envvar wiring and the default
+    path in one place instead of repeating it across ~20 command definitions."""
+    return click.option(
+        "--db",
+        "db_path",
+        default="adsbtrack.db",
+        envvar="ADSBTRACK_DB",
+        help=f"{help_text} Reads $ADSBTRACK_DB if set (default: ./adsbtrack.db).",
+    )
+
+
+def _default_fetch_start() -> date:
+    """Fallback start date for `fetch` when there's no --start and no prior
+    fetch history to resume from. January 1 of the previous calendar year,
+    computed at runtime rather than frozen to a hardcoded date."""
+    return date(date.today().year - 1, 1, 1)
 
 
 _HEX_RE = re.compile(r"[0-9a-f]{6}")
@@ -155,7 +175,21 @@ def cli():
     help="Data source, or 'all' to fetch from every readsb source (default: adsbx)",
 )
 @click.option("--url", "custom_url", default=None, help="Custom readsb globe_history base URL")
-@click.option("--start", "start_date", default="2025-01-01", help="Start date (YYYY-MM-DD)")
+@click.option(
+    "--start",
+    "start_date",
+    default=None,
+    help="Start date (YYYY-MM-DD). If omitted: resumes the day after the last fetched "
+    "day when this hex+source has prior fetch history (same as --since-last), otherwise "
+    "defaults to January 1 of last year.",
+)
+@click.option(
+    "--since-last",
+    is_flag=True,
+    default=False,
+    help="Resume from the day after the last successfully fetched day for this hex+source. "
+    "Errors if no prior fetch history exists. Implied when --start is omitted and history exists.",
+)
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
 @click.option("--rate", default=0.5, help="Seconds between requests")
 @click.option(
@@ -166,8 +200,8 @@ def cli():
     "caps request-start spacing; concurrency only helps when request latency "
     "exceeds --rate. Set to 1 for byte-identical serial behavior.",
 )
-@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
-def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate, concurrency, db_path):
+@_db_option()
+def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end_date, rate, concurrency, db_path):
     """Download trace data from ADS-B data sources."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
@@ -177,7 +211,34 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
 
         ensure_airports(db, config)
 
-        start = date.fromisoformat(start_date)
+        if start_date and since_last:
+            raise click.UsageError("Provide either --start or --since-last, not both.")
+        if since_last and custom_url:
+            raise click.UsageError("--since-last is not supported with --url; pass --start explicitly.")
+
+        # --url resolves its own source name (from the URL's netloc) further
+        # below; resuming here against --source's fetch history would look up
+        # the wrong source, so resume/--since-last only applies to a plain
+        # --source fetch.
+        last_fetched = None
+        if not custom_url:
+            fetched_dates = db.get_fetched_dates(hex_code, source=source)
+            last_fetched = max(fetched_dates) if fetched_dates else None
+
+        if since_last:
+            if last_fetched is None:
+                raise click.UsageError(
+                    f"--since-last requested but no prior fetches found for {hex_code} via source {source!r}."
+                )
+            start = date.fromisoformat(last_fetched) + timedelta(days=1)
+        elif start_date:
+            start = date.fromisoformat(start_date)
+        elif last_fetched is not None:
+            start = date.fromisoformat(last_fetched) + timedelta(days=1)
+            console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
+        else:
+            start = _default_fetch_start()
+
         end = date.fromisoformat(end_date) if end_date else date.today()
 
         if custom_url:
@@ -284,7 +345,7 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, end_date, rate,
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
 @click.option("--reprocess", is_flag=True, help="Clear and rebuild all flights")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def extract(hex_code, tail_number, reprocess, db_path):
     """Process raw traces into flights."""
     with Database(Path(db_path)) as db:
@@ -330,7 +391,7 @@ def _load_airframes_api_key(config: Config) -> str:
 @click.option("--tail", "tail_number", default=None, help="Tail/registration (resolved via aircraft_registry)")
 @click.option("--start", "start_date", required=True, help="Start date (YYYY-MM-DD)")
 @click.option("--end", "end_date", default=None, help="End date (YYYY-MM-DD), defaults to today")
-@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+@_db_option()
 def acars(hex_code, tail_number, start_date, end_date, db_path):
     """Fetch ACARS / VDL2 / HFDL messages from airframes.io for a given aircraft.
 
@@ -392,7 +453,7 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     default=False,
     help="Show the primary squawk code held by each flight.",
 )
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, show_squawk, db_path):
     """Show flight history."""
     with Database(Path(db_path)) as db:
@@ -553,7 +614,7 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code (6 chars)")
 @click.option("--tail", "tail_number", default=None, help="Tail number; resolved to hex")
-@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+@_db_option()
 def route(hex_code, tail_number, db_path):
     """Print the navaid track fingerprint for each flight of an aircraft."""
     import json as _json
@@ -598,7 +659,7 @@ def route(hex_code, tail_number, db_path):
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def status(hex_code, tail_number, db_path):
     """Show database statistics."""
     with Database(Path(db_path)) as db:
@@ -855,7 +916,7 @@ def lookup(tail_number):
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 @click.option(
     "--urls-only",
     is_flag=True,
@@ -901,7 +962,7 @@ def registry():
     default=None,
     help="Use a local ReleasableAircraft.zip instead of downloading.",
 )
-@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+@_db_option()
 def registry_update(zip_path, db_path):
     """Download the FAA ReleasableAircraft.zip and (re)import MASTER/DEREG/ACFTREF."""
     import sqlite3
@@ -973,7 +1034,7 @@ def _print_faa_registry_row(row, *, deregistered: bool) -> None:
 @registry.command("lookup")
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number (with or without leading N)")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def registry_lookup(hex_code, tail_number, db_path):
     """Show full FAA registration for an aircraft, including deregistration status."""
     if bool(hex_code) == bool(tail_number):
@@ -1029,7 +1090,7 @@ def _print_registry_summary_rows(rows, *, empty_message: str) -> None:
 @registry.command("owner")
 @click.option("--name", required=True, help="Owner name to search (LIKE match, case-insensitive)")
 @click.option("--limit", default=500, show_default=True, help="Max rows to return")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def registry_owner(name, limit, db_path):
     """Search faa_registry by registrant name (LIKE match)."""
     with Database(Path(db_path)) as db:
@@ -1042,7 +1103,7 @@ def registry_owner(name, limit, db_path):
 @click.option("--city", default=None, help="Exact city match (case-insensitive)")
 @click.option("--state", default=None, help="Exact state abbreviation match")
 @click.option("--limit", default=500, show_default=True, help="Max rows to return")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def registry_address(street, city, state, limit, db_path):
     """Search faa_registry by address. Provide at least one filter."""
     if not any([street, city, state]):
@@ -1073,7 +1134,7 @@ def runways():
     default=None,
     help="Use a local runways.csv instead of downloading from OurAirports.",
 )
-@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+@_db_option()
 def runways_refresh(csv_path, db_path):
     """Download OurAirports runways.csv and upsert runway geometry.
 
@@ -1108,7 +1169,7 @@ def navaids():
     default=None,
     help="Use a local navaids.csv instead of downloading from OurAirports.",
 )
-@click.option("--db", "db_path", default="adsbtrack.db", help="Database path")
+@_db_option()
 def navaids_refresh(csv_path, db_path):
     """Download OurAirports navaids.csv and upsert global navaid reference data.
 
@@ -1159,7 +1220,7 @@ def enrich():
 
 @enrich.command("hex")
 @click.option("--hex", "hex_code", required=True, callback=_validate_hex, help="ICAO hex code")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 @click.option(
     "--mictronics-dir",
     type=click.Path(path_type=Path, file_okay=False),
@@ -1205,7 +1266,7 @@ def enrich_hex_cmd(hex_code, db_path, mictronics_dir, no_hexdb):
 
 
 @enrich.command("all")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 @click.option(
     "--mictronics-dir",
     type=click.Path(path_type=Path, file_okay=False),
@@ -1251,7 +1312,7 @@ def mil():
 
 @mil.command("hex")
 @click.option("--hex", "hex_code", required=True, callback=_validate_hex, help="ICAO hex code")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def mil_hex_cmd(hex_code, db_path):
     """Check whether a single hex falls into a known military range."""
     with Database(Path(db_path)) as db:
@@ -1267,7 +1328,7 @@ def mil_hex_cmd(hex_code, db_path):
 
 
 @mil.command("scan")
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 def mil_scan_cmd(db_path):
     """Scan every icao in trace_days / flights against military ranges.
 
@@ -1304,7 +1365,7 @@ def mil_scan_cmd(db_path):
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 @click.option(
     "--min-gap-secs",
     type=int,
@@ -1389,7 +1450,7 @@ def _pct(mix: dict, key: str) -> str:
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
-@click.option("--db", "db_path", default="adsbtrack.db")
+@_db_option()
 @click.option(
     "--since",
     "since_str",
@@ -1461,7 +1522,7 @@ def events(hex_code, tail_number, db_path, since_str, severity):
 
 
 @cli.command("mcp-serve")
-@click.option("--db", "db_path", default="adsbtrack.db", help="SQLite database path the server reads from.")
+@_db_option("SQLite database path the server reads from.")
 def mcp_serve(db_path):
     """Run the read-only MCP server over stdio.
 
@@ -1478,7 +1539,7 @@ def mcp_serve(db_path):
 
 
 @cli.command()
-@click.option("--db", "db_path", default="adsbtrack.db", help="SQLite database path to open in the TUI.")
+@_db_option("SQLite database path to open in the TUI.")
 def tui(db_path):
     """Launch the Textual TUI over the local SQLite database.
 
@@ -1495,7 +1556,7 @@ def tui(db_path):
 
 
 @cli.command("gui")
-@click.option("--db", "db_path", default="adsbtrack.db", help="SQLite database path to export from.")
+@_db_option("SQLite database path to export from.")
 @click.option(
     "--out",
     "out_dir",

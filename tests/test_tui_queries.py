@@ -56,6 +56,38 @@ def test_list_flights_per_icao(seeded_db):
     assert flights[0].origin_icao == "KEWR"
 
 
+def test_list_flights_carries_nearest_origin_and_probable_destination(tmp_path):
+    """Issue #18: FlightRow surfaces the raw fallback fields (already
+    computed by the extractor) so the flights view can render a ~ICAO
+    marker instead of a bare dash for near-match-only endpoints."""
+    db_path = tmp_path / "fallback.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ad677e",
+                takeoff_time=datetime(2022, 6, 5, 10, 0, tzinfo=UTC),
+                takeoff_lat=38.06,
+                takeoff_lon=-116.77,
+                takeoff_date="2022-06-05",
+                landing_time=datetime(2022, 6, 5, 11, 0, tzinfo=UTC),
+                landing_lat=38.05,
+                landing_lon=-116.78,
+                landing_date="2022-06-05",
+                origin_icao=None,
+                nearest_origin_icao="KTNX",
+                destination_icao=None,
+                landing_type="signal_lost",
+                probable_destination_icao="KTNX",
+                duration_minutes=60.0,
+            )
+        )
+    with Database(db_path) as db:
+        flights = list_flights(db, "ad677e")
+    assert len(flights) == 1
+    assert flights[0].nearest_origin_icao == "KTNX"
+    assert flights[0].probable_destination_icao == "KTNX"
+
+
 def test_list_flights_unknown_icao(seeded_db):
     with Database(seeded_db) as db:
         assert list_flights(db, "ffffff") == []

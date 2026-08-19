@@ -139,6 +139,58 @@ def test_flights_by_icao_keyed_per_aircraft(exported_bundle):
     assert bbb[0]["callsign"] == "SWA200"
 
 
+def test_flights_by_icao_carries_fallback_fields_for_signal_lost(tmp_path):
+    """Issue #18: the exported flight JSON carries nearest_origin_icao and
+    probable_destination_icao so app.js can render the same ~ICAO fallback
+    the CLI/TUI show for signal_lost / dropped_on_approach flights whose
+    endpoint didn't clear the on-field match threshold."""
+    db_path = tmp_path / "fallback_gui.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ad677e",
+                takeoff_time=datetime(2022, 6, 5, 10, 0, tzinfo=UTC),
+                takeoff_lat=38.06,
+                takeoff_lon=-116.77,
+                takeoff_date="2022-06-05",
+                landing_time=datetime(2022, 6, 5, 11, 0, tzinfo=UTC),
+                landing_lat=38.05,
+                landing_lon=-116.78,
+                landing_date="2022-06-05",
+                origin_icao=None,
+                nearest_origin_icao="KTNX",
+                nearest_origin_distance_km=2.67,
+                destination_icao=None,
+                landing_type="signal_lost",
+                probable_destination_icao="KTNX",
+                probable_destination_distance_km=4.63,
+                duration_minutes=60.0,
+            )
+        )
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
+            ("ad677e", "N999YY", "AT02", "TEST HELICOPTER"),
+        )
+        db.refresh_aircraft_stats("ad677e")
+        db.commit()
+
+    out_dir = tmp_path / "gui_fallback"
+    export_gui(db_path, out_dir, focus_hex="ad677e")
+    data = _load_snapshot(out_dir)
+    flight = data["flights_by_icao"]["ad677e"][0]
+    assert flight["nearest_origin_icao"] == "KTNX"
+    assert flight["probable_destination_icao"] == "KTNX"
+
+
+def test_app_js_flights_table_renders_endpoint_fallbacks(exported_bundle):
+    """app.js must consult the fallback fields to render the same ~ICAO
+    marker the CLI/TUI show, not just the raw origin_icao/destination_icao."""
+    out_dir, _ = exported_bundle
+    text = (out_dir / "app.js").read_text()
+    assert "nearest_origin_icao" in text
+    assert "probable_destination_icao" in text
+
+
 def test_events_status_spoofs_keyed_per_aircraft(exported_bundle):
     out_dir, _ = exported_bundle
     data = _load_snapshot(out_dir)

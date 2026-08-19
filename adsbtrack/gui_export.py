@@ -234,7 +234,9 @@ def _flight_row_to_json(flight) -> dict[str, Any]:  # type: ignore[no-untyped-de
         "takeoff_time": flight.takeoff_time,
         "takeoff_date": flight.takeoff_date,
         "origin_icao": flight.origin_icao,
+        "nearest_origin_icao": flight.nearest_origin_icao,
         "destination_icao": flight.destination_icao,
+        "probable_destination_icao": flight.probable_destination_icao,
         "duration_minutes": flight.duration_minutes,
         "callsign": flight.callsign,
         "mission_type": flight.mission_type,
@@ -735,8 +737,8 @@ function renderFlightsTable() {
   for (const f of flights) {
     const tr = el('tr', {}, [
       el('td', { text: (f.takeoff_time || '').slice(0, 16).replace('T', ' ') + 'Z' }),
-      el('td', { text: f.origin_icao || '-' }),
-      el('td', { text: f.destination_icao || '-' }),
+      originCell(f),
+      destinationCell(f),
       el('td', { class: 'num', text: f.duration_minutes != null ? String(Math.round(f.duration_minutes)) : '-' }),
       el('td', { text: f.callsign || '-' }),
       el('td', { text: (f.mission_type || '-').toUpperCase().slice(0, 6) }),
@@ -751,6 +753,25 @@ function renderFlightsTable() {
     ]);
     tbody.appendChild(tr);
   }
+}
+
+// Origin/destination cells: real ICAO when the on-field match threshold
+// was cleared, else a ~ICAO fallback (issue #18) from the near-match /
+// probable-destination diagnostic fields the extractor already computed,
+// matching the CLI's `trips` table and the TUI's flights view.
+function originCell(f) {
+  if (f.origin_icao) return el('td', { text: f.origin_icao });
+  if (f.nearest_origin_icao) return el('td', {}, [el('span', { class: 'c-amber', text: `~${f.nearest_origin_icao}` })]);
+  return el('td', { text: '-' });
+}
+
+function destinationCell(f) {
+  if (f.destination_icao) return el('td', { text: f.destination_icao });
+  if (f.probable_destination_icao && (f.landing_type === 'signal_lost' || f.landing_type === 'dropped_on_approach')) {
+    return el('td', {}, [el('span', { class: 'c-amber', text: `~${f.probable_destination_icao}` })]);
+  }
+  if (f.landing_type === 'signal_lost') return el('td', {}, [el('span', { class: 'c-red', text: 'sig lost' })]);
+  return el('td', { text: '-' });
 }
 
 function landingCell(f) {

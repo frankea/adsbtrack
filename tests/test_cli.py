@@ -1027,6 +1027,141 @@ def test_trips_from_column_plain_when_takeoff_runway_null(tmp_path, monkeypatch)
     assert "KSPG/" not in result.output
 
 
+def test_trips_shows_probable_destination_fallback_for_signal_lost(tmp_path, monkeypatch) -> None:
+    """Issue #18: signal_lost flights with an inferred probable_destination_icao
+    render `~ICAO` (the existing dropped_on_approach fallback convention) instead
+    of just "signal lost" -- _infer_probable_destination computes this field for
+    both landing types, but the table only rendered it for one."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="ad677e",
+            takeoff_time=datetime(2022, 6, 5, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2022-06-05",
+            landing_time=datetime(2022, 6, 5, 11, 0),
+            landing_lat=38.05,
+            landing_lon=-116.78,
+            landing_date="2022-06-05",
+            origin_icao="KSPG",
+            destination_icao=None,
+            duration_minutes=60.0,
+            landing_type="signal_lost",
+            landing_confidence=0.4,
+            probable_destination_icao="KTNX",
+            probable_destination_distance_km=4.63,
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "ad677e", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "~KTNX" in result.output
+    assert "signal lost" not in result.output
+
+
+def test_trips_signal_lost_without_probable_destination_still_shows_signal_lost(tmp_path, monkeypatch) -> None:
+    """Regression: a signal_lost flight with no inferred destination keeps
+    showing the red "signal lost" marker instead of a bogus fallback."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="ad677f",
+            takeoff_time=datetime(2022, 6, 5, 10, 0),
+            takeoff_lat=27.76,
+            takeoff_lon=-82.63,
+            takeoff_date="2022-06-05",
+            landing_time=datetime(2022, 6, 5, 11, 0),
+            landing_lat=38.05,
+            landing_lon=-116.78,
+            landing_date="2022-06-05",
+            origin_icao="KSPG",
+            destination_icao=None,
+            duration_minutes=60.0,
+            landing_type="signal_lost",
+            landing_confidence=0.4,
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "ad677f", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "signal lost" in result.output
+
+
+def test_trips_shows_nearest_origin_fallback_when_origin_null(tmp_path, monkeypatch) -> None:
+    """Issue #18: origin falls back to `~NEAREST` (yellow) when origin_icao is
+    NULL but nearest_origin_icao was resolved (the on-field gate keeps a
+    near-match airport out of origin_icao when coverage starts mid-climb)."""
+    monkeypatch.setenv("COLUMNS", "200")
+    db_path = tmp_path / "a.db"
+    with Database(db_path) as db:
+        f = Flight(
+            icao="ad677e",
+            takeoff_time=datetime(2022, 6, 5, 10, 0),
+            takeoff_lat=38.06,
+            takeoff_lon=-116.77,
+            takeoff_date="2022-06-05",
+            landing_time=datetime(2022, 6, 5, 11, 0),
+            landing_lat=27.76,
+            landing_lon=-82.63,
+            landing_date="2022-06-05",
+            origin_icao=None,
+            nearest_origin_icao="KTNX",
+            nearest_origin_distance_km=2.67,
+            destination_icao="KSPG",
+            duration_minutes=60.0,
+            landing_type="confirmed",
+            landing_confidence=0.9,
+        )
+        db.insert_flight(f)
+
+    runner = CliRunner()
+    result = runner.invoke(cli, ["trips", "--hex", "ad677e", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "~KTNX" in result.output
+
+
+def test_trips_json_includes_fallback_fields(tmp_path) -> None:
+    """--json carries the raw fields backing both fallbacks so downstream
+    consumers don't need to re-query the DB to compute them."""
+    db_path = tmp_path / "t.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ad677e",
+                takeoff_time=datetime(2022, 6, 5, 10, 0),
+                takeoff_lat=38.06,
+                takeoff_lon=-116.77,
+                takeoff_date="2022-06-05",
+                landing_time=datetime(2022, 6, 5, 11, 0),
+                landing_lat=38.05,
+                landing_lon=-116.78,
+                landing_date="2022-06-05",
+                origin_icao=None,
+                nearest_origin_icao="KTNX",
+                nearest_origin_distance_km=2.67,
+                destination_icao=None,
+                duration_minutes=60.0,
+                landing_type="signal_lost",
+                landing_confidence=0.4,
+                probable_destination_icao="KTNX",
+                probable_destination_distance_km=4.63,
+            )
+        )
+
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ad677e", "--db", str(db_path), "--json"])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload[0]["nearest_origin_icao"] == "KTNX"
+    assert payload[0]["nearest_origin_distance_km"] == 2.67
+    assert payload[0]["probable_destination_icao"] == "KTNX"
+    assert payload[0]["probable_destination_distance_km"] == 4.63
+
+
 def test_status_shows_go_around_and_pattern_counts(tmp_path, monkeypatch) -> None:
     """status output includes go-around count and pattern-work count."""
     monkeypatch.setenv("COLUMNS", "200")

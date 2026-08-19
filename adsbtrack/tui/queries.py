@@ -227,6 +227,12 @@ class FlightRow:
     emergency_squawk: str | None
     had_go_around: int | None
     max_hover_secs: int | None
+    # Near-match diagnostic fields (issue #18): populated when the real
+    # origin_icao/destination_icao didn't clear the on-field match
+    # threshold. Views use these to render a ~ICAO fallback instead of a
+    # bare dash for flights the extractor still resolved to a nearby field.
+    nearest_origin_icao: str | None
+    probable_destination_icao: str | None
 
 
 def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRow]:
@@ -241,7 +247,8 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
                duration_minutes, callsign,
                mission_type, max_altitude, cruise_gs_kt,
                landing_type, landing_confidence,
-               emergency_squawk, had_go_around, max_hover_secs
+               emergency_squawk, had_go_around, max_hover_secs,
+               nearest_origin_icao, probable_destination_icao
           FROM flights
          WHERE icao = ?
          ORDER BY takeoff_time DESC
@@ -263,6 +270,8 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
             emergency_squawk=r["emergency_squawk"],
             had_go_around=r["had_go_around"],
             max_hover_secs=r["max_hover_secs"],
+            nearest_origin_icao=r["nearest_origin_icao"],
+            probable_destination_icao=r["probable_destination_icao"],
         )
         for r in db.conn.execute(sql, (icao, limit)).fetchall()
     ]

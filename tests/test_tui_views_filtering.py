@@ -15,8 +15,9 @@ from adsbtrack.events import Event
 from adsbtrack.tui.queries import AircraftRow, FlightRow, JumpMatch
 from adsbtrack.tui.views.aircraft import filter_aircraft
 from adsbtrack.tui.views.events import filter_events
-from adsbtrack.tui.views.flights import filter_flights
+from adsbtrack.tui.views.flights import _airport_cell, _display_destination, _display_origin, filter_flights
 from adsbtrack.tui.views.jump import filter_jump_matches
+from adsbtrack.tui.widgets import ACCENT_AMBER, ACCENT_RED
 
 # ---------------------------------------------------------------------------
 # events
@@ -97,6 +98,8 @@ def _flight(**overrides) -> FlightRow:
         emergency_squawk=None,
         had_go_around=None,
         max_hover_secs=None,
+        nearest_origin_icao=None,
+        probable_destination_icao=None,
     )
     fields.update(overrides)
     return FlightRow(**fields)
@@ -146,6 +149,63 @@ def test_filter_flights_skips_none_fields():
 def test_filter_flights_no_match_returns_empty():
     rows = [_flight()]
     assert filter_flights(rows, "zzzzzz") == []
+
+
+# ---------------------------------------------------------------------------
+# flights: endpoint display fallbacks (issue #18)
+# ---------------------------------------------------------------------------
+
+
+def test_display_origin_prefers_real_icao():
+    row = _flight(origin_icao="KEWR", nearest_origin_icao="KTNX")
+    assert _display_origin(row) == "KEWR"
+
+
+def test_display_origin_falls_back_to_nearest_when_origin_null():
+    row = _flight(origin_icao=None, nearest_origin_icao="KTNX")
+    assert _display_origin(row) == "~KTNX"
+
+
+def test_display_origin_none_when_neither_set():
+    row = _flight(origin_icao=None, nearest_origin_icao=None)
+    assert _display_origin(row) is None
+
+
+def test_display_destination_prefers_real_icao():
+    row = _flight(destination_icao="KBOS", probable_destination_icao="KTNX", landing_type="signal_lost")
+    assert _display_destination(row) == "KBOS"
+
+
+def test_display_destination_falls_back_for_signal_lost():
+    row = _flight(destination_icao=None, probable_destination_icao="KTNX", landing_type="signal_lost")
+    assert _display_destination(row) == "~KTNX"
+
+
+def test_display_destination_falls_back_for_dropped_on_approach():
+    row = _flight(destination_icao=None, probable_destination_icao="KTNX", landing_type="dropped_on_approach")
+    assert _display_destination(row) == "~KTNX"
+
+
+def test_display_destination_signal_lost_no_probable_shows_literal():
+    row = _flight(destination_icao=None, probable_destination_icao=None, landing_type="signal_lost")
+    assert _display_destination(row) == "sig lost"
+
+
+def test_display_destination_none_when_uncertain_no_probable():
+    row = _flight(destination_icao=None, probable_destination_icao=None, landing_type="uncertain")
+    assert _display_destination(row) is None
+
+
+def test_airport_cell_amber_for_fallback_marker():
+    result = _airport_cell("~KTNX")
+    assert result.plain == "~KTNX"
+    assert result.style == ACCENT_AMBER
+
+
+def test_airport_cell_red_for_signal_lost_literal():
+    result = _airport_cell("sig lost")
+    assert result.plain == "sig lost"
+    assert result.style == ACCENT_RED
 
 
 # ---------------------------------------------------------------------------

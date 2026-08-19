@@ -648,6 +648,8 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                     "landing_time": f["landing_time"],
                     "origin_icao": f["origin_icao"],
                     "origin_name": f["origin_name"],
+                    "nearest_origin_icao": _col(f, "nearest_origin_icao"),
+                    "nearest_origin_distance_km": _col(f, "nearest_origin_distance_km"),
                     "takeoff_runway": _col(f, "takeoff_runway"),
                     "takeoff_lat": f["takeoff_lat"],
                     "takeoff_lon": f["takeoff_lon"],
@@ -658,6 +660,7 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                     "landing_type": f["landing_type"] or "unknown",
                     "landing_confidence": f["landing_confidence"],
                     "probable_destination_icao": _col(f, "probable_destination_icao"),
+                    "probable_destination_distance_km": _col(f, "probable_destination_distance_km"),
                     "duration_minutes": f["duration_minutes"],
                     "callsign": f["callsign"],
                     "mission_type": _col(f, "mission_type"),
@@ -711,6 +714,8 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                 origin = f"{origin_icao}{origin_suffix} ({f['origin_name']})"
             elif origin_icao:
                 origin = f"{origin_icao}{origin_suffix}"
+            elif _col(f, "nearest_origin_icao"):
+                origin = f"[yellow]~{_col(f, 'nearest_origin_icao')}[/]"
             else:
                 origin = f"({f['takeoff_lat']:.2f}, {f['takeoff_lon']:.2f})"
 
@@ -718,7 +723,9 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
 
             if f["destination_icao"]:
                 dest = f"{f['destination_icao']} ({f['destination_name']})"
-            elif landing_type == LandingType.DROPPED_ON_APPROACH and _col(f, "probable_destination_icao"):
+            elif landing_type in (LandingType.DROPPED_ON_APPROACH, LandingType.SIGNAL_LOST) and _col(
+                f, "probable_destination_icao"
+            ):
                 dest = f"[yellow]~{_col(f, 'probable_destination_icao')}[/]"
             elif landing_type == LandingType.SIGNAL_LOST:
                 dest = "[red]signal lost[/]"

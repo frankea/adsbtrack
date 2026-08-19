@@ -39,7 +39,14 @@ from textual.worker import Worker, WorkerState
 from ...airports import find_nearest_airport
 from ...db import Database
 from ..braille import BrailleCanvas
-from ..queries import TracePoint, distinct_dates_for_icao, load_trace_points
+from ..queries import (
+    TracePoint,
+    _display_destination,
+    _display_origin,
+    distinct_dates_for_icao,
+    list_flights,
+    load_trace_points,
+)
 from ..widgets import (
     ACCENT_AMBER,
     ACCENT_CYAN,
@@ -554,6 +561,34 @@ def _compose(ctx: _MapCtx, cols: int, rows: int) -> Text:
     return grid.to_text()
 
 
+def _route_for(db: Database, icao: str, date: str) -> str | None:
+    """Return a "KSPG > KHKY"-style route label for the displayed date's
+    first flight, or ``None`` if there's no flight that day or neither
+    endpoint resolves to anything displayable.
+
+    Anchored to the flights table (the extractor's actual matched
+    origin/destination for a specific flight) rather than a live
+    nearest-airport lookup against the raw trace endpoints -- the two can
+    disagree on a multi-leg day, since the trace's absolute first/last
+    point isn't necessarily this flight's takeoff/landing. Reuses
+    ``queries._display_origin`` / ``_display_destination`` (issue #18's
+    ~ICAO near-match fallback, also used by the flights table in
+    ``views/flights.py``) instead of reimplementing that fallback logic,
+    so a flight whose real origin_icao missed the on-field match
+    threshold still shows a route here, consistent with how the flights
+    table renders that same flight.
+    """
+    day_flights = [f for f in list_flights(db, icao) if f.takeoff_date == date]
+    if not day_flights:
+        return None
+    first = min(day_flights, key=lambda f: f.takeoff_time)
+    origin = _display_origin(first)
+    destination = _display_destination(first)
+    if not origin or not destination:
+        return None
+    return f"{origin} > {destination}"
+
+
 # ---------------------------------------------------------------------------
 # Widgets
 # ---------------------------------------------------------------------------
@@ -656,7 +691,12 @@ class MapView(Vertical):
             start_label = self._airport_or_coords(db, points[0])
             end_label = self._airport_or_coords(db, points[-1])
             ctx = _build_ctx(points, date, start_label, end_label, self.app.config.map_trace_gap_secs)
-            crumb = f"{date} {DOT} {start_label} > {end_label}"
+            # Prefer the flight's actual matched route (more precise than
+            # a live nearest-airport guess against the raw trace
+            # endpoints, and agrees with the flights table); fall back to
+            # the trace-endpoint labels when no flight row covers this date.
+            route = _route_for(db, icao, date)
+            crumb = f"{date} {DOT} {route}" if route is not None else f"{date} {DOT} {start_label} > {end_label}"
             trailing = (
                 f"{len(points):,} points {DOT} "
                 f"bbox ({ctx.lat_min:.3f},{ctx.lon_min:.3f})-({ctx.lat_max:.3f},{ctx.lon_max:.3f})"

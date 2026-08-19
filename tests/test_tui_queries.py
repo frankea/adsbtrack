@@ -16,6 +16,10 @@ import pytest
 from adsbtrack.db import Database
 from adsbtrack.models import Flight
 from adsbtrack.tui.queries import (
+    FlightRow,
+    _display_destination,
+    _display_origin,
+    _render_flags,
     count_aircraft,
     count_flights,
     count_trace_bytes,
@@ -86,6 +90,77 @@ def test_list_flights_carries_nearest_origin_and_probable_destination(tmp_path):
     assert len(flights) == 1
     assert flights[0].nearest_origin_icao == "KTNX"
     assert flights[0].probable_destination_icao == "KTNX"
+
+
+# ---------------------------------------------------------------------------
+# _display_origin / _display_destination: endpoint display fallbacks
+# (issue #18). Pure functions of a FlightRow -- relocated here from
+# views/flights.py so views/flights.py and views/map.py's route crumb
+# can both consume them without a cross-view import.
+# ---------------------------------------------------------------------------
+
+
+def _flight_row(**overrides) -> FlightRow:
+    fields = dict(
+        takeoff_time="2026-03-01T12:00:00+00:00",
+        takeoff_date="2026-03-01",
+        origin_icao="KEWR",
+        destination_icao="KBOS",
+        duration_minutes=120.0,
+        callsign="UAL1",
+        mission_type="transport",
+        max_altitude=35000,
+        cruise_gs_kt=430,
+        landing_type="confirmed",
+        landing_confidence=0.9,
+        emergency_squawk=None,
+        had_go_around=None,
+        max_hover_secs=None,
+        nearest_origin_icao=None,
+        probable_destination_icao=None,
+    )
+    fields.update(overrides)
+    return FlightRow(**fields)
+
+
+def test_display_origin_prefers_real_icao():
+    row = _flight_row(origin_icao="KEWR", nearest_origin_icao="KTNX")
+    assert _display_origin(row) == "KEWR"
+
+
+def test_display_origin_falls_back_to_nearest_when_origin_null():
+    row = _flight_row(origin_icao=None, nearest_origin_icao="KTNX")
+    assert _display_origin(row) == "~KTNX"
+
+
+def test_display_origin_none_when_neither_set():
+    row = _flight_row(origin_icao=None, nearest_origin_icao=None)
+    assert _display_origin(row) is None
+
+
+def test_display_destination_prefers_real_icao():
+    row = _flight_row(destination_icao="KBOS", probable_destination_icao="KTNX", landing_type="signal_lost")
+    assert _display_destination(row) == "KBOS"
+
+
+def test_display_destination_falls_back_for_signal_lost():
+    row = _flight_row(destination_icao=None, probable_destination_icao="KTNX", landing_type="signal_lost")
+    assert _display_destination(row) == "~KTNX"
+
+
+def test_display_destination_falls_back_for_dropped_on_approach():
+    row = _flight_row(destination_icao=None, probable_destination_icao="KTNX", landing_type="dropped_on_approach")
+    assert _display_destination(row) == "~KTNX"
+
+
+def test_display_destination_signal_lost_no_probable_shows_literal():
+    row = _flight_row(destination_icao=None, probable_destination_icao=None, landing_type="signal_lost")
+    assert _display_destination(row) == "sig lost"
+
+
+def test_display_destination_none_when_uncertain_no_probable():
+    row = _flight_row(destination_icao=None, probable_destination_icao=None, landing_type="uncertain")
+    assert _display_destination(row) is None
 
 
 def test_list_flights_unknown_icao(seeded_db):
@@ -268,6 +343,138 @@ def test_list_aircraft_respects_row_limit(tmp_path):
         db.commit()
         rows = list_aircraft(db, limit=5)
     assert len(rows) == 5
+
+
+def test_list_aircraft_has_hover_true_for_long_hover_flight(tmp_path):
+    """has_hover fires when any flight for the aircraft has a hover >= 5
+    min (300s) -- the same "long hover" threshold events.py's
+    _LONG_HOVER_SECS uses, and the HOVER flag replaces the old
+    hardcoded type-code HELI badge."""
+    db_path = tmp_path / "hover.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="cccccc",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+                max_hover_secs=310,
+            )
+        )
+        db.refresh_aircraft_stats("cccccc")
+        db.commit()
+        rows = list_aircraft(db)
+    row = next(r for r in rows if r.icao == "cccccc")
+    assert row.has_hover is True
+    assert "HOVER" in row.flags.split()
+
+
+def test_list_aircraft_has_hover_false_below_threshold(tmp_path):
+    db_path = tmp_path / "no_hover.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="dddddd",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+                max_hover_secs=120,
+            )
+        )
+        db.refresh_aircraft_stats("dddddd")
+        db.commit()
+        rows = list_aircraft(db)
+    row = next(r for r in rows if r.icao == "dddddd")
+    assert row.has_hover is False
+    assert "HOVER" not in row.flags.split()
+
+
+def test_list_aircraft_has_type_override_true_when_crossref_differs_from_registry(tmp_path):
+    """has_type_override fires when hex_crossref.type_code disagrees with
+    aircraft_registry.type_code -- i.e. a manual override exists."""
+    db_path = tmp_path / "type_override.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="eeeeee",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+            )
+        )
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
+            ("eeeeee", "N222EE", "B738", "BOEING 737-800"),
+        )
+        db.upsert_hex_crossref({"icao": "eeeeee", "type_code": "A320", "type_description": "AIRBUS A320"})
+        db.refresh_aircraft_stats("eeeeee")
+        db.commit()
+        rows = list_aircraft(db)
+    row = next(r for r in rows if r.icao == "eeeeee")
+    assert row.has_type_override is True
+    assert "TYP" in row.flags.split()
+
+
+def test_list_aircraft_has_type_override_false_when_types_match(tmp_path):
+    db_path = tmp_path / "type_match.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ffffff",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+            )
+        )
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
+            ("ffffff", "N333FF", "B738", "BOEING 737-800"),
+        )
+        db.upsert_hex_crossref({"icao": "ffffff", "type_code": "B738", "type_description": "BOEING 737-800"})
+        db.refresh_aircraft_stats("ffffff")
+        db.commit()
+        rows = list_aircraft(db)
+    row = next(r for r in rows if r.icao == "ffffff")
+    assert row.has_type_override is False
+    assert "TYP" not in row.flags.split()
+
+
+def test_list_aircraft_has_type_override_false_when_crossref_type_missing(tmp_path):
+    """No override signal when hex_crossref has no type_code at all --
+    only a genuine disagreement between two known types should flag."""
+    db_path = tmp_path / "type_missing.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="a1a1a1",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+            )
+        )
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, type_code, description) VALUES (?, ?, ?, ?)",
+            ("a1a1a1", "N444GG", "B738", "BOEING 737-800"),
+        )
+        db.upsert_hex_crossref({"icao": "a1a1a1", "type_code": None})
+        db.refresh_aircraft_stats("a1a1a1")
+        db.commit()
+        rows = list_aircraft(db)
+    row = next(r for r in rows if r.icao == "a1a1a1")
+    assert row.has_type_override is False
+
+
+def test_render_flags_mil_spf_hover_typ():
+    assert _render_flags(is_military=1, spoof_count=0, has_hover=False, has_type_override=False) == "MIL"
+    assert _render_flags(is_military=0, spoof_count=2, has_hover=False, has_type_override=False) == "SPF"
+    assert _render_flags(is_military=0, spoof_count=0, has_hover=True, has_type_override=False) == "HOVER"
+    assert _render_flags(is_military=0, spoof_count=0, has_hover=False, has_type_override=True) == "TYP"
+    assert _render_flags(is_military=1, spoof_count=1, has_hover=True, has_type_override=True) == "MIL SPF HOVER TYP"
 
 
 def test_count_trace_bytes_empty(seeded_db):

@@ -50,11 +50,14 @@ class SpoofView(Vertical):
         super().__init__(id="view-spoof")
         self._rows: list[SpoofedBroadcast] = []
         self._matched: list[SpoofedBroadcast] = []
+        self._expanded_key: tuple[str, str] | None = None
+        self._last_needle = ""
         self._header = PageHeader(
             "spoofed broadcasts",
             crumb="bimodal integrity audit",
             trailing=f"threshold v2_sil0 ≥ 10% {DOT} min 25 samples",
             widget_id="spoof-header",
+            crumb_prefix="›",
         )
         self._filter = FilterBar(
             placeholder="filter rejected broadcasts",
@@ -79,6 +82,8 @@ class SpoofView(Vertical):
         self._table.add_column(Text("SIL=0%", justify="right"), width=8)
         self._table.add_column(Text("NIC=0%", justify="right"), width=8)
         self._table.add_column("PER-SOURCE")
+        # Trailing expand indicator: `+` collapsed, `−` expanded.
+        self._table.add_column(Text("", justify="center"), width=3)
 
     # --- public API ---
 
@@ -88,13 +93,33 @@ class SpoofView(Vertical):
         self._rerender(needle)
 
     def toggle_detail(self) -> None:
+        """Expand/collapse the detail pane for the selected row.
+
+        Tracks the expanded row by ``(icao, takeoff_time)`` identity (not
+        table index) in ``self._expanded_key`` so a second press on the
+        same row collapses it, and so ``_rerender`` can carry the
+        expansion across a filter re-render instead of always resetting
+        it (the previous behaviour collapsed on every keystroke).
+        ``takeoff_time``, not ``takeoff_date``: ``spoofed_broadcasts`` is
+        UNIQUE(icao, takeoff_time), so two broadcasts for one aircraft on
+        the same calendar date share a ``takeoff_date`` -- keying on the
+        date would make them indistinguishable, marking both rows
+        expanded and making a press on the second row collapse instead
+        of switching detail to it.
+        """
         row = self._selected()
         if row is None:
+            self._expanded_key = None
             self._detail.display = False
+            self._rerender(self._last_needle)
             return
-        if self._detail.display:
+        key = (row.icao, row.takeoff_time)
+        if self._expanded_key == key:
+            self._expanded_key = None
             self._detail.display = False
+            self._rerender(self._last_needle)
             return
+        self._expanded_key = key
         body = json.dumps(row.reason_detail, indent=2)
         self._detail.update(
             Text.from_markup(
@@ -106,6 +131,7 @@ class SpoofView(Vertical):
             + Text(body, style=FG_0)
         )
         self._detail.display = True
+        self._rerender(self._last_needle)
 
     def focus_filter(self) -> None:
         self._filter.input_widget.focus()
@@ -130,8 +156,25 @@ class SpoofView(Vertical):
         return self._matched[idx]
 
     def _rerender(self, needle: str) -> None:
+        """Rebuild the table from ``self._rows`` filtered by ``needle``.
+
+        Preserves two bits of state across the rebuild instead of always
+        resetting them: the expanded detail row (``self._expanded_key``,
+        collapsed only if it got filtered out) and the cursor position
+        (re-seated onto the same underlying (icao, takeoff_time) row if it
+        survived the filter, since ``DataTable.clear()`` always resets the
+        cursor to row 0). Keyed on ``takeoff_time`` rather than
+        ``takeoff_date`` -- see ``toggle_detail`` -- so two same-day
+        broadcasts for one aircraft stay distinguishable.
+        """
+        self._last_needle = needle
+        cursor_key: tuple[str, str] | None = None
+        idx = self._table.cursor_row
+        if self._matched and idx is not None and 0 <= idx < len(self._matched):
+            cursor_row = self._matched[idx]
+            cursor_key = (cursor_row.icao, cursor_row.takeoff_time)
+
         self._table.clear()
-        self._detail.display = False
         needle_low = needle.lower() if needle else ""
         self._matched = []
         for row in self._rows:
@@ -145,6 +188,9 @@ class SpoofView(Vertical):
             sil_fmt = f"{sil:.1f}" if isinstance(sil, (int, float)) else "-"
             nic_fmt = f"{nic:.1f}" if isinstance(nic, (int, float)) else "-"
             per_source = _format_source_rates(detail) or "-"
+            is_expanded = self._expanded_key == (row.icao, row.takeoff_time)
+            indicator = "−" if is_expanded else "+"
+            indicator_colour = ACCENT_VIOLET if is_expanded else FG_2
             self._table.add_row(
                 cell(row.takeoff_date, style=FG_2),
                 cell(row.icao, style=ACCENT_CYAN),
@@ -153,8 +199,26 @@ class SpoofView(Vertical):
                 num_cell(sil_fmt, style=ACCENT_VIOLET),
                 num_cell(nic_fmt, style=ACCENT_VIOLET),
                 cell(per_source, style=FG_2) if per_source != "-" else dash(),
+                Text(indicator, style=indicator_colour, justify="center"),
             )
         self._filter.set_counts(matched=len(self._matched), total=len(self._rows))
+
+        # If the previously-expanded row got filtered out, collapse it.
+        if self._expanded_key is not None and not any(
+            (r.icao, r.takeoff_time) == self._expanded_key for r in self._matched
+        ):
+            self._expanded_key = None
+            self._detail.display = False
+
+        # Re-seat the cursor on the same (icao, takeoff_time) pair if it
+        # survived the filter, so toggling/filtering doesn't silently jump
+        # the selection to an unrelated row.
+        if cursor_key is not None:
+            for new_idx, row in enumerate(self._matched):
+                if (row.icao, row.takeoff_time) == cursor_key:
+                    self._table.move_cursor(row=new_idx)
+                    break
+
         if not self._rows:
             self._header.set_crumb("bimodal integrity audit (no rejections yet)")
         else:

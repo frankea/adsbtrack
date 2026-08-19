@@ -13,9 +13,9 @@ from datetime import UTC, datetime
 
 from adsbtrack.events import Event
 from adsbtrack.tui.queries import AircraftRow, FlightRow, JumpMatch
-from adsbtrack.tui.views.aircraft import filter_aircraft
+from adsbtrack.tui.views.aircraft import _fmt_flags, filter_aircraft
 from adsbtrack.tui.views.events import filter_events
-from adsbtrack.tui.views.flights import _airport_cell, _display_destination, _display_origin, filter_flights
+from adsbtrack.tui.views.flights import _airport_cell, filter_flights
 from adsbtrack.tui.views.jump import filter_jump_matches
 from adsbtrack.tui.widgets import ACCENT_AMBER, ACCENT_RED
 
@@ -152,48 +152,13 @@ def test_filter_flights_no_match_returns_empty():
 
 
 # ---------------------------------------------------------------------------
-# flights: endpoint display fallbacks (issue #18)
+# flights: endpoint cell colouring
 # ---------------------------------------------------------------------------
-
-
-def test_display_origin_prefers_real_icao():
-    row = _flight(origin_icao="KEWR", nearest_origin_icao="KTNX")
-    assert _display_origin(row) == "KEWR"
-
-
-def test_display_origin_falls_back_to_nearest_when_origin_null():
-    row = _flight(origin_icao=None, nearest_origin_icao="KTNX")
-    assert _display_origin(row) == "~KTNX"
-
-
-def test_display_origin_none_when_neither_set():
-    row = _flight(origin_icao=None, nearest_origin_icao=None)
-    assert _display_origin(row) is None
-
-
-def test_display_destination_prefers_real_icao():
-    row = _flight(destination_icao="KBOS", probable_destination_icao="KTNX", landing_type="signal_lost")
-    assert _display_destination(row) == "KBOS"
-
-
-def test_display_destination_falls_back_for_signal_lost():
-    row = _flight(destination_icao=None, probable_destination_icao="KTNX", landing_type="signal_lost")
-    assert _display_destination(row) == "~KTNX"
-
-
-def test_display_destination_falls_back_for_dropped_on_approach():
-    row = _flight(destination_icao=None, probable_destination_icao="KTNX", landing_type="dropped_on_approach")
-    assert _display_destination(row) == "~KTNX"
-
-
-def test_display_destination_signal_lost_no_probable_shows_literal():
-    row = _flight(destination_icao=None, probable_destination_icao=None, landing_type="signal_lost")
-    assert _display_destination(row) == "sig lost"
-
-
-def test_display_destination_none_when_uncertain_no_probable():
-    row = _flight(destination_icao=None, probable_destination_icao=None, landing_type="uncertain")
-    assert _display_destination(row) is None
+# The ~ICAO / "sig lost" fallback *decision* (issue #18) is a pure function
+# of a FlightRow -- _display_origin / _display_destination -- and now lives
+# in tui/queries.py (test_tui_queries.py) alongside the FlightRow it
+# formats, since both this view and the map's route crumb need it. What's
+# left here is _airport_cell's colouring of whatever string it's handed.
 
 
 def test_airport_cell_amber_for_fallback_marker():
@@ -225,6 +190,8 @@ def _aircraft(**overrides) -> AircraftRow:
         last_seen="2026-03-01",
         spoof_count=0,
         is_military=0,
+        has_hover=False,
+        has_type_override=False,
         flags="",
     )
     fields.update(overrides)
@@ -276,6 +243,31 @@ def test_filter_aircraft_skips_none_home_base():
 def test_filter_aircraft_no_match_returns_empty():
     rows = [_aircraft()]
     assert filter_aircraft(rows, "zzzzzz") == []
+
+
+def test_fmt_flags_no_flags_is_dash():
+    result = _fmt_flags(_aircraft())
+    assert result.plain == "--"
+
+
+def test_fmt_flags_hover_uses_amber():
+    result = _fmt_flags(_aircraft(has_hover=True))
+    assert "HOVER" in result.plain
+    assert ACCENT_AMBER in result.spans[0].style
+
+
+def test_fmt_flags_type_override_uses_amber():
+    result = _fmt_flags(_aircraft(has_type_override=True))
+    assert "TYP" in result.plain
+    assert ACCENT_AMBER in result.spans[0].style
+
+
+def test_fmt_flags_mil_spf_hover_typ_all_present():
+    result = _fmt_flags(_aircraft(is_military=1, spoof_count=3, has_hover=True, has_type_override=True))
+    assert "MIL" in result.plain
+    assert "SPF" in result.plain
+    assert "HOVER" in result.plain
+    assert "TYP" in result.plain
 
 
 # ---------------------------------------------------------------------------

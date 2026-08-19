@@ -40,7 +40,9 @@ class AircraftRow:
     last_seen: str | None
     spoof_count: int
     is_military: int
-    flags: str  # pre-rendered MIL/SPF/HOVER badge string
+    has_hover: bool
+    has_type_override: bool
+    flags: str  # pre-rendered MIL/SPF/HOVER/TYP badge string
 
     @property
     def display_reg(self) -> str:
@@ -86,7 +88,12 @@ def list_aircraft(db: Database, *, limit: int = 5000) -> list[AircraftRow]:
                s.home_base_icao AS home_base_icao,
                s.last_seen AS last_seen,
                (SELECT COUNT(*) FROM spoofed_broadcasts sb WHERE sb.icao = s.icao) AS spoof_count,
-               COALESCE(x.is_military, 0) AS is_military
+               COALESCE(x.is_military, 0) AS is_military,
+               EXISTS (
+                   SELECT 1 FROM flights f WHERE f.icao = s.icao AND f.max_hover_secs >= 300
+               ) AS has_hover,
+               (x.type_code IS NOT NULL AND r.type_code IS NOT NULL AND x.type_code != r.type_code)
+                   AS has_type_override
           FROM aircraft_stats s
           LEFT JOIN aircraft_registry r ON r.icao = s.icao
           LEFT JOIN hex_crossref x ON x.icao = s.icao
@@ -95,10 +102,13 @@ def list_aircraft(db: Database, *, limit: int = 5000) -> list[AircraftRow]:
     rows = db.conn.execute(sql, [limit]).fetchall()
     out = []
     for row in rows:
+        has_hover = bool(row["has_hover"])
+        has_type_override = bool(row["has_type_override"])
         flags = _render_flags(
             is_military=row["is_military"],
             spoof_count=row["spoof_count"],
-            type_code=row["type_code"],
+            has_hover=has_hover,
+            has_type_override=has_type_override,
         )
         out.append(
             AircraftRow(
@@ -112,21 +122,32 @@ def list_aircraft(db: Database, *, limit: int = 5000) -> list[AircraftRow]:
                 last_seen=row["last_seen"],
                 spoof_count=row["spoof_count"],
                 is_military=row["is_military"],
+                has_hover=has_hover,
+                has_type_override=has_type_override,
                 flags=flags,
             )
         )
     return out
 
 
-def _render_flags(*, is_military: int, spoof_count: int, type_code: str | None) -> str:
-    """Render a compact MIL/SPF/TYP badge string for the flags column."""
+def _render_flags(*, is_military: int, spoof_count: int, has_hover: bool, has_type_override: bool) -> str:
+    """Render the MIL / SPF / HOVER / TYP badge string for the flags column.
+
+    HOVER fires when any flight for this aircraft has a hover >= 5 min
+    (the same "long hover" threshold events.py's ``_LONG_HOVER_SECS``
+    uses); TYP fires when the hex_crossref type disagrees with the FAA
+    registry type, i.e. a manual type override exists. Replaces the old
+    hardcoded type-code-set HELI badge with these two data-driven signals.
+    """
     flags: list[str] = []
     if is_military:
         flags.append("MIL")
     if spoof_count:
         flags.append("SPF")
-    if type_code and type_code in {"B407", "B429", "S76", "S92", "H60", "UH60", "EC35", "EC45"}:
-        flags.append("HELI")
+    if has_hover:
+        flags.append("HOVER")
+    if has_type_override:
+        flags.append("TYP")
     return " ".join(flags)
 
 
@@ -275,6 +296,41 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
         )
         for r in db.conn.execute(sql, (icao, limit)).fetchall()
     ]
+
+
+def _display_origin(row: FlightRow) -> str | None:
+    """Origin cell content: the real ICAO, else a ``~NEAREST`` fallback
+    (issue #18) when only a near-match airport (2-10 km, kept out of
+    origin_icao by the on-field gate) was found, else ``None`` so the
+    caller can render a dash.
+
+    Pure function of a ``FlightRow``, so it lives alongside the
+    dataclass it formats rather than in a specific view -- both the
+    flights table (``views/flights.py``) and the map's route crumb
+    (``views/map.py``) need the exact same ~ICAO fallback so a flight
+    renders consistently in both places.
+    """
+    if row.origin_icao:
+        return row.origin_icao
+    if row.nearest_origin_icao:
+        return f"~{row.nearest_origin_icao}"
+    return None
+
+
+def _display_destination(row: FlightRow) -> str | None:
+    """Destination cell content: the real ICAO, else a ``~PROBABLE``
+    fallback (issue #18) for signal_lost/dropped_on_approach flights with
+    an inferred destination, else the literal "sig lost" marker for
+    signal_lost flights with no inference, else ``None``. See
+    ``_display_origin`` for why this lives here rather than in a view.
+    """
+    if row.destination_icao:
+        return row.destination_icao
+    if row.probable_destination_icao and row.landing_type in ("signal_lost", "dropped_on_approach"):
+        return f"~{row.probable_destination_icao}"
+    if row.landing_type == "signal_lost":
+        return "sig lost"
+    return None
 
 
 # ---------------------------------------------------------------------------

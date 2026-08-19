@@ -14,7 +14,7 @@ from textual.widgets import DataTable, Input
 from textual.worker import Worker, WorkerState
 
 from ...db import Database
-from ..queries import FlightRow, list_flights
+from ..queries import FlightRow, _display_destination, _display_origin, list_flights
 from ..widgets import (
     ACCENT_AMBER,
     ACCENT_CYAN,
@@ -74,32 +74,6 @@ def _airport_cell(code: str | None, *, fallback_style: str = FG_2) -> Text:
     if _ICAO_RE.match(code.upper()):
         return cell(code, style=ACCENT_OK)
     return cell(code, style=FG_0)
-
-
-def _display_origin(row: FlightRow) -> str | None:
-    """Origin cell content: the real ICAO, else a ``~NEAREST`` fallback
-    (issue #18) when only a near-match airport (2-10 km, kept out of
-    origin_icao by the on-field gate) was found, else ``None`` so
-    ``_airport_cell`` renders a dash."""
-    if row.origin_icao:
-        return row.origin_icao
-    if row.nearest_origin_icao:
-        return f"~{row.nearest_origin_icao}"
-    return None
-
-
-def _display_destination(row: FlightRow) -> str | None:
-    """Destination cell content: the real ICAO, else a ``~PROBABLE``
-    fallback (issue #18) for signal_lost/dropped_on_approach flights with
-    an inferred destination, else the literal "sig lost" marker for
-    signal_lost flights with no inference, else ``None``."""
-    if row.destination_icao:
-        return row.destination_icao
-    if row.probable_destination_icao and row.landing_type in ("signal_lost", "dropped_on_approach"):
-        return f"~{row.probable_destination_icao}"
-    if row.landing_type == "signal_lost":
-        return "sig lost"
-    return None
 
 
 def _fmt_landing(row: FlightRow) -> Text:

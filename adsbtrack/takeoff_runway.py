@@ -102,7 +102,17 @@ def _longest_inside_run(
     min_gs_kt: float,
 ) -> tuple[float, float] | None:
     """Walk samples, find the longest contiguous run inside polygon whose
-    max gs >= min_gs_kt. Returns (duration_secs, max_gs) or None."""
+    max gs >= min_gs_kt. Returns (duration_secs, max_gs) or None.
+
+    Does not use ``geo.split_on_gaps``: that core splits a pre-filtered
+    "kept points" list on time gaps between qualifying points, so a brief
+    excursion outside the qualifying set doesn't end a segment as long as
+    the elapsed time is small. Here, leaving the polygon ends the run
+    immediately regardless of elapsed time (see the ``not inside`` branch
+    below) -- re-entering shortly after starts a new run rather than
+    resuming the old one. Routing through the shared core would silently
+    bridge across those excursions, which changes which runway wins.
+    """
     best_duration = 0.0
     best_max_gs = 0.0
     run_start: float | None = None

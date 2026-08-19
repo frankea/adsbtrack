@@ -554,21 +554,41 @@ def _compute_navaid_track_json(
     return json.dumps(payload, ensure_ascii=True)
 
 
-def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
-    if reprocess:
-        db.clear_flights(hex_code)
+def _warn_on_type_code_drift(db: Database, hex_code: str, registry_row: dict, type_code: str | None) -> None:
+    """Warn when the registry recorded a lot of metadata drift AND at least
+    one drift event disagreed on type_code. Pure description drift is noise;
+    a type_code conflict indicates the registry entry may be wrong (e.g.
+    GLF6 vs GA8C on adf64f)."""
+    drift_count = registry_row.get("metadata_drift_count", 0)
+    if drift_count <= 20:
+        return
+    try:
+        drift_json = db.conn.execute(
+            "SELECT metadata_drift_values FROM aircraft_registry WHERE icao = ?",
+            (hex_code,),
+        ).fetchone()
+        if drift_json and drift_json[0]:
+            drift_vals = json.loads(drift_json[0])
+            type_conflicts = [d for d in drift_vals if d.get("type_code") and d["type_code"] != type_code]
+            if type_conflicts:
+                conflict_types = ", ".join(f"{d['type_code']}({d['count']})" for d in type_conflicts)
+                print(
+                    f"  WARNING: {hex_code} has {drift_count} metadata drift events "
+                    f"with type_code conflicts: {type_code} vs {conflict_types}"
+                )
+    except Exception:
+        pass
 
-    # get_trace_days is a generator (P7); materialize it here since this
-    # function makes multiple passes over trace_days below (registry
-    # upsert, type_code/owner_operator fallback scans, iter_parsed_trace_days).
-    trace_days = list(db.get_trace_days(hex_code))
-    if not trace_days:
-        return 0
 
-    # populate/refresh aircraft_registry and use the authoritative
-    # type_code for endurance, hover gating and mission rules. Fall back
-    # to the first row's type_code if the registry write fails (e.g. in
-    # tests using a MagicMock db).
+def _resolve_registry_metadata(db: Database, hex_code: str, trace_days: list) -> tuple[str | None, str | None]:
+    """Populate/refresh aircraft_registry and return the authoritative
+    ``(type_code, owner_operator)`` for this ICAO.
+
+    type_code drives endurance, hover gating and mission rules, so the
+    registry value wins. Falls back to the first trace_days row carrying
+    each field when the registry write fails (e.g. tests using a MagicMock
+    db) or the registry has no value for it.
+    """
     type_code: str | None = None
     owner_operator: str | None = None
     try:
@@ -580,27 +600,7 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             type_code = registry_row["type_code"]
         if registry_row.get("owner_operator"):
             owner_operator = registry_row["owner_operator"]
-        # warn when type_code drift exceeds threshold. Pure
-        # description drift is noise; type_code conflicts indicate the
-        # registry entry may be wrong (e.g. GLF6 vs GA8C on adf64f).
-        drift_count = registry_row.get("metadata_drift_count", 0)
-        if drift_count > 20:
-            try:
-                drift_json = db.conn.execute(
-                    "SELECT metadata_drift_values FROM aircraft_registry WHERE icao = ?",
-                    (hex_code,),
-                ).fetchone()
-                if drift_json and drift_json[0]:
-                    drift_vals = json.loads(drift_json[0])
-                    type_conflicts = [d for d in drift_vals if d.get("type_code") and d["type_code"] != type_code]
-                    if type_conflicts:
-                        conflict_types = ", ".join(f"{d['type_code']}({d['count']})" for d in type_conflicts)
-                        print(
-                            f"  WARNING: {hex_code} has {drift_count} metadata drift events "
-                            f"with type_code conflicts: {type_code} vs {conflict_types}"
-                        )
-            except Exception:
-                pass
+        _warn_on_type_code_drift(db, hex_code, registry_row, type_code)
     if type_code is None:
         for row in trace_days:
             if row["type_code"]:
@@ -611,30 +611,62 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
             if row["owner_operator"]:
                 owner_operator = row["owner_operator"]
                 break
+    return type_code, owner_operator
 
+
+def _load_and_merge(
+    trace_days: list, hex_code: str, config: Config
+) -> tuple[list[tuple[str, float, list]], set[str], dict[str, dict]]:
+    """Decode the trace rows once, score spoof indicators, and merge each
+    date's (possibly multi-source) rows into a single chronological trace.
+
+    Returns ``(merged_days, all_sources, spoof_scores_by_date)``:
+      - merged_days: ``[(date, base_timestamp, trace), ...]`` in date order,
+        the input the state machine walks.
+      - all_sources: union of every source that contributed a trace day;
+        stamped on every flight's FlightMetrics.
+      - spoof_scores_by_date: per-date bimodal-integrity scores computed up
+        front so the rejection gate never re-scans trace_json. Empty when
+        config.reject_spoofed_flights is off, which skips the scan entirely.
+
+    Needs no Database handle: the rows are loaded by the caller, which is
+    also where any "which days to process" narrowing belongs.
+    """
     # Decode every row's trace_json exactly once. The parsed pairs feed
     # both the spoof-scoring pass and the per-date merge below, instead of
     # each pass calling json.loads on the same rows independently.
     parsed_days = list(iter_parsed_trace_days(trace_days, hex_code))
 
-    # Compute per-date bimodal-integrity spoof scores up front so the
-    # rejection step below can query without re-scanning trace_json.
-    # Disabling reject_spoofed_flights skips the scan entirely.
     spoof_scores_by_date: dict[str, dict] = (
         pool_spoof_scores(parsed_days, config) if config.reject_spoofed_flights else {}
     )
 
-    # Group by date and merge multi-source rows
     by_date: dict[str, list[tuple[sqlite3.Row, list]]] = defaultdict(list)
     for row, trace in parsed_days:
         by_date[row["date"]].append((row, trace))
 
-    merged_days = []
+    merged_days: list[tuple[str, float, list]] = []
     all_sources: set[str] = set()
     for day_date in sorted(by_date.keys()):
         date_str, base_ts, trace, day_sources = _merge_trace_rows(by_date[day_date], config)
         merged_days.append((date_str, base_ts, trace))
         all_sources |= day_sources
+    return merged_days, all_sources, spoof_scores_by_date
+
+
+def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool = False):
+    if reprocess:
+        db.clear_flights(hex_code)
+
+    # get_trace_days is a generator (P7); materialize it here since the
+    # stages below make multiple passes over trace_days (registry upsert,
+    # type_code/owner_operator fallback scans, iter_parsed_trace_days).
+    trace_days = list(db.get_trace_days(hex_code))
+    if not trace_days:
+        return 0
+
+    type_code, owner_operator = _resolve_registry_metadata(db, hex_code, trace_days)
+    merged_days, all_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
 
     max_day_gap = timedelta(days=config.max_day_gap_days)
     max_point_gap_secs = config.max_point_gap_minutes * 60.0

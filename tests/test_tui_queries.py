@@ -9,7 +9,7 @@ migrations and schema stay in the loop.
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -19,6 +19,7 @@ from adsbtrack.tui.queries import (
     count_aircraft,
     count_flights,
     count_trace_bytes,
+    daily_activity,
     distinct_dates_for_icao,
     list_aircraft,
     list_events,
@@ -461,3 +462,127 @@ def test_status_snapshot_sources_returns_none_when_all_points_zero(tmp_path):
         db.commit()
         snap = status_snapshot(db, icao)
     assert snap["sources"] is None
+
+
+# ---------------------------------------------------------------------------
+# daily_activity (Task A1: real per-day activity strip data)
+# ---------------------------------------------------------------------------
+
+
+def test_daily_activity_returns_one_row_per_day_oldest_first(tmp_path):
+    db_path = tmp_path / "activity_window.db"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        db.commit()
+        rows = daily_activity(db, "hhh888", days=52, today=today)
+    assert len(rows) == 52
+    assert rows[0].date == "2026-05-10"  # today - 51 days
+    assert rows[-1].date == "2026-06-30"  # today
+    assert all(r.flight_count == 0 for r in rows)
+    assert all(r.flagged is False for r in rows)
+
+
+def test_daily_activity_counts_real_flights_per_day(tmp_path):
+    db_path = tmp_path / "activity_counts.db"
+    icao = "iii999"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        db.insert_flight(_flight(icao, hour=1, takeoff_date="2026-06-30"))
+        db.insert_flight(_flight(icao, hour=3, takeoff_date="2026-06-30"))
+        db.insert_flight(_flight(icao, hour=5, takeoff_date="2026-06-29"))
+        db.commit()
+        rows = daily_activity(db, icao, days=52, today=today)
+    by_date = {r.date: r.flight_count for r in rows}
+    assert by_date["2026-06-30"] == 2
+    assert by_date["2026-06-29"] == 1
+    assert by_date["2026-06-28"] == 0
+
+
+def test_daily_activity_ignores_flights_outside_the_window(tmp_path):
+    db_path = tmp_path / "activity_window_edge.db"
+    icao = "jjj000"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        # 53 days before today: just outside a 52-day window ending today.
+        db.insert_flight(_flight(icao, hour=1, takeoff_date="2026-05-08"))
+        db.commit()
+        rows = daily_activity(db, icao, days=52, today=today)
+    assert all(r.flight_count == 0 for r in rows)
+
+
+def test_daily_activity_flags_day_with_emergency_squawk(tmp_path):
+    db_path = tmp_path / "activity_emergency_squawk.db"
+    icao = "kkk111"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        db.insert_flight(_flight(icao, hour=1, takeoff_date="2026-06-30", emergency_squawk="7700"))
+        db.commit()
+        rows = daily_activity(db, icao, days=52, today=today)
+    by_date = {r.date: r.flagged for r in rows}
+    assert by_date["2026-06-30"] is True
+    assert by_date["2026-06-29"] is False
+
+
+def test_daily_activity_flags_day_with_emergency_flag(tmp_path):
+    db_path = tmp_path / "activity_emergency_flag.db"
+    icao = "lll222"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        db.insert_flight(_flight(icao, hour=1, takeoff_date="2026-06-30", emergency_flag="7700"))
+        db.commit()
+        rows = daily_activity(db, icao, days=52, today=today)
+    by_date = {r.date: r.flagged for r in rows}
+    assert by_date["2026-06-30"] is True
+
+
+def test_daily_activity_flags_day_with_spoofed_broadcast_even_with_zero_flights(tmp_path):
+    """A rejected broadcast is diverted out of `flights` entirely (see
+    parser.py's spoof-reject gate), so a flagged day from a spoof rejection
+    can have flight_count == 0. That's the normal case, not a bug."""
+    db_path = tmp_path / "activity_spoof.db"
+    icao = "mmm333"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        db.insert_spoofed_broadcast(
+            icao=icao,
+            takeoff_time="2026-06-30T00:49:47.580000+00:00",
+            landing_time="2026-06-30T01:41:52.140000+00:00",
+            takeoff_date="2026-06-30",
+            callsign="TEST1",
+            takeoff_lat=25.25,
+            takeoff_lon=55.38,
+            landing_lat=27.14,
+            landing_lon=55.55,
+            max_altitude=250,
+            data_points=350,
+            sources="adsbfi",
+            origin_icao=None,
+            destination_icao=None,
+            reason="bimodal_integrity",
+            reason_detail=json.dumps({}),
+        )
+        db.commit()
+        rows = daily_activity(db, icao, days=52, today=today)
+    row = next(r for r in rows if r.date == "2026-06-30")
+    assert row.flight_count == 0
+    assert row.flagged is True
+
+
+def test_daily_activity_default_days_is_52(tmp_path):
+    db_path = tmp_path / "activity_default.db"
+    with Database(db_path) as db:
+        db.commit()
+        rows = daily_activity(db, "nnn444", today=date(2026, 6, 30))
+    assert len(rows) == 52
+
+
+def test_daily_activity_scoped_to_icao(tmp_path):
+    db_path = tmp_path / "activity_scoped.db"
+    today = date(2026, 6, 30)
+    with Database(db_path) as db:
+        db.insert_flight(_flight("ooo555", hour=1, takeoff_date="2026-06-30"))
+        db.insert_flight(_flight("ppp666", hour=1, takeoff_date="2026-06-30"))
+        db.commit()
+        rows = daily_activity(db, "ooo555", days=52, today=today)
+    by_date = {r.date: r.flight_count for r in rows}
+    assert by_date["2026-06-30"] == 1

@@ -12,7 +12,6 @@ event loop, because mounting widgets off the main thread is not safe.
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -23,7 +22,7 @@ from textual.containers import Grid, Vertical
 from textual.widgets import Static
 from textual.worker import Worker, WorkerState
 
-from ..queries import status_snapshot
+from ..queries import DailyActivity, daily_activity, status_snapshot
 from ..widgets import (
     ACCENT_AMBER,
     ACCENT_MAGENTA,
@@ -92,27 +91,57 @@ def _build_indicators_body(snap: dict[str, Any]) -> Text:
     return Text.from_markup("\n".join(lines))
 
 
+# Window width for the activity strip. Layout-driven (the card is sized
+# for a 52-cell-wide bar row to match the concept), not a Config
+# threshold -- a different value would just resize the strip, not change
+# any classification behaviour.
+_ACTIVITY_DAYS = 52
+
+_ACTIVITY_GLYPHS = "▁▂▃▄▅▆▇█"
+
+
+def _activity_bar_index(count: int, max_count: int, n_glyphs: int) -> int:
+    """Map one day's flight count onto the glyph ramp.
+
+    Scaled against the busiest day in the window so the strip always uses
+    its full height range. A zero-flight day always renders glyph index 0
+    (the lowest/blank glyph); any positive count renders at least index 1
+    so a single flight is visibly distinct from a blank day.
+    """
+    if count <= 0 or max_count <= 0:
+        return 0
+    idx = 1 + round((count / max_count) * (n_glyphs - 2))
+    return min(n_glyphs - 1, max(1, idx))
+
+
+def _activity_spark_markup(activity: list[DailyActivity]) -> str:
+    """Build the activity strip's markup from real per-day rows.
+
+    One glyph per day, oldest left (``activity`` is already ordered that
+    way by ``queries.daily_activity``). A day renders amber when it was
+    flagged (an emergency squawk/flag or a spoof rejection that day),
+    otherwise the ok-green tier colour.
+    """
+    max_count = max((day.flight_count for day in activity), default=0)
+    parts = []
+    for day in activity:
+        idx = _activity_bar_index(day.flight_count, max_count, len(_ACTIVITY_GLYPHS))
+        colour = ACCENT_AMBER if day.flagged else ACCENT_OK
+        parts.append(f"[{colour}]{_ACTIVITY_GLYPHS[idx]}[/]")
+    return "".join(parts)
+
+
 def _build_signal_body(snap: dict[str, Any]) -> Text:
     spoof = snap.get("spoof_count") or 0
     tier_colour = ACCENT_OK if spoof == 0 else ACCENT_AMBER
     tier = "TIER A" if spoof == 0 else "TIER B"
-    # 52-bar strip derived deterministically from flight count so it
-    # doesn't flicker between renders. Not a real weekly-uptime signal
-    # yet; the label reflects that.
-    total_flights = (snap.get("stats") or {}).get("total_flights") or 0
-    glyphs = "▁▂▃▄▅▆▇█"
-    spark = []
-    for i in range(52):
-        seed = (total_flights + i * 13) % 97
-        h = int(math.sin(seed * 0.13) * 4 + 4) % 8
-        colour = ACCENT_AMBER if spoof and (i % 17 == 0) else ACCENT_OK
-        spark.append(f"[{colour}]{glyphs[h]}[/]")
+    spark = _activity_spark_markup(snap.get("activity") or [])
     return Text.from_markup(
-        f"[{FG_2}]SIGNAL QUALITY[/]\n"
+        f"[{FG_2}]ACTIVITY ({_ACTIVITY_DAYS}D)[/]\n"
         f"[b {tier_colour}]{tier}[/]\n"
         f"[{FG_2}]sil ≥ 2  nic ≥ 7  {spoof} v2_sil0 events[/]\n"
-        f"{''.join(spark)}\n"
-        f"[{FG_2}]activity strip (placeholder, not real uptime)[/]"
+        f"{spark}\n"
+        f"[{FG_2}]flights/day - amber = emergency or spoof day[/]"
     )
 
 
@@ -247,7 +276,9 @@ class StatusView(Vertical):
         """
         db = self.app.db_factory()
         try:
-            return _StatusResult(icao=icao, snap=status_snapshot(db, icao))
+            snap = status_snapshot(db, icao)
+            snap["activity"] = daily_activity(db, icao, days=_ACTIVITY_DAYS)
+            return _StatusResult(icao=icao, snap=snap)
         finally:
             db.close()
 

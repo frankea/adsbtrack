@@ -16,6 +16,7 @@ import json
 import sqlite3
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from ..db import Database, decode_trace_json
@@ -461,6 +462,67 @@ def status_snapshot(db: Database, icao: str) -> dict[str, Any]:
         "missions": [(r["mission_type"], r["n"]) for r in missions if r["mission_type"]],
         "spoof_count": spoof_count_row["n"] if spoof_count_row else 0,
     }
+
+
+@dataclass(frozen=True)
+class DailyActivity:
+    date: str
+    flight_count: int
+    flagged: bool
+
+
+def daily_activity(db: Database, icao: str, *, days: int = 52, today: date | None = None) -> list[DailyActivity]:
+    """Return real per-day flight counts for one aircraft over a trailing window.
+
+    Backs the status view's activity strip with actual per-day data instead
+    of a synthesized pattern. Returns exactly ``days`` rows, oldest first,
+    ending on ``today`` (UTC "today" when omitted so a real run always
+    reflects the current date). ``flagged`` is True for a day with >= 1
+    row in ``spoofed_broadcasts`` for ``icao``, or >= 1 flight with a
+    non-empty ``emergency_squawk`` or ``emergency_flag`` -- the exact two
+    columns ``events._event_from_row`` treats as emergency events, so
+    "amber" here means the same thing it means in the event feed and the
+    status view's own Indicators card. A flagged day can have
+    flight_count == 0: a rejected broadcast is diverted out of `flights`
+    entirely (parser.py's spoof-reject gate), so the flight it came from
+    never shows up in the count.
+    """
+    end = today or datetime.now(UTC).date()
+    start = end - timedelta(days=days - 1)
+    start_s, end_s = start.isoformat(), end.isoformat()
+
+    counts = {
+        r["takeoff_date"]: r["n"]
+        for r in db.conn.execute(
+            "SELECT takeoff_date, COUNT(*) AS n FROM flights"
+            " WHERE icao = ? AND takeoff_date BETWEEN ? AND ?"
+            " GROUP BY takeoff_date",
+            (icao, start_s, end_s),
+        ).fetchall()
+    }
+    flagged_days = {
+        r["takeoff_date"]
+        for r in db.conn.execute(
+            "SELECT DISTINCT takeoff_date FROM flights"
+            " WHERE icao = ? AND takeoff_date BETWEEN ? AND ?"
+            "   AND ((emergency_squawk IS NOT NULL AND emergency_squawk != '')"
+            "     OR (emergency_flag IS NOT NULL AND emergency_flag != ''))",
+            (icao, start_s, end_s),
+        ).fetchall()
+    }
+    flagged_days |= {
+        r["takeoff_date"]
+        for r in db.conn.execute(
+            "SELECT DISTINCT takeoff_date FROM spoofed_broadcasts WHERE icao = ? AND takeoff_date BETWEEN ? AND ?",
+            (icao, start_s, end_s),
+        ).fetchall()
+    }
+
+    out: list[DailyActivity] = []
+    for i in range(days):
+        d_s = (start + timedelta(days=i)).isoformat()
+        out.append(DailyActivity(date=d_s, flight_count=counts.get(d_s, 0), flagged=d_s in flagged_days))
+    return out
 
 
 # ---------------------------------------------------------------------------

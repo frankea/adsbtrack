@@ -315,13 +315,27 @@ class Config:
     stationary_max_alt_ft: float = 1000.0  # raised from 500 to catch ramp at higher-elevation airports
     stationary_max_gs_kt: float = 15.0
 
-    # Spoofed-broadcast gate (see parser.extract_flights). When enabled
+    # Spoofed-broadcast gate (see parser.pool_spoof_scores, consulted from
+    # parser.extract_flights and events._detect_spoof_events). When enabled
     # (default), a flight whose source trace_day shows bimodal-integrity
     # spoofing (>= spoof_v2_sil0_pct share of v2 samples with sil=0) or
     # matches the crude shallow-EK-flight signature (max_alt < 500 ft,
     # origin/dest both null, callsign ~= ^EK\d+$) is diverted to the
     # spoofed_broadcasts audit table instead of being inserted into
     # flights. Turn off to see the raw parser output unfiltered.
+    #
+    # Under ADS-B version 2, real aircraft transponders almost never
+    # report sil=0 (the Source Integrity Level field is >= 2 on production
+    # equipment). A populated broadcast with >= spoof_v2_sil0_pct of v2
+    # samples carrying sil=0 implies either two emitters on the same ICAO
+    # (one realistic, one garbage) or a single spoofer that hardcoded the
+    # integrity fields. The 10% default was empirically calibrated from the
+    # 2026-04 Strait-of-Hormuz Emirates A380 spoofs (25-50% v2_sil0 rate)
+    # vs. the same airframes' legitimate 2025-12 flights (0-1.4%).
+    # spoof_min_v2_samples is the minimum pooled v2 sample count required
+    # before the ratio is trusted; below it variance dominates and sparse
+    # days produce false positives. A typical active flight day has >100
+    # v2 samples.
     reject_spoofed_flights: bool = True
     spoof_v2_sil0_pct: float = 10.0
     spoof_min_v2_samples: int = 25

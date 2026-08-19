@@ -13,6 +13,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from adsbtrack.config import Config
 from adsbtrack.db import Database
 from adsbtrack.events import collect_events
 from adsbtrack.models import Flight
@@ -377,4 +378,23 @@ def test_spoof_detector_dedupes_across_aggregators(tmp_path):
         db.commit()
         events = collect_events(db, "89618d", include_spoof_checks=True)
     spoof = [e for e in events if e.event_type == "spoof_bimodal_integrity"]
+    assert len(spoof) == 1
+
+
+def test_spoof_detector_threshold_follows_config_override(tmp_path):
+    """A7: the events detector's sil0-rate threshold must move with a
+    Config override, not stay pinned to a module-level constant.
+
+    5% sil0 is below the default 10% threshold (no event) but above a
+    Config(spoof_v2_sil0_pct=3.0) override (event fires).
+    """
+    db_path = tmp_path / "cfg_override.db"
+    samples = [_make_sample(2, 8, 3) for _ in range(95)] + [_make_sample(2, 0, 0) for _ in range(5)]
+    with Database(db_path) as db:
+        _insert_trace_day(db, "89618d", "2026-05-01", samples)
+        db.commit()
+        default_events = collect_events(db, "89618d", include_spoof_checks=True)
+        lowered_events = collect_events(db, "89618d", include_spoof_checks=True, config=Config(spoof_v2_sil0_pct=3.0))
+    assert [e for e in default_events if e.event_type == "spoof_bimodal_integrity"] == []
+    spoof = [e for e in lowered_events if e.event_type == "spoof_bimodal_integrity"]
     assert len(spoof) == 1

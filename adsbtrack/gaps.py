@@ -19,13 +19,12 @@ A gap-analysis tool that confidently mislabels is worse than none.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from typing import Any
 
 from .airports import haversine_km
 from .config import Config
-from .db import Database
+from .db import Database, iter_parsed_trace_days
 
 # ---------------------------------------------------------------------------
 # Types
@@ -232,16 +231,16 @@ def detect_gaps(
     if not rows:
         return []
 
-    # Flatten every trace_day row into (abs_ts, point_dict) tuples.
-    # Multiple source rows for the same date get merged here by simple
-    # concat + sort + dedup on (rounded ts, rounded lat, rounded lon);
-    # this is a lightweight version of parser._merge_trace_rows that
-    # skips the Config.dedup_* fine-tuning since we only need "same
-    # point within a second" detection.
+    # Flatten every trace_day row into (abs_ts, point_dict) tuples. Each
+    # row's trace_json is decoded once via db.iter_parsed_trace_days (the
+    # same seam parser.py and events.py use). Multiple source rows for the
+    # same date get merged here by simple concat + sort + dedup on
+    # (rounded ts, rounded lat, rounded lon); this is a lightweight version
+    # of parser._merge_trace_rows that skips the Config.dedup_* fine-tuning
+    # since we only need "same point within a second" detection.
     abs_points: list[tuple[float, dict[str, Any]]] = []
-    for row in rows:
+    for row, trace in iter_parsed_trace_days(rows):
         base_ts = row["timestamp"]
-        trace = json.loads(row["trace_json"])
         for raw_point in trace:
             pt = _extract_point_dict(raw_point)
             abs_points.append((base_ts + pt["ts_offset"], pt))

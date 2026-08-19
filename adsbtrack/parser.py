@@ -2,6 +2,7 @@ import contextlib
 import json
 import math
 import re
+import sqlite3
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime, timedelta
@@ -16,7 +17,7 @@ from .classifier import (
     score_confidence,
 )
 from .config import TYPE_CEILINGS, TYPE_MAX_GS, Config
-from .db import Database
+from .db import Database, iter_parsed_trace_days
 from .ils_alignment import IlsAlignmentResult, detect_all_ils_alignments
 from .landing_anchor import compute_landing_anchor
 from .models import Flight, LandingType
@@ -142,8 +143,13 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
     )
 
 
-def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set[str]]:
+def _merge_trace_rows(rows: list[tuple[sqlite3.Row, list]], config: Config) -> tuple[str, float, list, set[str]]:
     """Merge trace_day rows for the same date into a single sorted+deduped trace.
+
+    ``rows`` is a list of (row, parsed_trace) pairs -- the trace_json for
+    each row is already decoded by the caller (see db.iter_parsed_trace_days)
+    so a multi-source day's trace_json is parsed exactly once per extract,
+    not once here and once in the spoof-scoring pass.
 
     Converts relative offsets to absolute timestamps, concatenates (possibly
     across multiple sources), sorts, deduplicates (points within
@@ -159,13 +165,12 @@ def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set
 
     Returns (date, base_timestamp, merged_trace, source_names).
     """
-    source_names = {row["source"] for row in rows}
+    source_names = {row["source"] for row, _trace in rows}
 
     # Convert all points to absolute timestamps
     abs_points = []
-    for row in rows:
+    for row, trace in rows:
         base_ts = row["timestamp"]
-        trace = json.loads(row["trace_json"])
         for point in trace:
             abs_ts = base_ts + point[0]
             abs_points.append((abs_ts, point))
@@ -196,14 +201,14 @@ def _merge_trace_rows(rows: list, config: Config) -> tuple[str, float, list, set
         prev_lon = lon
 
     # Convert back to relative offsets from the earliest base timestamp
-    base_timestamp = min(row["timestamp"] for row in rows)
+    base_timestamp = min(row["timestamp"] for row, _trace in rows)
     result_trace = []
     for abs_ts, point in merged:
         new_point = list(point)
         new_point[0] = abs_ts - base_timestamp
         result_trace.append(new_point)
 
-    return rows[0]["date"], base_timestamp, result_trace, source_names
+    return rows[0][0]["date"], base_timestamp, result_trace, source_names
 
 
 def _stitch_fragments(
@@ -401,8 +406,15 @@ def _stitch_fragments(
 _EK_FLIGHTNUM_RE = re.compile(r"^EK\d+$")
 
 
-def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str, dict]:
+def pool_spoof_scores(parsed_rows: Iterable[tuple[sqlite3.Row, list]], config: Config) -> dict[str, dict]:
     """Return a per-date summary of bimodal-integrity spoof indicators.
+
+    ``parsed_rows`` is the output of db.iter_parsed_trace_days -- each
+    row's trace_json is already decoded, so pooling never re-parses JSON
+    the caller already parsed. This is the single scan shared by
+    parser.extract_flights (the rejection gate) and events._detect_spoof_events
+    (the opt-in event); it used to be two near-duplicate scans, one of them
+    hardcoding thresholds events.py couldn't override.
 
     Pool v2 samples across every aggregator that fetched the same date:
     the denominator is the union of v2 samples from all sources, the
@@ -415,6 +427,11 @@ def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str,
     every aggregator, so the rate holds up against dilution; a single
     aggregator's transient integrity-field glitch gets averaged out by
     the other sources.
+
+    Each flagged date also carries its earliest row timestamp and the set
+    of callsigns seen on v2 samples -- parser.extract_flights ignores
+    both, but events._detect_spoof_events needs them to build the
+    spoof_bimodal_integrity Event's ts/callsign without a second scan.
     """
     by_date: dict[str, dict] = defaultdict(
         lambda: {
@@ -423,18 +440,15 @@ def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str,
             "nic0": 0,
             "sources": set(),
             "source_rates": [],
+            "timestamp": None,
+            "callsigns": set(),
         }
     )
-    for row in trace_days:
-        try:
-            samples = json.loads(row["trace_json"])
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(samples, list):
-            continue
+    for row, samples in parsed_rows:
         src_v2 = 0
         src_sil0 = 0
         src_nic0 = 0
+        callsigns: set[str] = set()
         for s in samples:
             if not isinstance(s, list) or len(s) <= 8:
                 continue
@@ -446,6 +460,9 @@ def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str,
                 src_sil0 += 1
             if ac.get("nic") == 0:
                 src_nic0 += 1
+            flight = (ac.get("flight") or "").strip()
+            if flight:
+                callsigns.add(flight)
         if src_v2 == 0:
             continue
         agg = by_date[row["date"]]
@@ -454,6 +471,9 @@ def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str,
         agg["nic0"] += src_nic0
         agg["sources"].add(row["source"])
         agg["source_rates"].append((row["source"], round(100.0 * src_sil0 / src_v2, 2)))
+        agg["callsigns"] |= callsigns
+        if agg["timestamp"] is None:
+            agg["timestamp"] = row["timestamp"]
 
     flagged: dict[str, dict] = {}
     for date, agg in by_date.items():
@@ -469,6 +489,8 @@ def _compute_spoof_scores_by_date(trace_days: list, config: Config) -> dict[str,
             "v2_nic0_pct": 100.0 * agg["nic0"] / v2,
             "sources": sorted(agg["sources"]),
             "source_rates": sorted(agg["source_rates"]),
+            "timestamp": agg["timestamp"],
+            "callsigns": sorted(agg["callsigns"]),
         }
     return flagged
 
@@ -646,17 +668,22 @@ def extract_flights(db: Database, config: Config, hex_code: str, reprocess: bool
                 owner_operator = row["owner_operator"]
                 break
 
+    # Decode every row's trace_json exactly once. The parsed pairs feed
+    # both the spoof-scoring pass and the per-date merge below, instead of
+    # each pass calling json.loads on the same rows independently.
+    parsed_days = list(iter_parsed_trace_days(trace_days))
+
     # Compute per-date bimodal-integrity spoof scores up front so the
     # rejection step below can query without re-scanning trace_json.
     # Disabling reject_spoofed_flights skips the scan entirely.
     spoof_scores_by_date: dict[str, dict] = (
-        _compute_spoof_scores_by_date(list(trace_days), config) if config.reject_spoofed_flights else {}
+        pool_spoof_scores(parsed_days, config) if config.reject_spoofed_flights else {}
     )
 
     # Group by date and merge multi-source rows
-    by_date: dict[str, list] = defaultdict(list)
-    for row in trace_days:
-        by_date[row["date"]].append(row)
+    by_date: dict[str, list[tuple[sqlite3.Row, list]]] = defaultdict(list)
+    for row, trace in parsed_days:
+        by_date[row["date"]].append((row, trace))
 
     merged_days = []
     all_sources: set[str] = set()

@@ -10,16 +10,22 @@ flag on collect_events.
 Thresholds (`long hover >= 300s`, `multiple go-arounds >= 2`) are
 deliberately set to cut everyday noise: one go-around happens all the
 time, two in a row is a pattern worth looking at.
+
+The spoof detector's own thresholds (`Config.spoof_v2_sil0_pct`,
+`Config.spoof_min_v2_samples`) and its pooling scan live in
+`parser.pool_spoof_scores`, shared with the reject-in-extract gate in
+parser.py so there is one bimodal-integrity implementation, not two.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 
-from .db import Database
+from .config import Config
+from .db import Database, iter_parsed_trace_days
+from .parser import pool_spoof_scores
 
 # ---------------------------------------------------------------------------
 # Thresholds (centralized for audit)
@@ -27,20 +33,6 @@ from .db import Database
 
 _LONG_HOVER_SECS = 300  # 5 minutes; below this is approach-phase noise
 _MULTI_GO_AROUNDS = 2  # one missed approach per flight is routine
-
-# Bimodal-integrity spoof detector. Under ADS-B version 2, real aircraft
-# transponders almost never report sil=0 (the Source Integrity Level field
-# is >= 2 on production equipment). A populated broadcast with >= 10% of
-# v2 samples carrying sil=0 implies either two emitters on the same ICAO
-# (one realistic, one garbage) or a single spoofer that hardcoded the
-# integrity fields. Threshold empirically calibrated from the 2026-04
-# Strait-of-Hormuz Emirates A380 spoofs (25-50% v2_sil0 rate) vs. the
-# same airframes' legitimate 2025-12 flights (0-1.4%).
-_SPOOF_V2_SIL0_PCT = 10.0
-# Minimum number of v2 samples required on the day before the ratio is
-# trusted. Below this the variance dominates and we get false positives
-# on sparse days. A typical active flight day has >100 v2 samples.
-_SPOOF_MIN_V2_SAMPLES = 25
 
 
 # ---------------------------------------------------------------------------
@@ -64,15 +56,17 @@ class Event:
 # ---------------------------------------------------------------------------
 
 
-def _detect_spoof_events(db: Database, icao: str, since: datetime | None) -> list[Event]:
+def _detect_spoof_events(db: Database, icao: str, since: datetime | None, config: Config) -> list[Event]:
     """Scan stored trace_days for bimodal-integrity spoof signatures.
 
-    v2 samples are pooled across every aggregator that fetched the same
-    date so a single aggregator's transient integrity-field glitch does
-    not by itself produce an event; real spoofs hit every receiver that
-    could hear them. Emits one `spoof_bimodal_integrity` Event per date
-    when the pooled sil=0 share crosses `_SPOOF_V2_SIL0_PCT` on a date
-    with >= `_SPOOF_MIN_V2_SAMPLES` pooled v2 samples.
+    Decodes each row's trace_json once (db.iter_parsed_trace_days) and
+    pools v2 samples across every aggregator that fetched the same date
+    via parser.pool_spoof_scores, so a single aggregator's transient
+    integrity-field glitch does not by itself produce an event; real
+    spoofs hit every receiver that could hear them. Emits one
+    `spoof_bimodal_integrity` Event per date when the pooled sil=0 share
+    crosses `config.spoof_v2_sil0_pct` on a date with
+    >= `config.spoof_min_v2_samples` pooled v2 samples.
     """
     params: list[Any] = [icao]
     sql = "SELECT date, source, trace_json, timestamp FROM trace_days WHERE icao = ?"
@@ -81,68 +75,21 @@ def _detect_spoof_events(db: Database, icao: str, since: datetime | None) -> lis
         params.append(since.strftime("%Y-%m-%d"))
     sql += " ORDER BY date, source"
 
-    per_day: dict[str, dict[str, Any]] = {}
-    for row in db.conn.execute(sql, params).fetchall():
-        try:
-            samples = json.loads(row["trace_json"])
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(samples, list):
-            continue
-        src_v2 = 0
-        src_sil0 = 0
-        src_nic0 = 0
-        callsigns: set[str] = set()
-        for s in samples:
-            if not isinstance(s, list) or len(s) <= 8:
-                continue
-            ac = s[8]
-            if not isinstance(ac, dict) or ac.get("version") != 2:
-                continue
-            src_v2 += 1
-            if ac.get("sil") == 0:
-                src_sil0 += 1
-            if ac.get("nic") == 0:
-                src_nic0 += 1
-            flight = (ac.get("flight") or "").strip()
-            if flight:
-                callsigns.add(flight)
-        if src_v2 == 0:
-            continue
-        agg = per_day.setdefault(
-            row["date"],
-            {
-                "v2": 0,
-                "sil0": 0,
-                "nic0": 0,
-                "timestamp": row["timestamp"],
-                "sources": [],
-                "callsigns": set(),
-            },
-        )
-        agg["v2"] += src_v2
-        agg["sil0"] += src_sil0
-        agg["nic0"] += src_nic0
-        rate = round(100.0 * src_sil0 / src_v2, 2)
-        agg["sources"].append((row["source"], rate))
-        agg["callsigns"] |= callsigns
+    rows = db.conn.execute(sql, params).fetchall()
+    flagged = pool_spoof_scores(iter_parsed_trace_days(rows), config)
 
     events: list[Event] = []
-    for date_str, agg in sorted(per_day.items()):
-        v2 = agg["v2"]
-        if v2 < _SPOOF_MIN_V2_SAMPLES:
-            continue
-        sil_pct = 100.0 * agg["sil0"] / v2
-        if sil_pct < _SPOOF_V2_SIL0_PCT:
-            continue
-        base_ts = agg.get("timestamp")
+    for date_str, agg in sorted(flagged.items()):
+        base_ts = agg["timestamp"]
         if isinstance(base_ts, (int, float)):
             ts = datetime.fromtimestamp(base_ts, tz=UTC)
         else:
             ts = datetime.fromisoformat(date_str).replace(tzinfo=UTC)
-        callsigns = sorted(agg["callsigns"])
+        callsigns = agg["callsigns"]
         callsign = callsigns[0] if callsigns else None
-        source_names = sorted({src for src, _ in agg["sources"]})
+        source_names = agg["sources"]
+        v2 = agg["v2_samples"]
+        sil_pct = agg["v2_sil0_pct"]
         events.append(
             Event(
                 ts=ts,
@@ -157,10 +104,10 @@ def _detect_spoof_events(db: Database, icao: str, since: datetime | None) -> lis
                 context={
                     "date": date_str,
                     "sources": source_names,
-                    "source_rates": sorted(agg["sources"]),
+                    "source_rates": agg["source_rates"],
                     "v2_samples": v2,
                     "v2_sil0_pct": round(sil_pct, 2),
-                    "v2_nic0_pct": round(100.0 * agg["nic0"] / v2, 2),
+                    "v2_nic0_pct": round(agg["v2_nic0_pct"], 2),
                     "callsigns": callsigns,
                 },
             )
@@ -263,6 +210,7 @@ def collect_events(
     since: datetime | None = None,
     severity: str = "all",
     include_spoof_checks: bool = False,
+    config: Config | None = None,
 ) -> list[Event]:
     """Return a chronological (newest first) list of events for `icao`.
 
@@ -270,7 +218,9 @@ def collect_events(
     `since` filters to flights with takeoff_time >= the given datetime.
     `include_spoof_checks` toggles the bimodal-integrity trace scan; it
     defaults to False so historical queries do not retroactively tag
-    trace_days without an explicit opt-in.
+    trace_days without an explicit opt-in. `config` supplies the spoof
+    thresholds (spoof_v2_sil0_pct, spoof_min_v2_samples); defaults to
+    Config() when omitted.
     """
     params: list[Any] = [icao]
     sql = "SELECT * FROM flights WHERE icao = ?"
@@ -285,7 +235,7 @@ def collect_events(
         events.extend(_event_from_row(dict(row)))
 
     if include_spoof_checks:
-        events.extend(_detect_spoof_events(db, icao, since))
+        events.extend(_detect_spoof_events(db, icao, since, config or Config()))
 
     # Chronological (newest first) after merging spoof events into the
     # flight-derived list.

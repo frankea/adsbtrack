@@ -1218,6 +1218,44 @@ def test_extract_flights_pct_handles_all_mlat_flight():
     assert flight.adsb_pct == 0.0
 
 
+def test_extract_flights_parses_trace_json_once_per_row_with_spoof_checks():
+    """P5: even with reject_spoofed_flights on, extract_flights must decode
+    each trace_day row's trace_json exactly once. Previously the spoof
+    scoring pass and the merge pass each called json.loads independently,
+    doubling the parse cost on every extract."""
+    config = _make_config()
+    config.reject_spoofed_flights = True
+
+    def _day_trace(lat_offset):
+        return [
+            _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+            _make_trace_point(60, 40.0 + lat_offset, -74.0, 1000, gs=120),
+            _make_trace_point(600, 40.5, -74.5, "ground", gs=5),
+        ]
+
+    rows = [
+        _make_trace_row("2024-06-15", _ts("2024-06-15"), _day_trace(0.0)),
+        _make_trace_row("2024-06-16", _ts("2024-06-16"), _day_trace(0.1)),
+        _make_trace_row("2024-06-17", _ts("2024-06-17"), _day_trace(0.2)),
+    ]
+    db = _make_db_mock(rows)
+
+    real_loads = json.loads
+    calls: list = []
+
+    def _counting_loads(s, *a, **kw):
+        calls.append(s)
+        return real_loads(s, *a, **kw)
+
+    with (
+        patch("adsbtrack.db.json.loads", side_effect=_counting_loads),
+        patch("adsbtrack.parser.find_nearest_airport", return_value=None),
+    ):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert len(calls) == 3
+
+
 def test_extract_flights_uses_alt_min_anchor_for_destination():
     """Synthetic flight where the altitude minimum is near airport KA but
     the last observed trace point drifted close to airport KB. The

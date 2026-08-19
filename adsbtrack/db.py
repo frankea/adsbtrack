@@ -2,6 +2,7 @@ import contextlib
 import json
 import shutil
 import sqlite3
+from collections.abc import Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -681,6 +682,41 @@ def _migrate_add_v4_columns(conn: sqlite3.Connection):
     for col_name, col_type in stats_columns:
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(f"ALTER TABLE aircraft_stats ADD COLUMN {col_name} {col_type}")
+
+
+# ---------------------------------------------------------------------------
+# trace_json decoding
+# ---------------------------------------------------------------------------
+# Single seam for turning a stored trace_days row's trace_json column into
+# its parsed point-list. parser.py, gaps.py, and events.py all scan
+# trace_days rows and previously each ran its own json.loads over
+# row["trace_json"]; some call sites even parsed the same row twice within
+# one extract. Routing every caller through iter_parsed_trace_days means
+# each row's JSON is decoded exactly once per scan, and a future compressed
+# trace-storage format only has to change decode_trace_json.
+
+
+def decode_trace_json(raw_trace_json: str) -> list | None:
+    """Decode a trace_days.trace_json value into its point list.
+
+    Returns None (instead of raising) for malformed JSON or a payload that
+    isn't a list, so callers can skip a bad row rather than crash on it.
+    """
+    try:
+        parsed = json.loads(raw_trace_json)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, list) else None
+
+
+def iter_parsed_trace_days(rows: Iterable[sqlite3.Row]) -> Iterator[tuple[sqlite3.Row, list]]:
+    """Yield (row, parsed_trace) for each row, decoding trace_json exactly
+    once per row via decode_trace_json. Rows with malformed trace_json are
+    skipped."""
+    for row in rows:
+        parsed = decode_trace_json(row["trace_json"])
+        if parsed is not None:
+            yield row, parsed
 
 
 class Database:

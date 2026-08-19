@@ -22,7 +22,7 @@ uv sync
 uv run python -m adsbtrack.cli fetch --hex a66ad3 --start 2020-01-01
 ```
 
-Downloads daily traces, then auto-extracts flights. Options: `--source` (adsbx, adsbfi, airplaneslive, adsblol, theairtraffic, opensky), `--end`, `--rate`, `--db`, `--tail` (converts N-number to hex). Skips dates already fetched; omitting `--start` auto-resumes from the day after the last fetched day, or pass `--since-last` to require that behavior explicitly (errors if there's no fetch history yet). WAL mode lets multiple fetches run in parallel.
+Downloads daily traces, then auto-extracts flights. Options: `--source` (adsbx, adsbfi, airplaneslive, adsblol, theairtraffic, opensky, all), `--end`, `--rate`, `--concurrency`, `--db`, `--tail` (converts N-number to hex). Skips dates already fetched - days that only ever failed with retryable errors (403/429/5xx) do not count and are retried on the next run. Omitting `--start` auto-resumes from the day after the last fetched day, or pass `--since-last` to require that behavior explicitly (errors if there's no fetch history yet). WAL mode lets multiple fetches run in parallel.
 
 ### View statistics
 
@@ -209,7 +209,7 @@ Fetch from different networks for better coverage:
 uv run python -m adsbtrack.cli fetch --hex a66ad3 --source adsbfi --start 2020-01-01
 ```
 
-Traces from multiple sources are automatically merged during extraction.
+Traces from multiple sources are automatically merged during extraction. `--source all` fetches from every readsb source in parallel (plus OpenSky when credentials are configured), with one progress line per source and a per-source summary at the end.
 
 | Source | Flag | Notes |
 |--------|------|-------|
@@ -259,7 +259,7 @@ Backfills legacy `trace_days` rows written before the compressed trace storage a
 
 ## Configuration file
 
-`Config` thresholds (rate limits, match distances, endurance caps, etc.) can be overridden with a TOML file instead of editing `adsbtrack/config.py`. The CLI resolves the file in this order: an explicit path > `$ADSBTRACK_CONFIG` > `~/.config/adsbtrack/config.toml` > built-in defaults if none of those exist. Keys map 1:1 onto `Config` field names; an unrecognized key is rejected.
+`Config` thresholds (rate limits, match distances, endurance caps, etc.) can be overridden with a TOML file instead of editing `adsbtrack/config.py`. The CLI resolves the file in this order: an explicit path > `$ADSBTRACK_CONFIG` > `~/.config/adsbtrack/config.toml` > built-in defaults if none of those exist. Keys map 1:1 onto `Config` field names; an unrecognized key is rejected. Separately, every command's `--db` option honors `$ADSBTRACK_DB`, so you can point a shell at a database once instead of repeating the flag.
 
 ```toml
 # ~/.config/adsbtrack/config.toml
@@ -279,14 +279,14 @@ Detailed reference docs for contributors and analysts:
 ## Development
 
 ```
-uv sync --extra dev
+uv sync --extra dev --extra tui --extra mcp
 uv run pytest
 uv run ruff check .
 uv run ruff format .
 uv run mypy adsbtrack
 ```
 
-CI runs on push and pull requests (Python 3.12 and 3.13).
+The `tui` and `mcp` extras are needed to run the full test suite (the Textual Pilot smoke tests and MCP server tests skip or fail without them); CI installs all three extras and runs on push and pull requests (Python 3.12 and 3.13).
 
 ## Notes
 

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import DataTable, Input
+from textual.worker import Worker, WorkerState
 
+from ...db import Database
 from ..queries import FlightRow, list_flights
 from ..widgets import (
     ACCENT_AMBER,
@@ -97,6 +101,15 @@ def _flight_matches(row: FlightRow, needle_low: str) -> bool:
     )
 
 
+@dataclass(frozen=True)
+class _FlightsResult:
+    """Everything the worker fetched, applied to the UI on the event loop."""
+
+    icao: str
+    rows: list[FlightRow]
+    reg_desc: str
+
+
 class FlightsView(Vertical):
     """Reverse-chronological flight list for one aircraft."""
 
@@ -141,27 +154,54 @@ class FlightsView(Vertical):
         self.refresh_data()
 
     def refresh_data(self) -> None:
-        """Query flights for the current aircraft and cache them.
+        """Kick off a background worker to query flights for the current aircraft.
 
         This is the only path that re-queries the DB; the filter bar
         re-filters the cached ``self._rows`` via ``_apply_filter`` without
-        touching the DB again (Task 14).
+        touching the DB again (Task 14). The query itself runs off the
+        event loop in ``_fetch_flights`` (Task 15); results land back here
+        via ``on_worker_state_changed``.
         """
-        db = self.app.db
         if self._icao is None:
             self._rows = []
             self._apply_filter("")
             self._header.set_crumb("select an aircraft first")
             self._header.set_trailing("")
             return
+        self.loading = True
+        self._fetch_flights(self._icao)
 
-        self._rows = list_flights(db, self._icao)
-        total_hours = sum((r.duration_minutes or 0) for r in self._rows) / 60
-        reg_desc = self._registry_line(self._icao)
-        self._header.set_title(self._icao)
-        self._header.set_crumb(reg_desc)
-        self._header.set_trailing(f"{len(self._rows):,} flights / {total_hours:,.1f} hrs")
-        self._apply_filter("")
+    @work(thread=True, exclusive=True, group="flights")
+    def _fetch_flights(self, icao: str) -> _FlightsResult:
+        """Run the flight + registry queries on a worker's own connection.
+
+        Must not touch ``self.app.db`` (the main-thread connection) or any
+        widget -- only DB reads and pure computation happen here.
+        """
+        db = self.app.db_factory()
+        try:
+            rows = list_flights(db, icao)
+            reg_desc = self._registry_line(db, icao)
+        finally:
+            db.close()
+        return _FlightsResult(icao=icao, rows=rows, reg_desc=reg_desc)
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "_fetch_flights":
+            return
+        if event.state == WorkerState.SUCCESS:
+            result = event.worker.result
+            assert result is not None  # a SUCCESS worker always has a result
+            self._rows = result.rows
+            total_hours = sum((r.duration_minutes or 0) for r in self._rows) / 60
+            self._header.set_title(result.icao)
+            self._header.set_crumb(result.reg_desc)
+            self._header.set_trailing(f"{len(self._rows):,} flights / {total_hours:,.1f} hrs")
+            self._apply_filter("")
+            self.loading = False
+        elif event.state == WorkerState.ERROR:
+            self.loading = False
+            self.app.notify(f"failed to load flights: {event.worker.error}", severity="error")
 
     def _apply_filter(self, needle: str) -> None:
         rows = filter_flights(self._rows, needle)
@@ -191,9 +231,9 @@ class FlightsView(Vertical):
 
     # --- helpers ---
 
-    def _registry_line(self, icao: str) -> str:
+    def _registry_line(self, db: Database, icao: str) -> str:
         try:
-            row = self.app.db.conn.execute(
+            row = db.conn.execute(
                 "SELECT registration, type_code, description FROM aircraft_registry WHERE icao = ?",
                 (icao,),
             ).fetchone()

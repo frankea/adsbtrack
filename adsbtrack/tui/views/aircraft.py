@@ -5,10 +5,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.message import Message
 from textual.widgets import DataTable, Input
+from textual.worker import Worker, WorkerState
 
 from ..queries import AircraftRow, list_aircraft
 from ..widgets import (
@@ -120,15 +122,40 @@ class AircraftView(Vertical):
     # --- public API ---
 
     def refresh_data(self) -> None:
-        """Query the full aircraft list and cache it.
+        """Kick off a background worker to query the full aircraft list.
 
         This is the only path that re-queries the DB; the filter bar
         re-filters the cached ``self._rows`` via ``_apply_filter`` without
-        touching the DB again (Task 14).
+        touching the DB again (Task 14). The query itself runs off the
+        event loop in ``_fetch_aircraft`` (Task 15); results land back
+        here via ``on_worker_state_changed``.
         """
-        db = self.app.db
-        self._rows = list_aircraft(db)
-        self._apply_filter("")
+        self.loading = True
+        self._fetch_aircraft()
+
+    @work(thread=True, exclusive=True, group="aircraft")
+    def _fetch_aircraft(self) -> list[AircraftRow]:
+        """Run the aircraft-list query on a worker's own connection.
+
+        Must not touch ``self.app.db`` (the main-thread connection) or any
+        widget -- only DB reads happen here.
+        """
+        db = self.app.db_factory()
+        try:
+            return list_aircraft(db)
+        finally:
+            db.close()
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "_fetch_aircraft":
+            return
+        if event.state == WorkerState.SUCCESS:
+            self._rows = event.worker.result or []
+            self._apply_filter("")
+            self.loading = False
+        elif event.state == WorkerState.ERROR:
+            self.loading = False
+            self.app.notify(f"failed to load aircraft: {event.worker.error}", severity="error")
 
     def _apply_filter(self, needle: str) -> None:
         rows = filter_aircraft(self._rows, needle)

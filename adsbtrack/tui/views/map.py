@@ -26,12 +26,15 @@ from collections import Counter
 from dataclasses import dataclass
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widget import Widget
+from textual.worker import Worker, WorkerState
 
 from ...airports import find_nearest_airport
 from ...config import Config
+from ...db import Database
 from ..braille import BrailleCanvas
 from ..queries import TracePoint, distinct_dates_for_icao, load_trace_points
 from ..widgets import (
@@ -83,6 +86,17 @@ class _MapCtx:
     date: str | None
     start_label: str
     end_label: str
+
+
+@dataclass(frozen=True)
+class _MapLoadResult:
+    """Everything the worker fetched, applied to the UI on the event loop."""
+
+    icao: str
+    date: str | None
+    ctx: _MapCtx | None
+    crumb: str
+    trailing: str
 
 
 # ---------------------------------------------------------------------------
@@ -450,42 +464,71 @@ class MapView(Vertical):
         self.refresh_data()
 
     def refresh_data(self) -> None:
+        """Kick off a background worker to load the trace + build the map context.
+
+        The query itself runs off the event loop in ``_fetch_map`` (Task 15);
+        the result lands back here via ``on_worker_state_changed``.
+        """
         if self._icao is None:
             self._canvas.set_context(None)
             self._header.set_crumb("select an aircraft first")
             self._header.set_trailing("")
             return
-        if self._date is None:
-            dates = distinct_dates_for_icao(self.app.db, self._icao)
-            if not dates:
-                self._canvas.set_context(None)
-                self._header.set_title(self._icao)
-                self._header.set_crumb("no trace data")
-                self._header.set_trailing("")
-                return
-            self._date = dates[0]
-        points = load_trace_points(self.app.db, self._icao, self._date)
-        if not points:
-            self._canvas.set_context(None)
-            self._header.set_title(self._icao)
-            self._header.set_crumb(f"map / {self._date} (no trace points)")
-            self._header.set_trailing("")
-            return
-        start_label = self._airport_or_coords(points[0])
-        end_label = self._airport_or_coords(points[-1])
-        self._canvas.set_context(_MapCtx(points=points, date=self._date, start_label=start_label, end_label=end_label))
-        lats = [p.lat for p in points]
-        lons = [p.lon for p in points]
-        self._header.set_title(self._icao)
-        self._header.set_crumb(f"map / {self._date}   {start_label} > {end_label}")
-        self._header.set_trailing(
-            f"{len(points):,} points   bbox ({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
-        )
+        self.loading = True
+        self._fetch_map(self._icao, self._date)
 
-    def _airport_or_coords(self, point: TracePoint) -> str:
+    @work(thread=True, exclusive=True, group="map")
+    def _fetch_map(self, icao: str, date: str | None) -> _MapLoadResult:
+        """Run the date-resolution + trace-point queries on a worker's own connection.
+
+        Must not touch ``self.app.db`` (the main-thread connection) or any
+        widget -- only DB reads and pure computation happen here.
+        """
+        db = self.app.db_factory()
+        try:
+            if date is None:
+                dates = distinct_dates_for_icao(db, icao)
+                if not dates:
+                    return _MapLoadResult(icao=icao, date=None, ctx=None, crumb="no trace data", trailing="")
+                date = dates[0]
+            points = load_trace_points(db, icao, date)
+            if not points:
+                return _MapLoadResult(
+                    icao=icao, date=date, ctx=None, crumb=f"map / {date} (no trace points)", trailing=""
+                )
+            start_label = self._airport_or_coords(db, points[0])
+            end_label = self._airport_or_coords(db, points[-1])
+            ctx = _MapCtx(points=points, date=date, start_label=start_label, end_label=end_label)
+            lats = [p.lat for p in points]
+            lons = [p.lon for p in points]
+            crumb = f"map / {date}   {start_label} > {end_label}"
+            trailing = (
+                f"{len(points):,} points   bbox ({min(lats):.3f},{min(lons):.3f})-({max(lats):.3f},{max(lons):.3f})"
+            )
+            return _MapLoadResult(icao=icao, date=date, ctx=ctx, crumb=crumb, trailing=trailing)
+        finally:
+            db.close()
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "_fetch_map":
+            return
+        if event.state == WorkerState.SUCCESS:
+            result = event.worker.result
+            assert result is not None  # a SUCCESS worker always has a result
+            self._date = result.date
+            self._canvas.set_context(result.ctx)
+            self._header.set_title(result.icao)
+            self._header.set_crumb(result.crumb)
+            self._header.set_trailing(result.trailing)
+            self.loading = False
+        elif event.state == WorkerState.ERROR:
+            self.loading = False
+            self.app.notify(f"failed to load map: {event.worker.error}", severity="error")
+
+    def _airport_or_coords(self, db: Database, point: TracePoint) -> str:
         """Return the nearest airport ident, or a lat/lon fallback."""
         try:
-            match = find_nearest_airport(self.app.db, point.lat, point.lon, Config())
+            match = find_nearest_airport(db, point.lat, point.lon, Config())
         except Exception:
             match = None
         if match and match.ident:

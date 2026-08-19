@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any
+
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import Static
+from textual.worker import Worker, WorkerState
 
 from ..queries import status_snapshot
 from ..widgets import (
@@ -17,6 +22,14 @@ from ..widgets import (
     FG_2,
     PageHeader,
 )
+
+
+@dataclass(frozen=True)
+class _StatusResult:
+    """Everything the worker fetched, applied to the UI on the event loop."""
+
+    icao: str
+    snap: dict[str, Any]
 
 
 class StatusView(Vertical):
@@ -37,15 +50,45 @@ class StatusView(Vertical):
         self.refresh_data()
 
     def refresh_data(self) -> None:
+        """Kick off a background worker to build the status snapshot.
+
+        The query itself runs off the event loop in ``_fetch_status``
+        (Task 15); the result lands back here via ``on_worker_state_changed``.
+        """
         if self._icao is None:
             self._body.update(f"[{FG_2}]no aircraft selected. press 1 and pick one.[/]")
             self._header.set_crumb("select an aircraft first")
             return
-        snap = status_snapshot(self.app.db, self._icao)
-        self._header.set_title(self._icao)
-        self._header.set_crumb("status")
-        self._header.set_trailing("")
-        self._body.update(self._build_body(snap))
+        self.loading = True
+        self._fetch_status(self._icao)
+
+    @work(thread=True, exclusive=True, group="status")
+    def _fetch_status(self, icao: str) -> _StatusResult:
+        """Run the status-snapshot query on a worker's own connection.
+
+        Must not touch ``self.app.db`` (the main-thread connection) or any
+        widget -- only DB reads happen here.
+        """
+        db = self.app.db_factory()
+        try:
+            return _StatusResult(icao=icao, snap=status_snapshot(db, icao))
+        finally:
+            db.close()
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "_fetch_status":
+            return
+        if event.state == WorkerState.SUCCESS:
+            result = event.worker.result
+            assert result is not None  # a SUCCESS worker always has a result
+            self._header.set_title(result.icao)
+            self._header.set_crumb("status")
+            self._header.set_trailing("")
+            self._body.update(self._build_body(result.snap))
+            self.loading = False
+        elif event.state == WorkerState.ERROR:
+            self.loading = False
+            self.app.notify(f"failed to load status: {event.worker.error}", severity="error")
 
     def _build_body(self, snap: dict) -> str:
         """Render the dashboard body markup. Renamed from ``_render`` to

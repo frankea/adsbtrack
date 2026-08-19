@@ -73,6 +73,18 @@ class AdsbtrackApp(App):
             self._db = Database(self._db_path)
         return self._db
 
+    def db_factory(self) -> Database:
+        """Open a fresh ``Database`` connection over the same path.
+
+        sqlite3 connections are thread-bound (``check_same_thread=True``
+        by default), so worker threads must never touch ``self.db`` --
+        the main-thread connection used for rendering. Views call this
+        from inside a ``@work(thread=True)`` method to get their own
+        connection and must close it when the worker is done. WAL mode
+        (db.py) lets this run concurrently with the main-thread reads.
+        """
+        return Database(self._db_path)
+
     def on_mount(self) -> None:
         flights_n, aircraft_n = 0, 0
         with contextlib.suppress(Exception):

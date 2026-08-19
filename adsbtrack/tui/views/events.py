@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
 from rich.text import Text
+from textual import work
 from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.widgets import DataTable, Input
+from textual.worker import Worker, WorkerState
 
 from ..queries import list_events
 from ..widgets import (
@@ -59,6 +62,15 @@ def _event_matches(event: Any, needle_low: str) -> bool:
     return False
 
 
+@dataclass(frozen=True)
+class _EventsResult:
+    """Everything the worker fetched, applied to the UI on the event loop."""
+
+    icao: str | None
+    rows: list[Any]
+    counts: dict[str, int]
+
+
 class EventsView(Vertical):
     """Chronological event stream, optionally scoped to one ICAO."""
 
@@ -96,27 +108,56 @@ class EventsView(Vertical):
         self.refresh_data()
 
     def refresh_data(self) -> None:
-        """Query events for the current scope and cache them.
+        """Kick off a background worker to query events for the current scope.
 
         This is the only path that re-queries the DB; the filter bar
         re-filters the cached ``self._rows`` via ``_apply_filter`` without
-        touching the DB again (Task 14).
+        touching the DB again (Task 14). The query itself runs off the
+        event loop in ``_fetch_events`` (Task 15); results land back here
+        via ``on_worker_state_changed``.
         """
-        db = self.app.db
-        self._rows = list_events(db, self._icao, include_spoof_checks=True)
+        self.loading = True
+        self._fetch_events(self._icao)
+
+    @work(thread=True, exclusive=True, group="events")
+    def _fetch_events(self, icao: str | None) -> _EventsResult:
+        """Run the event query on a worker's own connection (thread-bound).
+
+        Must not touch ``self.app.db`` (the main-thread connection) or any
+        widget -- only DB reads and pure computation happen here.
+        """
+        db = self.app.db_factory()
+        try:
+            rows = list_events(db, icao, include_spoof_checks=True)
+        finally:
+            db.close()
         counts = {"emergency": 0, "unusual": 0, "spoof": 0}
-        for e in self._rows:
+        for e in rows:
             if e.event_type.startswith("spoof"):
                 counts["spoof"] += 1
             elif e.severity == "emergency":
                 counts["emergency"] += 1
             else:
                 counts["unusual"] += 1
-        self._header.set_crumb("all aircraft" if self._icao is None else self._icao)
-        self._header.set_trailing(
-            f"emergency {counts['emergency']}   unusual {counts['unusual']}   spoof {counts['spoof']}"
-        )
-        self._apply_filter("")
+        return _EventsResult(icao=icao, rows=rows, counts=counts)
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "_fetch_events":
+            return
+        if event.state == WorkerState.SUCCESS:
+            result = event.worker.result
+            assert result is not None  # a SUCCESS worker always has a result
+            self._rows = result.rows
+            self._header.set_crumb("all aircraft" if result.icao is None else result.icao)
+            self._header.set_trailing(
+                f"emergency {result.counts['emergency']}   unusual {result.counts['unusual']}   "
+                f"spoof {result.counts['spoof']}"
+            )
+            self._apply_filter("")
+            self.loading = False
+        elif event.state == WorkerState.ERROR:
+            self.loading = False
+            self.app.notify(f"failed to load events: {event.worker.error}", severity="error")
 
     def _apply_filter(self, needle: str) -> None:
         rows = filter_events(self._rows, needle)

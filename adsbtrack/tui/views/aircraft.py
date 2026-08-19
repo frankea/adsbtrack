@@ -93,6 +93,7 @@ class AircraftView(Vertical):
             crumb="all (-)",
             trailing=Text.from_markup(f"[{FG_2}]sort:[/] [{ACCENT_CYAN}]last_seen ↓[/]"),
             widget_id="aircraft-header",
+            crumb_prefix="›",
         )
         self._filter = FilterBar(
             placeholder="filter (fzf)   e.g.  pc-12  or  N512  or  ae6",

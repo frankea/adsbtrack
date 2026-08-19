@@ -55,6 +55,7 @@ class SpoofView(Vertical):
             crumb="bimodal integrity audit",
             trailing=f"threshold v2_sil0 ≥ 10% {DOT} min 25 samples",
             widget_id="spoof-header",
+            crumb_prefix="›",
         )
         self._filter = FilterBar(
             placeholder="filter rejected broadcasts",

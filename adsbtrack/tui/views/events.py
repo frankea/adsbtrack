@@ -93,6 +93,7 @@ class EventsView(Vertical):
             "events",
             crumb="all aircraft",
             widget_id="events-header",
+            crumb_prefix="›",
         )
         self._filter = FilterBar(
             placeholder="filter events (type:emergency, icao:ae, since:3d)",

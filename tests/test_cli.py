@@ -1627,6 +1627,45 @@ def test_fetch_cli_omits_failed_days_header_when_empty(tmp_path, monkeypatch):
     assert "Failed days" not in result.output
 
 
+def _capture_fetch_calls(monkeypatch, tmp_path):
+    """Shared fetch_traces/fetch_traces_opensky stub for the --source all
+    tests below (resume, health, and this stats/progress test). Records
+    (source, start, end) for every call instead of the summary stats --
+    most consumers care about which window each source was given.
+
+    Pins opensky availability deterministically OFF, not just tolerantly
+    safe: the fetch command's opensky-availability check first looks at
+    the OPENSKY_CLIENT_ID/SECRET env vars, then falls back to reading
+    config.credentials_path (a relative "credentials.json" resolved
+    against the CWD). Without pinning, a checkout that happens to carry a
+    real credentials.json at its root flips opensky_available True, adds
+    a 6th source to sources_to_fetch, and breaks every test here that
+    asserts an exact call count or exact source set -- green on a clean
+    checkout, red on one with real OpenSky creds. chdir'ing into tmp_path
+    guarantees no credentials.json is resolvable, and clearing the env
+    vars closes the other half of the check, so every consumer sees a
+    deterministic 5-readsb-source world regardless of host environment.
+    fetch_traces_opensky is still stubbed too, as a belt-and-suspenders
+    guard against a live network call if opensky ever does activate."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
+
+    calls: list[tuple[str, date, date]] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
+        calls.append((source, start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    def fake_fetch_traces_opensky(db, config, hex_code, start, end):
+        calls.append(("opensky", start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    monkeypatch.setattr("adsbtrack.cli.fetch_traces", fake_fetch_traces)
+    monkeypatch.setattr("adsbtrack.cli.fetch_traces_opensky", fake_fetch_traces_opensky)
+    return calls
+
+
 def test_fetch_cli_source_all_prints_per_source_stats(tmp_path, monkeypatch):
     """`fetch --source all` fans out to every readsb source in its own thread.
     Each source must get its own stats line in the summary (not just the
@@ -1643,11 +1682,25 @@ def test_fetch_cli_source_all_prints_per_source_stats(tmp_path, monkeypatch):
     }
     seen_progress_objects = []
 
+    # This test needs per-source-distinguishing return values and progress-
+    # object tracking that the shared _capture_fetch_calls stub doesn't
+    # provide, so it keeps its own inline fake_fetch_traces -- but still
+    # needs the same hermeticity guards _capture_fetch_calls applies, since
+    # a real credentials.json at the repo root would otherwise let
+    # fetch_traces_opensky (unmocked here) make a live network call.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
+
     def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx", progress=None):
         seen_progress_objects.append(progress)
         return per_source_returns[source]
 
+    def fake_fetch_traces_opensky(db, config, hex_code, start, end):
+        raise AssertionError("opensky should not be available in this hermetic test")
+
     monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+    monkeypatch.setattr(cli_module, "fetch_traces_opensky", fake_fetch_traces_opensky)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:
@@ -1778,15 +1831,7 @@ def test_fetch_cli_source_all_resumes_each_source_from_its_own_history(tmp_path,
     (403) fetch_log rows counts as having no history, and a source with
     zero fetch_log rows resumes from the earliest peer's start (so it can
     catch up) instead of erroring the whole command."""
-    from adsbtrack import cli as cli_module
-
-    calls: list[tuple[str, date, date]] = []
-
-    def fake_fetch_traces(db, config, hex_code, start, end, *, source="adsbx", progress=None):
-        calls.append((source, start, end))
-        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
-
-    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:
@@ -1825,45 +1870,6 @@ def test_fetch_cli_source_all_resumes_each_source_from_its_own_history(tmp_path,
     # instead of a single uniform "Resuming from ..." message.
     assert "adsbx: from 2026-05-06" in result.output
     assert "adsbfi: from 2026-05-02" in result.output
-
-
-def _capture_fetch_calls(monkeypatch, tmp_path):
-    """Shared fetch_traces/fetch_traces_opensky stub for the per-source
-    resume and health tests below. Records (source, start, end) for every
-    call instead of the summary stats -- these tests care about which
-    window each source was given.
-
-    Pins opensky availability deterministically OFF, not just tolerantly
-    safe: the fetch command's opensky-availability check first looks at
-    the OPENSKY_CLIENT_ID/SECRET env vars, then falls back to reading
-    config.credentials_path (a relative "credentials.json" resolved
-    against the CWD). Without pinning, a checkout that happens to carry a
-    real credentials.json at its root flips opensky_available True, adds
-    a 6th source to sources_to_fetch, and breaks every test here that
-    asserts an exact call count or exact source set -- green on a clean
-    checkout, red on one with real OpenSky creds. chdir'ing into tmp_path
-    guarantees no credentials.json is resolvable, and clearing the env
-    vars closes the other half of the check, so every consumer sees a
-    deterministic 5-readsb-source world regardless of host environment.
-    fetch_traces_opensky is still stubbed too, as a belt-and-suspenders
-    guard against a live network call if opensky ever does activate."""
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
-    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
-
-    calls: list[tuple[str, date, date]] = []
-
-    def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
-        calls.append((source, start, end))
-        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
-
-    def fake_fetch_traces_opensky(db, config, hex_code, start, end):
-        calls.append(("opensky", start, end))
-        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
-
-    monkeypatch.setattr("adsbtrack.cli.fetch_traces", fake_fetch_traces)
-    monkeypatch.setattr("adsbtrack.cli.fetch_traces_opensky", fake_fetch_traces_opensky)
-    return calls
 
 
 def test_source_all_resumes_each_source_from_its_own_history(tmp_path, monkeypatch):

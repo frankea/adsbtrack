@@ -1827,21 +1827,30 @@ def test_fetch_cli_source_all_resumes_each_source_from_its_own_history(tmp_path,
     assert "adsbfi: from 2026-05-02" in result.output
 
 
-def _capture_fetch_calls(monkeypatch):
+def _capture_fetch_calls(monkeypatch, tmp_path):
     """Shared fetch_traces/fetch_traces_opensky stub for the per-source
     resume and health tests below. Records (source, start, end) for every
     call instead of the summary stats -- these tests care about which
     window each source was given.
 
-    Also stubs fetch_traces_opensky, not just fetch_traces: the fetch
-    command's opensky-availability check falls back to reading
-    config.credentials_path (a relative "credentials.json" in the CWD) when
-    the OPENSKY_CLIENT_ID/SECRET env vars aren't set. On a machine (or repo
-    checkout) where that file happens to exist with real-looking
-    credentials, opensky_available flips True and an unmocked
-    fetch_traces_opensky would make a live network call from inside these
-    tests. Stubbing both here, in one place, keeps every consumer hermetic
-    regardless of host credentials."""
+    Pins opensky availability deterministically OFF, not just tolerantly
+    safe: the fetch command's opensky-availability check first looks at
+    the OPENSKY_CLIENT_ID/SECRET env vars, then falls back to reading
+    config.credentials_path (a relative "credentials.json" resolved
+    against the CWD). Without pinning, a checkout that happens to carry a
+    real credentials.json at its root flips opensky_available True, adds
+    a 6th source to sources_to_fetch, and breaks every test here that
+    asserts an exact call count or exact source set -- green on a clean
+    checkout, red on one with real OpenSky creds. chdir'ing into tmp_path
+    guarantees no credentials.json is resolvable, and clearing the env
+    vars closes the other half of the check, so every consumer sees a
+    deterministic 5-readsb-source world regardless of host environment.
+    fetch_traces_opensky is still stubbed too, as a belt-and-suspenders
+    guard against a live network call if opensky ever does activate."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
+
     calls: list[tuple[str, date, date]] = []
 
     def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
@@ -1860,7 +1869,7 @@ def _capture_fetch_calls(monkeypatch):
 def test_source_all_resumes_each_source_from_its_own_history(tmp_path, monkeypatch):
     """Two sources with different histories resume from their own last
     fetched day, not a single date reduced across every source (#19)."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     today = date.today()
     adsbx_last = today - timedelta(days=10)
@@ -1894,7 +1903,7 @@ def test_source_all_clamps_dead_source_to_lookback(tmp_path, monkeypatch):
     The output warns which source was clamped and how to override it."""
     from adsbtrack.config import Config
 
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     today = date.today()
     lookback = Config().resume_max_lookback_days
@@ -1933,7 +1942,7 @@ def test_single_source_resume_never_clamped(tmp_path, monkeypatch):
     """A single named source (not 'all') is explicit user intent, so its
     resume start is never clamped by resume_max_lookback_days -- even
     across a gap of hundreds of days."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     today = date.today()
     adsblol_last = today - timedelta(days=300)
@@ -1960,7 +1969,7 @@ def test_explicit_start_overrides_per_source_resume(tmp_path, monkeypatch):
     """`fetch --source all --start <date>` uses that date for every source
     verbatim, ignoring per-source history and the lookback clamp entirely --
     an explicit --start is user intent."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     today = date.today()
     # Seed history that would otherwise drive a clamp, to prove --start wins.
@@ -2002,7 +2011,7 @@ def test_source_with_no_history_uses_earliest_peer_start(tmp_path, monkeypatch):
     """A readsb source with no fetch history under --source all starts from
     the same date as the earliest peer's resume start, so it can catch up
     instead of defaulting to the Jan-1-last-year fallback."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     today = date.today()
     adsbx_last = today - timedelta(days=10)
@@ -2094,7 +2103,7 @@ def test_source_all_skips_unhealthy_source(tmp_path, monkeypatch):
     source_health_skip_threshold (20) day-requests were all retryable
     failures (403/429/5xx), instead of burning a full backoff ladder on a
     source known to be sick. The other (healthy) readsb sources still run."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:
@@ -2133,7 +2142,7 @@ def test_source_all_skips_unhealthy_source(tmp_path, monkeypatch):
 def test_include_unhealthy_forces_sick_source(tmp_path, monkeypatch):
     """--include-unhealthy overrides the health skip, forcing the sick
     source back into the fetch."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:
@@ -2171,7 +2180,7 @@ def test_include_unhealthy_forces_sick_source(tmp_path, monkeypatch):
 def test_named_single_source_never_health_skipped(tmp_path, monkeypatch):
     """A named single source (not 'all') is explicit user intent, so it
     always runs regardless of its recent health history."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:
@@ -2209,7 +2218,7 @@ def test_all_sources_unhealthy_falls_back_to_unfiltered(tmp_path, monkeypatch):
     anyway, with a warning instead of a skip."""
     from adsbtrack.config import SOURCE_URLS
 
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:
@@ -2247,7 +2256,7 @@ def test_retention_note_printed_for_old_window(tmp_path, monkeypatch):
     """theairtraffic's observed ~90-day archive retention (source_retention_days)
     gets annotated when a fetch's start predates that window, so a 404 out
     there reads as "probably expired" rather than "aircraft not seen"."""
-    calls = _capture_fetch_calls(monkeypatch)
+    calls = _capture_fetch_calls(monkeypatch, tmp_path)
 
     db_path = tmp_path / "fetch.db"
     with Database(db_path) as db:

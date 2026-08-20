@@ -376,13 +376,16 @@ class Config:
 
     # Flight-scoped gate (issue #22). Day-scoped rejection quarantined real
     # flights that merely transited GPS-jamming corridors on days that also
-    # carried ghost broadcasts (A6-EUY 2026-05-19: real DXB-DUS leg ~18-25%
-    # sil0 vs ghost fragments 87-100% sil0 at 1,000+ kt implied speed).
-    # Reject a flight when its own sil0 share >= spoof_flight_sil0_hard_pct,
-    # OR when it is >= spoof_v2_sil0_pct AND the flight contains an inter-fix
-    # jump faster than spoof_teleport_speed_kt (no aircraft in this DB's
-    # scope sustains 900 kt over ground; Hormuz-style 25-50% sil0 spoofs
-    # teleport, jammed-but-real flights do not).
+    # carried ghost broadcasts. Reject a flight when its own sil0 share >=
+    # spoof_flight_sil0_hard_pct, OR when it is >= spoof_v2_sil0_pct AND the
+    # flight contains an inter-fix jump faster than spoof_teleport_speed_kt
+    # (no aircraft in this DB's scope sustains 900 kt over ground;
+    # Hormuz-style 25-50% sil0 spoofs teleport, jammed-but-real flights with
+    # physically plausible positions do not). A6-EUY's 2026-05-19 outbound
+    # DXB-DUS leg is the counter-example, not a pass case: moderate sil0
+    # (21.27%) AND a 1,684 kt implied jump, so it quarantines -- its jammed
+    # GPS genuinely teleported. Its same-day return legs (near-zero sil0,
+    # physical speeds) extract normally.
     spoof_flight_sil0_hard_pct: float = 60.0
     spoof_teleport_speed_kt: float = 900.0
 

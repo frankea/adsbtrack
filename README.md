@@ -229,6 +229,32 @@ Traces from multiple sources are automatically merged during extraction. `--sour
 | [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
 
+## Watching a hex list
+
+Run a lightweight fetch/extract/alert cycle over a list of hexes, meant to be driven by cron:
+
+```
+uv run python -m adsbtrack.cli watch --hex a66ad3 --hex adf64f
+```
+
+Each run fetches from every healthy readsb source, extracts, then compares the aircraft's state before and after the run. Three things fire an alert: an aircraft going quiet for `watch_dormancy_days` (default 30) and then reappearing, a new flight carrying an emergency squawk (7500/7600/7700) or the `had_emergency` flag, and a new row landing in `spoofed_broadcasts`. An aircraft's very first `watch` run only records a baseline and fires nothing - without that, backfilling years of history on the first pass would read as one giant reactivation alert.
+
+`--watchlist <path>` reads one hex per line from a file and unions it with any `--hex` flags (duplicates deduped); blank lines and `#` comments are ignored:
+
+```
+# rotating watchlist
+a66ad3   # G650 tail N512WB
+adf64f
+```
+
+Exit code is `2` when any alert fired, `0` otherwise, so a cron entry only needs to react to failure:
+
+```
+*/15 * * * * adsbtrack watch --watchlist ~/.config/adsbtrack/watchlist.txt --webhook https://ntfy.sh/mytopic
+```
+
+`--webhook <url>` POSTs the run's alerts as JSON to that URL, but only when at least one fired. `--dormancy-days N` overrides the reactivation threshold for one run. `--json` prints a single machine-readable document (`generated_at`, `alerts`, per-hex `hexes` status) instead of the status lines and table.
+
 ## Interactive surfaces
 
 ### Terminal UI

@@ -394,6 +394,10 @@ class Config:
     # signal this exists for; routine overnight gaps must not fire it.
     watch_dormancy_days: int = 30
 
+    # watch --webhook: POST timeout. A hung alert receiver must not wedge a
+    # cron-driven watch run.
+    watch_webhook_timeout_secs: float = 10.0
+
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km

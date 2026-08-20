@@ -15,6 +15,8 @@ Leaf module: imports only db/config types, never adsbtrack.cli.
 
 from __future__ import annotations
 
+import json
+import urllib.request
 from dataclasses import dataclass
 from datetime import date
 
@@ -133,3 +135,12 @@ def _check_spoof(db: Database, icao: str, run_started_at: str) -> list[WatchAler
         }
         alerts.append(WatchAlert(kind="spoof", icao=icao, summary=summary, detail=detail))
     return alerts
+
+
+def _post_webhook(url: str, payload: dict, timeout: float) -> None:
+    """POST payload as a JSON document to url. Raises on any failure
+    (connection error, timeout, non-2xx status via HTTPError) -- the CLI
+    catches it and reports a warning without changing the run's exit code."""
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    urllib.request.urlopen(request, timeout=timeout)

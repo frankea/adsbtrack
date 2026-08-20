@@ -2883,3 +2883,196 @@ def test_inspect_cli_closest_approach_with_airport(tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert "EGLL" in result.output
+
+
+# ---------------------------------------------------------------------------
+# watch command (#24)
+# ---------------------------------------------------------------------------
+
+
+def _watch_trace_data(timestamp: float = 1700000000.0) -> dict:
+    return {"timestamp": timestamp, "trace": [[0, 40.0, -74.0, 5000, 200, None, None, None, {}]]}
+
+
+def _capture_watch_fetch_calls(monkeypatch, *, inject_hex: str | None = None, inject_source: str = "adsbx"):
+    """Stub adsbtrack.cli.fetch_traces for `watch` tests: records every
+    (hex, source) call. When `inject_hex` is given, the call for that hex on
+    `inject_source` inserts a trace day for today via the real db handle it
+    receives -- simulating a fetch that discovered new data."""
+    from adsbtrack import cli as cli_module
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
+        calls.append((hex_code, source))
+        if inject_hex is not None and hex_code == inject_hex and source == inject_source:
+            db.insert_trace_day(hex_code, date.today().isoformat(), _watch_trace_data(), source=source)
+            db.commit()
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+    return calls
+
+
+def _capture_webhook(monkeypatch):
+    """Stub the urllib.request.urlopen that adsbtrack.watch._post_webhook
+    calls, recording (url, body, timeout) for each POST."""
+    calls: list[tuple[str, bytes, float | None]] = []
+
+    def fake_urlopen(request, timeout=None):
+        calls.append((request.full_url, request.data, timeout))
+
+        class _Response:
+            def read(self):
+                return b""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        return _Response()
+
+    monkeypatch.setattr("adsbtrack.watch.urllib.request.urlopen", fake_urlopen)
+    return calls
+
+
+def test_watch_requires_some_hex(tmp_path):
+    """No --hex and no --watchlist -> click.UsageError (exit code 2)."""
+    result = CliRunner().invoke(cli, ["watch", "--db", str(tmp_path / "watch.db")])
+    assert result.exit_code == 2, result.output
+    assert "at least one" in result.output.lower()
+
+
+def test_watch_first_run_baselines_without_alerts(tmp_path, monkeypatch):
+    """An aircraft with no prior trace history baselines instead of firing
+    alerts for its whole backfilled history, and never touches the webhook."""
+    calls = _capture_watch_fetch_calls(monkeypatch)
+    webhook_calls = _capture_webhook(monkeypatch)
+
+    db_path = tmp_path / "watch.db"
+    result = CliRunner().invoke(
+        cli, ["watch", "--hex", "aa11bb", "--webhook", "http://example.invalid/hook", "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "baselined" in result.output
+    assert len(calls) == 5  # every healthy readsb source attempted
+    assert webhook_calls == []
+
+
+def test_watch_reactivation_alert_and_exit_code(tmp_path, monkeypatch):
+    """A hex dormant for 100 days that gets new trace data during the run
+    fires a reactivation alert and exits 2; no --webhook means no POST."""
+    hex_code = "aa22cc"
+    old_day = (date.today() - timedelta(days=100)).isoformat()
+    calls = _capture_watch_fetch_calls(monkeypatch, inject_hex=hex_code)
+    webhook_calls = _capture_webhook(monkeypatch)
+
+    db_path = tmp_path / "watch.db"
+    with Database(db_path) as db:
+        db.insert_trace_day(hex_code, old_day, _watch_trace_data(), source="adsbx")
+        db.commit()
+
+    result = CliRunner().invoke(cli, ["watch", "--hex", hex_code, "--db", str(db_path)])
+    assert result.exit_code == 2, result.output
+    assert "reactivation" in result.output
+    assert len(calls) == 5
+    assert webhook_calls == []
+
+
+def test_watch_webhook_posts_on_alerts_only(tmp_path, monkeypatch):
+    """--webhook POSTs the same JSON document, but only for a run that fired
+    at least one alert; a clean run never calls it."""
+    from adsbtrack.config import Config
+
+    hex_code = "bb33dd"
+    old_day = (date.today() - timedelta(days=100)).isoformat()
+    _capture_watch_fetch_calls(monkeypatch, inject_hex=hex_code)
+    webhook_calls = _capture_webhook(monkeypatch)
+
+    db_path = tmp_path / "watch.db"
+    with Database(db_path) as db:
+        db.insert_trace_day(hex_code, old_day, _watch_trace_data(), source="adsbx")
+        db.commit()
+
+    result = CliRunner().invoke(
+        cli, ["watch", "--hex", hex_code, "--webhook", "http://example.invalid/hook", "--db", str(db_path)]
+    )
+    assert result.exit_code == 2, result.output
+    assert len(webhook_calls) == 1
+    url, body, timeout = webhook_calls[0]
+    assert url == "http://example.invalid/hook"
+    payload = json.loads(body)
+    assert payload["alerts"][0]["kind"] == "reactivation"
+    assert payload["alerts"][0]["icao"] == hex_code
+    assert timeout == Config().watch_webhook_timeout_secs
+
+    # A clean second run (fresh hex, no prior history -> baselines) must not
+    # call the webhook at all.
+    webhook_calls.clear()
+    result2 = CliRunner().invoke(
+        cli,
+        ["watch", "--hex", "cc44ee", "--webhook", "http://example.invalid/hook", "--db", str(tmp_path / "w2.db")],
+    )
+    assert result2.exit_code == 0, result2.output
+    assert webhook_calls == []
+
+
+def test_watch_watchlist_file_parsing(tmp_path, monkeypatch):
+    """Watchlist entries union with --hex, with comments/blanks ignored and
+    a cross-source duplicate (mixed case) deduped rather than double-fetched."""
+    calls = _capture_watch_fetch_calls(monkeypatch)
+
+    watchlist = tmp_path / "watchlist.txt"
+    watchlist.write_text("# my watchlist\n\nAA11BB   # dup of --hex, mixed case\n   \ncc22dd\n")
+
+    db_path = tmp_path / "watch.db"
+    result = CliRunner().invoke(cli, ["watch", "--hex", "aa11bb", "--watchlist", str(watchlist), "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    hexes_called = {c[0] for c in calls}
+    assert hexes_called == {"aa11bb", "cc22dd"}
+    # 5 healthy readsb sources x 2 unique hexes -- aa11bb (given via both
+    # --hex and the watchlist) is not double-fetched.
+    assert len(calls) == 10
+
+
+def test_watch_skips_unhealthy_sources(tmp_path, monkeypatch):
+    """A readsb source whose last 20 attempts were all retryable failures is
+    skipped for every hex, with a skip note naming it."""
+    calls = _capture_watch_fetch_calls(monkeypatch)
+
+    db_path = tmp_path / "watch.db"
+    with Database(db_path) as db:
+        _seed_sick_source(db, "dd55ee", "adsblol")
+        db.commit()
+
+    result = CliRunner().invoke(cli, ["watch", "--hex", "dd55ee", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    sources_called = {c[1] for c in calls}
+    assert "adsblol" not in sources_called
+    assert sources_called == {"adsbx", "adsbfi", "airplaneslive", "theairtraffic"}
+    assert "adsblol" in result.output
+    assert "skip" in result.output.lower()
+
+
+def test_watch_continues_after_one_hex_fails(tmp_path, monkeypatch):
+    """A fetch/extract exception for one hex warns and continues to the next
+    hex; the run still completes with an exit code reflecting only real
+    alerts (neither hex here fires one)."""
+    from adsbtrack import cli as cli_module
+
+    def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
+        if hex_code == "ff66aa" and source == "adsbx":
+            raise RuntimeError("simulated network failure")
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
+
+    db_path = tmp_path / "watch.db"
+    result = CliRunner().invoke(cli, ["watch", "--hex", "ff66aa", "--hex", "bb77cc", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "ff66aa" in result.output
+    assert "bb77cc" in result.output
+    assert "baselined" in result.output
+    assert "failed" in result.output.lower()

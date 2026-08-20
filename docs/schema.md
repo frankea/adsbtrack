@@ -165,7 +165,7 @@ Materialized rollup of utilization per aircraft (refreshed on every extract).
 
 ## spoofed_broadcasts
 
-Audit log of flights rejected by the spoof-broadcast gate in `parser.extract_flights`. Populated instead of `flights` when a would-be flight either (a) originates from a trace_day whose pooled v2 samples carry `sil=0` at `>= config.spoof_v2_sil0_pct` (default 10%), or (b) matches the crude shallow-EK signature (max_altitude below `config.spoof_crude_max_altitude_ft`, both `origin_icao` and `destination_icao` NULL, callsign matching `^EK\d+$`). Turn the gate off by setting `config.reject_spoofed_flights = False` to see the raw parser output unfiltered; `clear_flights(icao)` also clears this table so `extract --reprocess` stays consistent.
+Audit log of flights rejected by the spoof-broadcast gate in `parser.extract_flights`. Populated instead of `flights` when a would-be flight either (a) is flight-scoped bimodal-integrity spoofed (issue #22): its own v2 samples carry `sil=0` at `>= config.spoof_flight_sil0_hard_pct` (default 60%, trigger `hard_sil0`), or at `>= config.spoof_v2_sil0_pct` (default 10%) AND the flight contains an inter-fix jump faster than `config.spoof_teleport_speed_kt` (default 900 kt, trigger `sil0_plus_teleport`); or (b) matches the crude shallow-EK signature (max_altitude below `config.spoof_crude_max_altitude_ft`, both `origin_icao` and `destination_icao` NULL, callsign matching `^EK\d+$`). Turn the gate off by setting `config.reject_spoofed_flights = False` to see the raw parser output unfiltered; `clear_flights(icao)` also clears this table so `extract --reprocess` stays consistent.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -183,7 +183,7 @@ Audit log of flights rejected by the spoof-broadcast gate in `parser.extract_fli
 | origin_icao | TEXT | On-field origin airport (if any) |
 | destination_icao | TEXT | On-field destination airport (if any) |
 | reason | TEXT | `bimodal_integrity` or `crude_heuristic` |
-| reason_detail | TEXT | JSON blob with specifics: for `bimodal_integrity`, `{date, v2_samples, v2_sil0_pct, v2_nic0_pct, sources, source_rates}`; for `crude_heuristic`, `{max_altitude, callsign, pattern}` |
+| reason_detail | TEXT | JSON blob with specifics: for `bimodal_integrity`, `{scope: "flight", date, v2_samples, v2_sil0_pct, v2_nic0_pct, max_implied_speed_kt, trigger: "hard_sil0" \| "sil0_plus_teleport"}`; for `crude_heuristic`, `{max_altitude, callsign, pattern}`. Rows written before issue #22 carry the older day-scoped shape (`{date, v2_samples, v2_sil0_pct, v2_nic0_pct, sources, source_rates}`, no `scope` key) and remain valid history -- `scope == "flight"` distinguishes rows produced by the current gate. |
 | detected_at | TEXT | When the rejection happened |
 
 UNIQUE(icao, takeoff_time) mirrors the `flights` table so the two are keyed compatibly.

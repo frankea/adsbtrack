@@ -111,7 +111,19 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
     emergency_field: str | None = None
     true_heading: float | None = None
     callsign: str | None = None
+    adsb_version: int | None = None
+    sil: int | None = None
+    nic: int | None = None
     if detail:
+        v = detail.get("version")
+        if isinstance(v, int):
+            adsb_version = v
+        s = detail.get("sil")
+        if isinstance(s, int):
+            sil = s
+        n = detail.get("nic")
+        if isinstance(n, int):
+            nic = n
         sq = detail.get("squawk")
         if sq:
             squawk = str(sq)
@@ -165,6 +177,9 @@ def _extract_point_fields(point: list, ts: float, lat: float, lon: float) -> Poi
         true_heading=true_heading,
         callsign=callsign,
         position_source=position_source,
+        adsb_version=adsb_version,
+        sil=sil,
+        nic=nic,
     )
 
 
@@ -277,6 +292,13 @@ def _stitch_fragments(
          is less than time_gap * cruise_speed * slack.
       5. Altitude difference between prev.last_seen_alt_ft and next's first
          airborne altitude is less than config.stitch_max_alt_delta_ft.
+      6. Fresh-departure veto (#21) does NOT fire: the gap exceeds
+         config.stitch_min_ground_gap_secs AND next's first airborne
+         altitude is below config.stitch_fresh_departure_alt_ft AND next's
+         raw altitude peak climbs more than config.stitch_fresh_departure_climb_ft
+         above that first altitude. That combination means next is a new
+         sortie taking off after real ground time, not a coverage hole in
+         the same flight.
 
     Effective stitch window:
       max(config.stitch_max_gap_minutes,
@@ -341,7 +363,22 @@ def _stitch_fragments(
                         alt_delta = abs(metrics.last_seen_alt_ft - next_metrics.last_airborne_alt)
                         alt_ok = alt_delta <= max_alt_delta
 
-                    if dist_km <= plausible and alt_ok:
+                    # Fresh-departure veto (#21): a long gap followed by a
+                    # reappearance that starts low and then climbs away is a
+                    # new sortie, not a coverage hole in the same flight.
+                    # raw_peak_altitude_ft, not max_altitude: max_altitude requires
+                    # AP corroboration and can fall back to 0 for a short
+                    # reappearance fragment, which would silently disable the veto.
+                    next_peak = next_metrics.raw_peak_altitude_ft
+                    fresh_departure = (
+                        gap_secs > config.stitch_min_ground_gap_secs
+                        and next_metrics.first_airborne_alt is not None
+                        and next_metrics.first_airborne_alt < config.stitch_fresh_departure_alt_ft
+                        and next_peak is not None
+                        and next_peak - next_metrics.first_airborne_alt > config.stitch_fresh_departure_climb_ft
+                    )
+
+                    if dist_km <= plausible and alt_ok and not fresh_departure:
                         # Merge: the next fragment inherits prev's takeoff
                         # position and time (the originally-observed takeoff
                         # if prev was observed, otherwise prev's first point).
@@ -400,10 +437,11 @@ def pool_spoof_scores(parsed_rows: Iterable[tuple[sqlite3.Row, list]], config: C
 
     ``parsed_rows`` is the output of db.iter_parsed_trace_days -- each
     row's trace_json is already decoded, so pooling never re-parses JSON
-    the caller already parsed. This is the single scan shared by
-    parser.extract_flights (the rejection gate) and events._detect_spoof_events
-    (the opt-in event); it used to be two near-duplicate scans, one of them
-    hardcoding thresholds events.py couldn't override.
+    the caller already parsed. This scan now backs only
+    events._detect_spoof_events (the opt-in day-level event); issue #22
+    moved parser.extract_flights's rejection gate to flight scope (see
+    _flight_is_spoofed), which reads FlightMetrics counters accumulated
+    per point instead of a day-level pre-scan.
 
     Pool v2 samples across every aggregator that fetched the same date:
     the denominator is the union of v2 samples from all sources, the
@@ -467,25 +505,32 @@ def pool_spoof_scores(parsed_rows: Iterable[tuple[sqlite3.Row, list]], config: C
     return flagged
 
 
-def _flight_is_spoofed(
-    flight: Flight, spoof_scores_by_date: dict[str, dict], config: Config
-) -> tuple[str, dict] | None:
+def _flight_is_spoofed(flight: Flight, metrics: FlightMetrics, config: Config) -> tuple[str, dict] | None:
     """Return ``(reason, detail)`` when a flight should be rejected.
 
-    Two gates, matching the spec:
-      - "bimodal_integrity": the flight's takeoff_date shows sil=0 on
-        >= config.spoof_v2_sil0_pct of v2 samples.
-      - "crude_heuristic": max_altitude < config.spoof_crude_max_altitude_ft
-        AND origin_icao / destination_icao both null AND callsign matches
-        ``^EK\\d+$`` (IATA flight-number format, not an ATC callsign).
-    Bimodal wins if both fire because the evidence is stronger.
+    Flight-scoped bimodal-integrity gate (two tiers, see Config comment and
+    issue #22), then the unchanged crude EK-callsign heuristic. Day-level
+    pooling no longer rejects flights - it survives only as the events-layer
+    detector (events._detect_spoof_events).
     """
-    bimodal = spoof_scores_by_date.get(flight.takeoff_date)
-    if bimodal is not None:
-        return "bimodal_integrity", {
-            "date": flight.takeoff_date,
-            **bimodal,
-        }
+    v2 = metrics.v2_samples
+    if v2 >= config.spoof_min_v2_samples:
+        sil_pct = 100.0 * metrics.v2_sil0 / v2
+        teleport = metrics.max_implied_speed_kt
+        hard = sil_pct >= config.spoof_flight_sil0_hard_pct
+        corroborated = (
+            sil_pct >= config.spoof_v2_sil0_pct and teleport is not None and teleport > config.spoof_teleport_speed_kt
+        )
+        if hard or corroborated:
+            return "bimodal_integrity", {
+                "scope": "flight",
+                "date": flight.takeoff_date,
+                "v2_samples": v2,
+                "v2_sil0_pct": round(sil_pct, 2),
+                "v2_nic0_pct": round(100.0 * metrics.v2_nic0 / v2, 2),
+                "max_implied_speed_kt": round(teleport, 1) if teleport is not None else None,
+                "trigger": "hard_sil0" if hard else "sil0_plus_teleport",
+            }
     cs = (flight.callsign or "").strip()
     if (
         flight.max_altitude is not None
@@ -646,32 +691,26 @@ def _resolve_registry_metadata(db: Database, hex_code: str, trace_days: list) ->
     return type_code, owner_operator
 
 
-def _load_and_merge(
-    trace_days: list, hex_code: str, config: Config
-) -> tuple[list[tuple[str, float, list]], set[str], dict[str, dict]]:
-    """Decode the trace rows once, score spoof indicators, and merge each
-    date's (possibly multi-source) rows into a single chronological trace.
+def _load_and_merge(trace_days: list, hex_code: str, config: Config) -> tuple[list[tuple[str, float, list]], set[str]]:
+    """Decode the trace rows once and merge each date's (possibly
+    multi-source) rows into a single chronological trace.
 
-    Returns ``(merged_days, all_sources, spoof_scores_by_date)``:
+    Returns ``(merged_days, all_sources)``:
       - merged_days: ``[(date, base_timestamp, trace), ...]`` in date order,
         the input the state machine walks.
       - all_sources: union of every source that contributed a trace day;
         stamped on every flight's FlightMetrics.
-      - spoof_scores_by_date: per-date bimodal-integrity scores computed up
-        front so the rejection gate never re-scans trace_json. Empty when
-        config.reject_spoofed_flights is off, which skips the scan entirely.
+
+    Spoof rejection (issue #22) is flight-scoped: it reads FlightMetrics
+    counters the state machine accumulates per point (see
+    _flight_is_spoofed), so it no longer needs a day-level pre-scan here.
+    Day-level pooling (pool_spoof_scores) still exists, but only for the
+    events layer, which scans independently of the extract path.
 
     Needs no Database handle: the rows are loaded by the caller, which is
     also where any "which days to process" narrowing belongs.
     """
-    # Decode every row's trace_json exactly once. The parsed pairs feed
-    # both the spoof-scoring pass and the per-date merge below, instead of
-    # each pass calling json.loads on the same rows independently.
     parsed_days = list(iter_parsed_trace_days(trace_days, hex_code))
-
-    spoof_scores_by_date: dict[str, dict] = (
-        pool_spoof_scores(parsed_days, config) if config.reject_spoofed_flights else {}
-    )
 
     by_date: dict[str, list[tuple[sqlite3.Row, list]]] = defaultdict(list)
     for row, trace in parsed_days:
@@ -683,7 +722,7 @@ def _load_and_merge(
         date_str, base_ts, trace, day_sources = _merge_trace_rows(by_date[day_date], config)
         merged_days.append((date_str, base_ts, trace))
         all_sources |= day_sources
-    return merged_days, all_sources, spoof_scores_by_date
+    return merged_days, all_sources
 
 
 def _scan_state_machine(
@@ -1069,7 +1108,6 @@ class _EnrichContext:
     hex_code: str
     type_code: str | None
     owner_operator: str | None
-    spoof_scores_by_date: dict[str, dict]
     # True when this run rebuilds only part of the aircraft's history, so
     # the ICAO-wide post-passes have to account for rows they never saw.
     incremental: bool = False
@@ -1482,18 +1520,20 @@ def _enrich_flight(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext) 
     return True
 
 
-def _reject_if_spoofed(flight: Flight, ctx: _EnrichContext) -> bool:
+def _reject_if_spoofed(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext) -> bool:
     """Divert a spoofed broadcast into spoofed_broadcasts and report that it
     must not be persisted as a flight.
 
     Runs after every derivation so the gate sees final values for
-    max_altitude / origin_icao / destination_icao / callsign. A rejected
-    flight is also kept out of the turnaround chain, so the next real
-    flight's gap is not measured against a fabricated one.
+    max_altitude / origin_icao / destination_icao / callsign, and the fully
+    merged (post-stitch) FlightMetrics for its v2 integrity and implied-
+    speed counters. A rejected flight is also kept out of the turnaround
+    chain, so the next real flight's gap is not measured against a
+    fabricated one.
     """
     if not ctx.config.reject_spoofed_flights:
         return False
-    verdict = _flight_is_spoofed(flight, ctx.spoof_scores_by_date, ctx.config)
+    verdict = _flight_is_spoofed(flight, metrics, ctx.config)
     if verdict is None:
         return False
     reason, detail = verdict
@@ -1648,7 +1688,7 @@ def _persist(
     for flight, metrics in pairs:
         if not _enrich_flight(flight, metrics, ctx):
             continue
-        if _reject_if_spoofed(flight, ctx):
+        if _reject_if_spoofed(flight, metrics, ctx):
             continue
 
         _apply_sequence_fields(flight, prev_end_time)
@@ -1800,7 +1840,7 @@ def _extract_window(
     """Load, merge, walk and persist one set of trace days. The whole history
     for a full extract, the days from the boundary onward for an incremental
     one. Returns the number of flights written."""
-    merged_days, window_sources, spoof_scores_by_date = _load_and_merge(trace_days, hex_code, config)
+    merged_days, window_sources = _load_and_merge(trace_days, hex_code, config)
     pairs = _run_state_machine(
         merged_days,
         config,
@@ -1815,7 +1855,6 @@ def _extract_window(
         hex_code=hex_code,
         type_code=type_code,
         owner_operator=owner_operator,
-        spoof_scores_by_date=spoof_scores_by_date,
         incremental=incremental,
     )
     return len(_persist(pairs, ctx, prev_end_time=carried.prev_end_time))

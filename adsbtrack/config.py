@@ -292,6 +292,28 @@ class Config:
     # rate_limit seconds apart, so concurrency only helps when request
     # latency exceeds rate_limit and in-flight overlap is possible.
     fetch_concurrency: int = 4
+    # fetch --source all resume: cap how far back a per-source resume may
+    # reach. A source that has been dead for months (adsblol, 2025-10 to
+    # present) otherwise drags its own catch-up window back across its whole
+    # outage on every run. Clamped sources print a warning naming the days
+    # skipped; pass --start explicitly to backfill deeper. Only applies to
+    # --source all resumes - a single named source is explicit user intent.
+    resume_max_lookback_days: int = 90
+
+    # Source health (fetch --source all planning). A source whose most recent
+    # source_health_skip_threshold day-requests were ALL retryable failures
+    # (403/429/5xx - see is_retryable_fetch_status) is skipped for the run
+    # with a warning; --include-unhealthy forces it back in. Derived from
+    # fetch_log.fetched_at at plan time - no separate health table.
+    source_health_window: int = 30
+    source_health_skip_threshold: int = 20
+    # Observed archive retention per source (days), None = unknown/unlimited.
+    # theairtraffic: returned no data for dates ~90 days old that two other
+    # networks had dense coverage for (2026-08 observation). Used only to
+    # annotate fetch output - a 404 beyond retention reads "probably
+    # expired", not "aircraft not seen".
+    source_retention_days: dict[str, int | None] = field(default_factory=lambda: {"theairtraffic": 90})
+
     airport_match_threshold_km: float = 10.0
     airport_types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")
     landing_speed_threshold_kts: float = 80.0  # ground speed above which a "ground" alt reading is ignored
@@ -316,31 +338,56 @@ class Config:
     stationary_max_alt_ft: float = 1000.0  # raised from 500 to catch ramp at higher-elevation airports
     stationary_max_gs_kt: float = 15.0
 
-    # Spoofed-broadcast gate (see parser.pool_spoof_scores, consulted from
-    # parser.extract_flights and events._detect_spoof_events). When enabled
-    # (default), a flight whose source trace_day shows bimodal-integrity
-    # spoofing (>= spoof_v2_sil0_pct share of v2 samples with sil=0) or
-    # matches the crude shallow-EK-flight signature (max_alt < 500 ft,
-    # origin/dest both null, callsign ~= ^EK\d+$) is diverted to the
-    # spoofed_broadcasts audit table instead of being inserted into
-    # flights. Turn off to see the raw parser output unfiltered.
+    # Spoofed-broadcast handling: two independent consumers share these
+    # thresholds. Under ADS-B version 2, real aircraft transponders almost
+    # never report sil=0 (the Source Integrity Level field is >= 2 on
+    # production equipment); a populated broadcast with a high sil=0 share
+    # implies either two emitters on the same ICAO (one realistic, one
+    # garbage) or a single spoofer that hardcoded the integrity fields.
     #
-    # Under ADS-B version 2, real aircraft transponders almost never
-    # report sil=0 (the Source Integrity Level field is >= 2 on production
-    # equipment). A populated broadcast with >= spoof_v2_sil0_pct of v2
-    # samples carrying sil=0 implies either two emitters on the same ICAO
-    # (one realistic, one garbage) or a single spoofer that hardcoded the
-    # integrity fields. The 10% default was empirically calibrated from the
+    # events._detect_spoof_events (via parser.pool_spoof_scores) pools v2
+    # samples per trace_day across every aggregator that fetched that date
+    # and emits an opt-in spoof_bimodal_integrity event when the pooled
+    # sil=0 share is >= spoof_v2_sil0_pct with >= spoof_min_v2_samples
+    # pooled samples. It never rejects anything.
+    #
+    # parser.extract_flights's reject-in-extract gate is flight-scoped
+    # (issue #22, see the block below): spoof_v2_sil0_pct doubles as tier
+    # 2's floor there, and spoof_min_v2_samples gates a single flight's own
+    # v2 sample count the same way it gates a pooled day. A flight that
+    # trips either tier, or matches the crude shallow-EK-flight signature
+    # (max_alt < spoof_crude_max_altitude_ft, origin/dest both null,
+    # callsign ~= ^EK\d+$), is diverted to the spoofed_broadcasts audit
+    # table instead of being inserted into flights. Turn off with
+    # reject_spoofed_flights = False to see the raw parser output
+    # unfiltered.
+    #
+    # The 10% spoof_v2_sil0_pct default was empirically calibrated from the
     # 2026-04 Strait-of-Hormuz Emirates A380 spoofs (25-50% v2_sil0 rate)
     # vs. the same airframes' legitimate 2025-12 flights (0-1.4%).
-    # spoof_min_v2_samples is the minimum pooled v2 sample count required
-    # before the ratio is trusted; below it variance dominates and sparse
-    # days produce false positives. A typical active flight day has >100
-    # v2 samples.
+    # spoof_min_v2_samples is the minimum sample count required before the
+    # ratio is trusted, pooled or per-flight; below it variance dominates
+    # and sparse days/short flights produce false positives. A typical
+    # active flight day has >100 v2 samples.
     reject_spoofed_flights: bool = True
     spoof_v2_sil0_pct: float = 10.0
     spoof_min_v2_samples: int = 25
     spoof_crude_max_altitude_ft: float = 500.0
+
+    # Flight-scoped gate (issue #22). Day-scoped rejection quarantined real
+    # flights that merely transited GPS-jamming corridors on days that also
+    # carried ghost broadcasts. Reject a flight when its own sil0 share >=
+    # spoof_flight_sil0_hard_pct, OR when it is >= spoof_v2_sil0_pct AND the
+    # flight contains an inter-fix jump faster than spoof_teleport_speed_kt
+    # (no aircraft in this DB's scope sustains 900 kt over ground;
+    # Hormuz-style 25-50% sil0 spoofs teleport, jammed-but-real flights with
+    # physically plausible positions do not). A6-EUY's 2026-05-19 outbound
+    # DXB-DUS leg is the counter-example, not a pass case: moderate sil0
+    # (21.27%) AND a 1,684 kt implied jump, so it quarantines -- its jammed
+    # GPS genuinely teleported. Its same-day return legs (near-zero sil0,
+    # physical speeds) extract normally.
+    spoof_flight_sil0_hard_pct: float = 60.0
+    spoof_teleport_speed_kt: float = 900.0
 
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
@@ -480,6 +527,17 @@ class Config:
     # operational mission; this ratio widens the window for those types
     # without changing behavior for light GA.
     stitch_endurance_ratio: float = 0.4
+
+    # Fresh-departure veto: a stitch candidate whose gap exceeds
+    # stitch_min_ground_gap_secs AND whose next fragment starts airborne
+    # below stitch_fresh_departure_alt_ft AND then climbs more than
+    # stitch_fresh_departure_climb_ft above that first altitude is a new
+    # sortie taking off, not a coverage hole - refuse the stitch. Keeps
+    # go-arounds (short gap) and cruise coverage holes (high reappearance)
+    # stitching exactly as before. See issue #21 (ZK019 double-sortie merge).
+    stitch_min_ground_gap_secs: float = 900.0
+    stitch_fresh_departure_alt_ft: float = 8000.0
+    stitch_fresh_departure_climb_ft: float = 2000.0
 
     # dropped_on_approach gating: require sustained descent in the last few
     # baro_rate samples before committing the classification.

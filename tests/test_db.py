@@ -518,6 +518,17 @@ def test_fetched_dates_includes_retried_then_succeeded_day(db):
     assert dates == {"2024-01-13"}
 
 
+def test_recent_source_outcomes_newest_first(db):
+    """recent_source_outcomes feeds the fetch planner's source-health check
+    (#20): most recent statuses first, scoped by source, ignoring icao."""
+    for i, status in enumerate([200, 404, 502, 502]):
+        db.insert_fetch_log("aaaaaa", f"2026-01-{i + 1:02d}", status, source="adsblol")
+    db.commit()
+
+    assert db.recent_source_outcomes("adsblol", limit=3) == [502, 502, 404]
+    assert db.recent_source_outcomes("adsbx", limit=3) == []
+
+
 # ---------------------------------------------------------------------------
 # flights
 # ---------------------------------------------------------------------------

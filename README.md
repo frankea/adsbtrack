@@ -22,7 +22,7 @@ uv sync
 uv run python -m adsbtrack.cli fetch --hex a66ad3 --start 2020-01-01
 ```
 
-Downloads daily traces, then auto-extracts flights. Options: `--source` (adsbx, adsbfi, airplaneslive, adsblol, theairtraffic, opensky, all), `--end`, `--rate`, `--concurrency`, `--db`, `--tail` (converts N-number to hex). Skips dates already fetched - days that only ever failed with retryable errors (403/429/5xx) do not count and are retried on the next run. Omitting `--start` auto-resumes from the day after the last fetched day, or pass `--since-last` to require that behavior explicitly (errors if there's no fetch history yet). WAL mode lets multiple fetches run in parallel.
+Downloads daily traces, then auto-extracts flights. Options: `--source` (adsbx, adsbfi, airplaneslive, adsblol, theairtraffic, opensky, all), `--end`, `--rate`, `--concurrency`, `--db`, `--tail` (converts N-number to hex), `--include-unhealthy` (with `--source all`, fetch every readsb source even if its recent history looks dead; ignored for a single named source). Skips dates already fetched - days that only ever failed with retryable errors (403/429/5xx) do not count and are retried on the next run. Omitting `--start` auto-resumes from the day after the last fetched day; under `--source all` each source resumes from its own last success, capped at 90 days behind (`Config.resume_max_lookback_days`, with a warning if clamped). Pass `--since-last` to require resume behavior explicitly (errors if there's no fetch history yet). WAL mode lets multiple fetches run in parallel.
 
 ### View statistics
 
@@ -98,6 +98,14 @@ uv run python -m adsbtrack.cli events --hex a66ad3
 ```
 
 Chronological log of emergency squawks (7500/7600/7700), emergency flags, off-airport landings, sustained hover (>= 5 min), and multiple go-arounds (>= 2 per flight) - all read from pre-computed columns on the `flights` table, no new heuristics. Options: `--since` (filter from a date), `--severity` (`emergency`, `unusual`, or `all`). Pass `--json` to emit a single JSON document instead of the table.
+
+### Day forensics
+
+```
+uv run python -m adsbtrack.cli inspect --hex a66ad3 --date 2026-03-27
+```
+
+Deep-dive on one aircraft-day: splits each source's raw trace into fragments on inter-point gaps (`--gap-secs`, default 300), and reports per-fragment point count, position, altitude/speed range, DO-260B v2/sil0/nic0 integrity counts, and the callsigns/squawks seen. Also prints the squawk and callsign change-point timeline across every source merged into one chronological stream. Pass `--airport <ident>` to add a closest-approach line (distance, time, altitude) against a known airport. `--source` limits to one source; `--json` emits a single JSON document instead of the tables.
 
 ### Re-extract flights
 
@@ -209,7 +217,7 @@ Fetch from different networks for better coverage:
 uv run python -m adsbtrack.cli fetch --hex a66ad3 --source adsbfi --start 2020-01-01
 ```
 
-Traces from multiple sources are automatically merged during extraction. `--source all` fetches from every readsb source in parallel (plus OpenSky when credentials are configured), with one progress line per source and a per-source summary at the end.
+Traces from multiple sources are automatically merged during extraction. `--source all` fetches from every readsb source in parallel (plus OpenSky when credentials are configured), with one progress line per source and a per-source summary at the end. A source whose recent fetch attempts all failed (403/429/5xx) is skipped with a warning as unhealthy; pass `--include-unhealthy` to force it back in. Requests older than a source's known archive retention window get a note in the output that a 404 there may mean "expired" rather than "no data."
 
 | Source | Flag | Notes |
 |--------|------|-------|

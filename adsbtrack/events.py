@@ -13,8 +13,11 @@ time, two in a row is a pattern worth looking at.
 
 The spoof detector's own thresholds (`Config.spoof_v2_sil0_pct`,
 `Config.spoof_min_v2_samples`) and its pooling scan live in
-`parser.pool_spoof_scores`, shared with the reject-in-extract gate in
-parser.py so there is one bimodal-integrity implementation, not two.
+`parser.pool_spoof_scores`. The reject-in-extract gate in parser.py no
+longer calls that day-level scan (issue #22 moved it to a flight-scoped
+gate over FlightMetrics counters), but both consumers still read the
+identical per-point integrity predicate via `integrity.count_v2_integrity`,
+so day-scoped and flight-scoped stats can never disagree about a point.
 """
 
 from __future__ import annotations

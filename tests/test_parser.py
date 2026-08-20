@@ -817,6 +817,180 @@ def _make_found_mid_flight_fragment(
     return flight, metrics
 
 
+# ---------------------------------------------------------------------------
+# Feature: fresh-departure stitch veto (#21)
+# ---------------------------------------------------------------------------
+
+
+def _make_reappearance_fragment(
+    icao: str,
+    start_ts: float,
+    start_lat: float,
+    start_lon: float,
+    first_airborne_alt: float,
+    raw_peak_alt_ft: int,
+    last_airborne_alt: int,
+) -> tuple[Flight, FlightMetrics]:
+    """Build a synthetic found_mid_flight fragment with independent control
+    over its first airborne altitude, raw altitude peak, and last airborne
+    altitude. Unlike _make_found_mid_flight_fragment (which derives all
+    three from a single start_alt_ft for the plain cruise-coverage-hole
+    tests), the fresh-departure veto needs these three decoupled: a fragment
+    that starts low, climbs to a much higher peak, then descends again
+    before its own coverage ends (e.g. toward its own landing)."""
+    flight = Flight(
+        icao=icao,
+        takeoff_time=datetime.fromtimestamp(start_ts, tz=UTC),
+        takeoff_lat=start_lat,
+        takeoff_lon=start_lon,
+        takeoff_date=datetime.fromtimestamp(start_ts, tz=UTC).date().isoformat(),
+    )
+    metrics = FlightMetrics()
+    metrics.first_point_ts = start_ts
+    metrics.last_point_ts = start_ts + 60.0
+    metrics.last_seen_ts = start_ts + 60.0
+    metrics.last_seen_lat = start_lat
+    metrics.last_seen_lon = start_lon
+    metrics.first_airborne_alt = first_airborne_alt
+    metrics._raw_max_altitude = raw_peak_alt_ft
+    metrics.last_airborne_alt = last_airborne_alt
+    metrics.takeoff_type = "found_mid_flight"
+    return flight, metrics
+
+
+def test_stitch_vetoes_fresh_departure_after_ground_gap():
+    """RAF Hawk ZK019 (#21): a 90-minute ground gap followed by a fragment
+    that starts low and climbs away is a new sortie taking off, not a
+    coverage hole in the same flight - the two fragments must NOT stitch.
+    """
+    t0 = _ts("2026-08-17", hour=13, minute=8, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="43c556",
+        start_ts=t0 - 3600,
+        end_ts=t0,
+        start_lat=51.5,
+        start_lon=-1.0,
+        end_lat=51.7,
+        end_lon=-1.2,
+        end_alt_ft=1050,
+    )
+    f2_start = t0 + 90 * 60  # 90-minute ground gap
+    f2, m2 = _make_reappearance_fragment(
+        icao="43c556",
+        start_ts=f2_start,
+        start_lat=51.7,
+        start_lon=-1.2,
+        first_airborne_alt=1200.0,
+        raw_peak_alt_ft=17_000,
+        last_airborne_alt=900,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 2, "Fresh departure after a long ground gap must not be stitched into one flight"
+
+
+def test_stitch_still_merges_go_around_reappearance():
+    """A short gap (well under stitch_min_ground_gap_secs) must still merge
+    even though the reappearing fragment climbs well past the veto's climb
+    threshold afterward - the gap check alone is what keeps the veto from
+    firing here (raw_peak_alt_ft - first_airborne_alt = 2,500 ft > the 2,000
+    ft climb threshold, so if the gap condition were ever dropped this test
+    would catch it)."""
+    t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="aaaaaa",
+        start_ts=t0 - 600,
+        end_ts=t0,
+        start_lat=40.0,
+        start_lon=-74.0,
+        end_lat=40.05,
+        end_lon=-74.05,
+        end_alt_ft=900,
+    )
+    f2_start = t0 + 180  # 3-minute gap, well under the 900s veto floor
+    f2, m2 = _make_reappearance_fragment(
+        icao="aaaaaa",
+        start_ts=f2_start,
+        start_lat=40.05,
+        start_lon=-74.05,
+        first_airborne_alt=1500.0,
+        raw_peak_alt_ft=4000,
+        last_airborne_alt=100,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 1, "Go-around reappearance within the ground-gap floor must still stitch into one flight"
+
+
+def test_stitch_still_merges_cruise_coverage_hole():
+    """A high-altitude reappearance (>= stitch_fresh_departure_alt_ft) is a
+    coverage hole in ongoing cruise, not a fresh departure, even across a
+    gap long enough to trip the ground-gap floor."""
+    t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="aaaaaa",
+        start_ts=t0 - 3600,
+        end_ts=t0,
+        start_lat=40.0,
+        start_lon=-74.0,
+        end_lat=41.0,
+        end_lon=-75.0,
+        end_alt_ft=39_000,
+    )
+    f2_start = t0 + 60 * 60  # 60-minute coverage hole
+    f2, m2 = _make_reappearance_fragment(
+        icao="aaaaaa",
+        start_ts=f2_start,
+        start_lat=41.0,
+        start_lon=-75.0,
+        first_airborne_alt=39_000.0,
+        raw_peak_alt_ft=39_000,
+        last_airborne_alt=39_000,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 1, "High-altitude reappearance must still stitch as a cruise coverage hole"
+
+
+def test_stitch_still_merges_low_descending_reappearance():
+    """A low reappearance that only continues descending toward landing (no
+    climb above first_airborne_alt + stitch_fresh_departure_climb_ft) is
+    still a coverage hole, not a fresh departure - only a genuine climb-away
+    distinguishes a new sortie."""
+    t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="aaaaaa",
+        start_ts=t0 - 1200,
+        end_ts=t0,
+        start_lat=40.0,
+        start_lon=-74.0,
+        end_lat=40.2,
+        end_lon=-74.2,
+        end_alt_ft=3000,
+    )
+    f2_start = t0 + 20 * 60  # 20-minute gap
+    f2, m2 = _make_reappearance_fragment(
+        icao="aaaaaa",
+        start_ts=f2_start,
+        start_lat=40.2,
+        start_lon=-74.2,
+        first_airborne_alt=2500.0,
+        raw_peak_alt_ft=2500,  # only descends after reappearing: peak == first sample
+        last_airborne_alt=200,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 1, "Descending-only reappearance must still stitch; no climb means no fresh departure"
+
+
 def test_stitch_uses_type_endurance_for_long_endurance_aircraft():
     """A KC-135-style long-endurance type should allow stitching across gaps
     larger than the default stitch_max_gap_minutes (90 min). The stitch
@@ -1381,6 +1555,164 @@ def test_extract_flights_parses_trace_json_once_per_row_with_spoof_checks():
         extract_flights(db, config, "aaaaaa", reprocess=True)
 
     assert len(calls) == 3
+
+
+# ---------------------------------------------------------------------------
+# Flight-scoped spoof gate with teleport corroboration (#22)
+# ---------------------------------------------------------------------------
+
+
+def _v2_point(time_offset, lat, lon, alt, gs, *, sil, nic=0, version=2):
+    """Trace point carrying DO-260B v2 aircraft-state fields in the same
+    detail-dict slot integrity.count_v2_integrity reads (point[8])."""
+    return _make_trace_point(time_offset, lat, lon, alt, gs=gs, detail={"version": version, "sil": sil, "nic": nic})
+
+
+def test_mixed_day_extracts_clean_flight_and_quarantines_ghost():
+    """The core #22 regression: a single trace day carrying both a real
+    flight and a ghost broadcast must not quarantine the real one. Day-level
+    pooling would see the combined sil0 rate for the whole day cross the
+    threshold and reject both; the flight-scoped gate judges each flight on
+    its own v2 samples."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+    t = 0.0
+
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+
+    # Flight A: 60 v2 points, all sil != 0 (clean), modest inter-point
+    # spacing (~1.11 km / 60s -> ~36 kt implied speed, nowhere near the
+    # teleport threshold) -> must land in flights.
+    lat = 40.0
+    for _ in range(60):
+        lat += 0.01
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=8, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))  # Flight A lands
+    t += 3600.0  # ground turnaround before Flight B departs
+
+    # Flight B: 60 v2 points, 55/60 (91.7%) sil=0 -- clears the hard tier
+    # (>= 60%) on its own, no teleport corroboration needed -> quarantined.
+    lat2 = 45.0
+    for i in range(60):
+        lat2 += 0.01
+        sil = 0 if i < 55 else 8
+        trace.append(_v2_point(t, lat2, -74.0, 10_000, 250, sil=sil, nic=0))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat2, -74.0, "ground", gs=5))  # Flight B lands
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 1, "the clean flight must be persisted"
+    inserted = db.insert_flight.call_args[0][0]
+    assert inserted.takeoff_lat == 40.0
+
+    assert db.insert_spoofed_broadcast.call_count == 1, "the ghost flight must be quarantined"
+    kwargs = db.insert_spoofed_broadcast.call_args[1]
+    assert kwargs["reason"] == "bimodal_integrity"
+    detail = json.loads(kwargs["reason_detail"])
+    assert detail["scope"] == "flight"
+    assert detail["trigger"] == "hard_sil0"
+
+
+def test_jammed_but_real_flight_passes_flight_gate():
+    """A real flight transiting a GPS-jamming corridor shows a moderate sil0
+    rate (18-25% in the #22 spec evidence) but never exceeds physical ground
+    speeds. Tier 2 (moderate sil0 + teleport) must not fire without the
+    teleport corroboration, so this flight is extracted normally."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+    t = 0.0
+
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+
+    # 40 v2 points, 10/40 (25%) sil=0. Steady ~469 kt ground speed the whole
+    # way (0.13 deg lat per 60s) -- well under the 900 kt teleport threshold.
+    lat = 40.0
+    for i in range(40):
+        lat += 0.13
+        sil = 0 if i < 10 else 8
+        trace.append(_v2_point(t, lat, -74.0, 35_000, 480, sil=sil, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 1
+    assert db.insert_spoofed_broadcast.call_count == 0
+
+
+def test_moderate_sil0_with_teleport_is_quarantined():
+    """Tier 2: a flight at moderate sil0 (between spoof_v2_sil0_pct and the
+    hard tier) is rejected only when corroborated by an inter-fix jump
+    faster than spoof_teleport_speed_kt -- the Hormuz-style spoof profile
+    from the #22 spec evidence."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+    t = 0.0
+
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+
+    lat = 40.0
+    # 40 v2 points, 12/40 (30%) sil=0. All fixes are near-stationary except
+    # one ~1,500 kt inter-fix jump (0.416 deg over 60s) at index 20.
+    for i in range(40):
+        lat += 0.416 if i == 20 else 0.001
+        sil = 0 if i < 12 else 8
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=sil, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 0
+    assert db.insert_spoofed_broadcast.call_count == 1
+    kwargs = db.insert_spoofed_broadcast.call_args[1]
+    assert kwargs["reason"] == "bimodal_integrity"
+    detail = json.loads(kwargs["reason_detail"])
+    assert detail["trigger"] == "sil0_plus_teleport"
+
+
+def test_crude_ek_callsign_gate_still_fires():
+    """The crude shallow-EK heuristic is unchanged by the #22 flight-scoped
+    rewrite: a low-altitude flight with an EK-numbered (IATA-style, not
+    ATC-style) callsign and no matched endpoints is still rejected, even
+    with zero v2 samples at all (below spoof_min_v2_samples, so the bimodal
+    gate never evaluates)."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.01, -74.0, 300, gs=90, detail={"flight": "EK123"}),
+        _make_trace_point(300, 40.02, -74.0, 300, gs=90, detail={"flight": "EK123"}),
+        _make_trace_point(600, 40.03, -74.0, "ground", gs=5),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 0
+    assert db.insert_spoofed_broadcast.call_count == 1
+    kwargs = db.insert_spoofed_broadcast.call_args[1]
+    assert kwargs["reason"] == "crude_heuristic"
 
 
 def test_extract_flights_skips_corrupt_trace_json_row_with_warning(capsys):

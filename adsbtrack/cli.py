@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 import re
@@ -15,10 +16,17 @@ from rich.table import Table
 from .acars import fetch_acars
 from .airframes import AirframesClient
 from .airports import download_airports, enrich_helipad_names
-from .config import SOURCE_URLS, Config
-from .db import Database
+from .config import SOURCE_URLS, Config, is_retryable_fetch_status
+from .db import Database, iter_parsed_trace_days
 from .events import collect_events
 from .fetcher import fetch_traces, fetch_traces_opensky
+from .forensics import (
+    DEFAULT_FRAGMENT_GAP_SECS,
+    callsign_timeline,
+    closest_approach,
+    squawk_timeline,
+    summarize_fragments,
+)
 from .gaps import detect_gaps
 from .models import LandingType
 from .navaids import refresh_navaids as _refresh_navaids
@@ -83,33 +91,50 @@ def _default_fetch_start() -> date:
     return date(date.today().year - 1, 1, 1)
 
 
-def _resume_start_for_all_sources(db: Database, hex_code: str) -> tuple[str | None, str | None]:
-    """Resume date for `fetch --source all`, reduced across every readsb
-    source instead of looked up under the literal (and never-matching)
-    source name "all".
-
-    Returns ``(earliest_last_fetched_date, driving_source)``: the MIN of
-    each source's own last-fetched day (success-filtered, same as the
-    single-source path), and the name of the source that produced it. A
-    source with no success-filtered history is excluded, not treated as
-    "already caught up" -- that would let it get skipped forever. Resuming
-    every source from `MIN(last_day) + 1` (the +1 is applied uniformly by
-    the caller) makes every source catch up; sources that are already
-    further ahead just skip their already-fetched days cheaply via the
-    per-day check inside fetch_traces. Returns (None, None) when no readsb
-    source has any history yet.
-    """
-    earliest_date: str | None = None
-    earliest_source: str | None = None
+def _resume_starts_per_source(db: Database, hex_code: str) -> dict[str, str]:
+    """Last success-filtered fetch date per readsb source. Sources with no
+    history are absent from the dict (a missing source resumes from the
+    earliest peer's start so it can catch up; see the fetch command)."""
+    starts: dict[str, str] = {}
     for src in SOURCE_URLS:
         fetched_dates = db.get_fetched_dates(hex_code, source=src)
-        if not fetched_dates:
+        if fetched_dates:
+            starts[src] = max(fetched_dates)
+    return starts
+
+
+def _source_is_unhealthy(db: Database, source: str, config: Config) -> tuple[bool, int]:
+    """(unhealthy, leading_failures): unhealthy when the source's most recent
+    outcomes are an unbroken run of at least source_health_skip_threshold
+    retryable failures (403/429/5xx)."""
+    outcomes = db.recent_source_outcomes(source, limit=config.source_health_window)
+    leading = 0
+    for status in outcomes:
+        if is_retryable_fetch_status(status):
+            leading += 1
+        else:
+            break
+    return leading >= config.source_health_skip_threshold, leading
+
+
+def _warn_retention_gaps(
+    config: Config, sources_to_fetch: list[str], per_source_start: dict[str, date], end: date
+) -> None:
+    """Print a dim note for any source whose start predates its known
+    archive retention window (config.source_retention_days), so a 404 out
+    there reads as "probably expired" instead of "aircraft not seen"."""
+    for src in sources_to_fetch:
+        retention = config.source_retention_days.get(src)
+        if retention is None:
             continue
-        last_day = max(fetched_dates)
-        if earliest_date is None or last_day < earliest_date:
-            earliest_date = last_day
-            earliest_source = src
-    return earliest_date, earliest_source
+        start = per_source_start.get(src)
+        if start is None or (end - start).days <= retention:
+            continue
+        console.print(
+            f"[dim]{src}: fetching from {start}, more than ~{retention} days before {end}. "
+            f"{src}'s archive may not retain data that old, so 404s past that point could mean "
+            "expired rather than not seen.[/]"
+        )
 
 
 _HEX_RE = re.compile(r"[0-9a-f]{6}")
@@ -249,8 +274,27 @@ def cli():
     "caps request-start spacing; concurrency only helps when request latency "
     "exceeds --rate. Set to 1 for byte-identical serial behavior.",
 )
+@click.option(
+    "--include-unhealthy",
+    is_flag=True,
+    default=False,
+    help="With --source all, fetch every readsb source even if its recent history "
+    "looks like a dead source (all retryable failures). Ignored for a single named source.",
+)
 @_db_option()
-def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end_date, rate, concurrency, db_path):
+def fetch(
+    hex_code,
+    tail_number,
+    source,
+    custom_url,
+    start_date,
+    since_last,
+    end_date,
+    rate,
+    concurrency,
+    include_unhealthy,
+    db_path,
+):
     """Download trace data from ADS-B data sources."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
@@ -265,61 +309,12 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
         if since_last and custom_url:
             raise click.UsageError("--since-last is not supported with --url; pass --start explicitly.")
 
-        # --url resolves its own source name (from the URL's netloc) further
-        # below; resuming here against --source's fetch history would look up
-        # the wrong source, so resume/--since-last only applies to a plain
-        # --source fetch. source == "all" fans out across every readsb
-        # source below, so its resume date is reduced across all of them
-        # too (db.get_fetched_dates(hex, source="all") would never match
-        # any fetch_log row -- "all" isn't a source name that gets written).
-        last_fetched = None
-        resume_driver = None
-        if not custom_url:
-            if source == "all":
-                last_fetched, resume_driver = _resume_start_for_all_sources(db, hex_code)
-            else:
-                fetched_dates = db.get_fetched_dates(hex_code, source=source)
-                last_fetched = max(fetched_dates) if fetched_dates else None
-
-        if since_last:
-            if last_fetched is None:
-                if source == "all":
-                    raise click.UsageError(
-                        f"--since-last requested but no prior fetches found for {hex_code} via any of the "
-                        f"readsb sources under --source all ({', '.join(sorted(SOURCE_URLS))})."
-                    )
-                raise click.UsageError(
-                    f"--since-last requested but no prior fetches found for {hex_code} via source {source!r}."
-                )
-            start = date.fromisoformat(last_fetched) + timedelta(days=1)
-        elif start_date:
-            start = date.fromisoformat(start_date)
-        elif last_fetched is not None:
-            start = date.fromisoformat(last_fetched) + timedelta(days=1)
-            if resume_driver:
-                console.print(
-                    f"[dim]Resuming from {start} ({resume_driver} is furthest behind; pass --start to override)[/]"
-                )
-            else:
-                console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
-        else:
-            start = _default_fetch_start()
-
         end = date.fromisoformat(end_date) if end_date else date.today()
 
-        if custom_url:
-            parsed = urlparse(custom_url)
-            if not parsed.scheme or not parsed.netloc:
-                raise click.BadParameter(
-                    f"Invalid URL: {custom_url}. Must be a full URL like https://example.com/globe_history",
-                    param_hint="--url",
-                )
-            source_name = parsed.netloc.replace(".", "_")
-            SOURCE_URLS[source_name] = custom_url
-            sources_to_fetch = [source_name]
-            console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{custom_url}[/]")
-        elif source == "all":
-            # Fetch from every readsb source + opensky if credentials exist
+        if source == "all" and not custom_url:
+            # Fetch from every readsb source + opensky if credentials exist.
+            # sources_to_fetch is computed first, then filtered by source
+            # health (below), then per-source start dates.
             sources_to_fetch = list(SOURCE_URLS.keys())
             opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
             if not opensky_available:
@@ -335,14 +330,131 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                         pass
             if opensky_available:
                 sources_to_fetch.append("opensky")
-            console.print(
-                f"Fetching [bold]{hex_code}[/] from {start} to {end} via "
-                f"[cyan]all {len(sources_to_fetch)} sources[/]"
-                + (" (incl. OpenSky)" if opensky_available else " (OpenSky skipped: no credentials)")
-            )
+
+            if not include_unhealthy:
+                unhealthy = {}
+                for src in sources_to_fetch:
+                    if src not in SOURCE_URLS:
+                        continue  # opensky isn't tracked in fetch_log by readsb source name
+                    is_unhealthy, leading = _source_is_unhealthy(db, src, config)
+                    if is_unhealthy:
+                        unhealthy[src] = leading
+                if unhealthy:
+                    remaining_readsb = [s for s in sources_to_fetch if s in SOURCE_URLS and s not in unhealthy]
+                    if not remaining_readsb:
+                        console.print(
+                            "[yellow]Every readsb source looks unhealthy; fetching all of them anyway "
+                            "instead of skipping everything.[/]"
+                        )
+                    else:
+                        for src, leading in unhealthy.items():
+                            console.print(
+                                f"[yellow]Skipping {src}: last {leading} attempts all failed (403/429/5xx); "
+                                "pass --include-unhealthy to force[/]"
+                            )
+                        sources_to_fetch = [s for s in sources_to_fetch if s not in unhealthy]
+
+            if start_date:
+                # Explicit --start is user intent: every source uses it
+                # verbatim, unclamped.
+                explicit_start = date.fromisoformat(start_date)
+                per_source_start: dict[str, date] = dict.fromkeys(sources_to_fetch, explicit_start)
+            else:
+                last = _resume_starts_per_source(db, hex_code)
+                if not last:
+                    if since_last:
+                        raise click.UsageError(
+                            f"--since-last requested but no prior fetches found for {hex_code} via any of the "
+                            f"readsb sources under --source all ({', '.join(sorted(SOURCE_URLS))})."
+                        )
+                    per_source_start = dict.fromkeys(sources_to_fetch, _default_fetch_start())
+                else:
+                    # A source with no history resumes from the earliest
+                    # peer's start so it can catch up, instead of being
+                    # skipped forever or stalling at the default start.
+                    fallback = min(date.fromisoformat(d) for d in last.values()) + timedelta(days=1)
+                    # Aligned to the (health-filtered) readsb members of
+                    # sources_to_fetch, not the full SOURCE_URLS -- a
+                    # skipped source must not leave a dangling entry that
+                    # feeds the "uniform start" banner below or gets
+                    # clamped for nothing.
+                    per_source_start = {
+                        src: (date.fromisoformat(last[src]) + timedelta(days=1) if src in last else fallback)
+                        for src in sources_to_fetch
+                        if src in SOURCE_URLS
+                    }
+                    for src, resume_start in list(per_source_start.items()):
+                        if (end - resume_start).days > config.resume_max_lookback_days:
+                            clamped = end - timedelta(days=config.resume_max_lookback_days)
+                            console.print(
+                                f"[yellow]{src}: resume date {resume_start} is more than "
+                                f"{config.resume_max_lookback_days} days behind; clamping to {clamped} "
+                                "(older days skipped -- pass --start to backfill)[/]"
+                            )
+                            per_source_start[src] = clamped
+                    if "opensky" in sources_to_fetch:
+                        # opensky isn't a readsb source (not in SOURCE_URLS),
+                        # so it has no history of its own to resume from --
+                        # use the min of the (already clamped) readsb starts.
+                        per_source_start["opensky"] = min(per_source_start.values())
+
+            starts = set(per_source_start.values())
+            opensky_suffix = " (incl. OpenSky)" if opensky_available else " (OpenSky skipped: no credentials)"
+            if len(starts) == 1:
+                (uniform_start,) = starts
+                console.print(
+                    f"Fetching [bold]{hex_code}[/] from {uniform_start} to {end} via "
+                    f"[cyan]all {len(sources_to_fetch)} sources[/]{opensky_suffix}"
+                )
+            else:
+                console.print(
+                    f"Fetching [bold]{hex_code}[/] to {end} via "
+                    f"[cyan]all {len(sources_to_fetch)} sources[/]{opensky_suffix}"
+                )
+                for src in sources_to_fetch:
+                    console.print(f"  [dim]{src}: from {per_source_start[src]}[/]")
         else:
-            sources_to_fetch = [source]
-            console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
+            # --url resolves its own source name (from the URL's netloc)
+            # below; resuming here against --source's fetch history would
+            # look up the wrong source, so resume/--since-last only applies
+            # to a plain --source fetch.
+            last_fetched = None
+            if not custom_url:
+                fetched_dates = db.get_fetched_dates(hex_code, source=source)
+                last_fetched = max(fetched_dates) if fetched_dates else None
+
+            if since_last:
+                if last_fetched is None:
+                    raise click.UsageError(
+                        f"--since-last requested but no prior fetches found for {hex_code} via source {source!r}."
+                    )
+                start = date.fromisoformat(last_fetched) + timedelta(days=1)
+            elif start_date:
+                start = date.fromisoformat(start_date)
+            elif last_fetched is not None:
+                start = date.fromisoformat(last_fetched) + timedelta(days=1)
+                console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
+            else:
+                start = _default_fetch_start()
+
+            if custom_url:
+                parsed = urlparse(custom_url)
+                if not parsed.scheme or not parsed.netloc:
+                    raise click.BadParameter(
+                        f"Invalid URL: {custom_url}. Must be a full URL like https://example.com/globe_history",
+                        param_hint="--url",
+                    )
+                source_name = parsed.netloc.replace(".", "_")
+                SOURCE_URLS[source_name] = custom_url
+                sources_to_fetch = [source_name]
+                per_source_start = {source_name: start}
+                console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{custom_url}[/]")
+            else:
+                sources_to_fetch = [source]
+                per_source_start = {source: start}
+                console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
+
+        _warn_retention_gaps(config, sources_to_fetch, per_source_start, end)
 
         # Marks this run's trace_days rows, whichever source writes them, so
         # the auto-extract below knows where its new data starts.
@@ -380,11 +492,18 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                         thread_config = _load_config(db_path)
                         thread_config.rate_limit = rate
                         thread_config.fetch_concurrency = concurrency
+                        src_start = per_source_start[src]
                         if src == "opensky":
-                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, start, end)
+                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
                         else:
                             stats = fetch_traces(
-                                thread_db, thread_config, hex_code, start, end, source=src, progress=shared_progress
+                                thread_db,
+                                thread_config,
+                                hex_code,
+                                src_start,
+                                end,
+                                source=src,
+                                progress=shared_progress,
                             )
                         with lock:
                             per_source_stats[src] = stats
@@ -406,10 +525,11 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                 )
         else:
             src = sources_to_fetch[0]
+            src_start = per_source_start[src]
             if src == "opensky":
-                stats = fetch_traces_opensky(db, config, hex_code, start, end)
+                stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
             else:
-                stats = fetch_traces(db, config, hex_code, start, end, source=src)
+                stats = fetch_traces(db, config, hex_code, src_start, end, source=src)
             _accumulate(stats)
 
         console.print(
@@ -1724,6 +1844,167 @@ def _pct(mix: dict, key: str) -> str:
     if total == 0:
         return "-"
     return f"{100 * mix.get(key, 0) // total}%"
+
+
+@cli.command("inspect")
+@click.option("--hex", "hex_code", callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", help=TAIL_HELP)
+@click.option("--date", "date_str", required=True, help="Day to inspect (YYYY-MM-DD)")
+@click.option("--source", default=None, help="Limit to one source (default: every source with data)")
+@click.option("--gap-secs", default=None, type=float, help="Fragment split gap in seconds (default 300)")
+@click.option("--airport", default=None, help="Airport ident for closest-approach (e.g. EGOV, KTYS)")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+@_db_option()
+def inspect_cmd(hex_code, tail_number, date_str, source, gap_secs, airport, as_json, db_path):
+    """Forensic view of one aircraft-day: fragments, integrity, squawks.
+
+    Splits each source's trace into fragments on inter-point gaps, reports
+    per-fragment integrity (v2/sil0/nic0) and identity (callsigns, squawks)
+    counts, and shows the squawk/callsign timeline and (with --airport)
+    closest-approach distance across every source's points merged into one
+    chronological stream.
+    """
+    gap_threshold = gap_secs if gap_secs is not None else DEFAULT_FRAGMENT_GAP_SECS
+
+    with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
+        config = _load_config(db_path)
+
+        rows = db.get_trace_day(hex_code, date_str)
+        if source:
+            rows = [row for row in rows if row["source"] == source]
+        parsed_rows = list(iter_parsed_trace_days(rows, hex_code))
+
+        sources: dict[str, list] = {}
+        combined_points: list[tuple[float, list]] = []
+        for row, trace in parsed_rows:
+            sources[row["source"]] = summarize_fragments(row["source"], row["timestamp"], trace, gap_threshold)
+            for point in trace:
+                if isinstance(point, list):
+                    combined_points.append((row["timestamp"] + point[0], point))
+
+        combined_points.sort(key=lambda item: item[0])
+        combined_base_ts = combined_points[0][0] if combined_points else 0.0
+        combined_trace = []
+        for abs_ts, point in combined_points:
+            shifted = list(point)
+            shifted[0] = abs_ts - combined_base_ts
+            combined_trace.append(shifted)
+
+        sq_timeline = squawk_timeline(combined_base_ts, combined_trace)
+        cs_timeline = callsign_timeline(combined_base_ts, combined_trace)
+
+        approach = None
+        if airport:
+            ensure_airports(db, config)
+            ident = airport.strip().upper()
+            apt_row = db.conn.execute(
+                "SELECT latitude_deg, longitude_deg FROM airports WHERE ident = ?", (ident,)
+            ).fetchone()
+            if apt_row is None:
+                raise click.UsageError(f"Unknown airport ident {ident!r}.")
+            approach = closest_approach(
+                combined_base_ts, combined_trace, apt_row["latitude_deg"], apt_row["longitude_deg"]
+            )
+
+    if not sources:
+        suffix = f" (source={source})" if source else ""
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "hex": hex_code,
+                        "date": date_str,
+                        "sources": {},
+                        "squawk_timeline": [],
+                        "callsign_timeline": [],
+                        "closest_approach": None,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[yellow]No trace data for {hex_code} on {date_str}{suffix}.[/]")
+        return
+
+    if as_json:
+        payload = {
+            "hex": hex_code,
+            "date": date_str,
+            "sources": {src: [dataclasses.asdict(frag) for frag in frags] for src, frags in sources.items()},
+            "squawk_timeline": sq_timeline,
+            "callsign_timeline": cs_timeline,
+            "closest_approach": {"dist_km": approach[0], "ts": approach[1], "alt": approach[2]} if approach else None,
+        }
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    for src, fragments in sources.items():
+        table = Table(title=f"{hex_code} {date_str} -- source={src}")
+        table.add_column("FRAG", justify="right")
+        table.add_column("START Z")
+        table.add_column("END Z")
+        table.add_column("PTS", justify="right")
+        table.add_column("FROM")
+        table.add_column("TO")
+        table.add_column("ALT")
+        table.add_column("GS")
+        table.add_column("V2/SIL0/NIC0")
+        table.add_column("CS")
+        table.add_column("SQ")
+        table.add_column("SRC-MIX")
+
+        for i, frag in enumerate(fragments, start=1):
+            start_z = datetime.fromtimestamp(frag.start_ts, UTC).strftime("%H:%M:%SZ")
+            end_z = datetime.fromtimestamp(frag.end_ts, UTC).strftime("%H:%M:%SZ")
+            alt = (
+                f"{frag.alt_min:.0f}-{frag.alt_max:.0f} ft"
+                if frag.alt_min is not None and frag.alt_max is not None
+                else "-"
+            )
+            gs_known = frag.gs_min is not None and frag.gs_max is not None
+            gs = f"{frag.gs_min:.0f}-{frag.gs_max:.0f} kt" if gs_known else "-"
+            integrity = f"{frag.v2_samples}/{frag.v2_sil0}/{frag.v2_nic0}"
+            cs = ", ".join(frag.callsigns) if frag.callsigns else "-"
+            sq = ", ".join(frag.squawks) if frag.squawks else "-"
+            src_mix = (
+                ", ".join(f"{k}:{v}" for k, v in sorted(frag.position_sources.items()))
+                if frag.position_sources
+                else "-"
+            )
+            table.add_row(
+                str(i),
+                start_z,
+                end_z,
+                str(frag.n_points),
+                f"{frag.start_lat:.4f},{frag.start_lon:.4f}",
+                f"{frag.end_lat:.4f},{frag.end_lon:.4f}",
+                alt,
+                gs,
+                integrity,
+                cs,
+                sq,
+                src_mix,
+            )
+        console.print(table)
+
+    if sq_timeline:
+        console.print("\n[bold]Squawk timeline:[/]")
+        for ts, val in sq_timeline:
+            console.print(f"  {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')}  {val}")
+
+    if cs_timeline:
+        console.print("\n[bold]Callsign timeline:[/]")
+        for ts, val in cs_timeline:
+            console.print(f"  {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')}  {val}")
+
+    if approach:
+        dist_km, ts, alt = approach
+        alt_str = f"{alt:.0f} ft" if alt is not None else "unknown alt"
+        console.print(
+            f"\n[bold]Closest approach to {ident}:[/] "
+            f"{dist_km:.2f} km at {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')} ({alt_str})"
+        )
 
 
 @cli.command()

@@ -389,6 +389,11 @@ class Config:
     spoof_flight_sil0_hard_pct: float = 60.0
     spoof_teleport_speed_kt: float = 900.0
 
+    # watch: minimum days of silence before a reappearance counts as a
+    # "reactivation" alert. Grounded/sanctioned airframes waking up is the
+    # signal this exists for; routine overnight gaps must not fire it.
+    watch_dormancy_days: int = 30
+
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km

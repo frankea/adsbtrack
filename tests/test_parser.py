@@ -893,8 +893,11 @@ def test_stitch_vetoes_fresh_departure_after_ground_gap():
 
 def test_stitch_still_merges_go_around_reappearance():
     """A short gap (well under stitch_min_ground_gap_secs) must still merge
-    even though the reappearing fragment climbs a lot afterward - the veto
-    only fires on gaps long enough to represent real ground time."""
+    even though the reappearing fragment climbs well past the veto's climb
+    threshold afterward - the gap check alone is what keeps the veto from
+    firing here (raw_peak_alt_ft - first_airborne_alt = 2,500 ft > the 2,000
+    ft climb threshold, so if the gap condition were ever dropped this test
+    would catch it)."""
     t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
     f1, m1 = _make_signal_lost_fragment(
         icao="aaaaaa",
@@ -913,7 +916,7 @@ def test_stitch_still_merges_go_around_reappearance():
         start_lat=40.05,
         start_lon=-74.05,
         first_airborne_alt=1500.0,
-        raw_peak_alt_ft=3000,
+        raw_peak_alt_ft=4000,
         last_airborne_alt=100,
     )
 

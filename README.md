@@ -229,6 +229,34 @@ Traces from multiple sources are automatically merged during extraction. `--sour
 | [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
 
+## Watching a hex list
+
+Run a lightweight fetch/extract/alert cycle over a list of hexes, meant to be driven by a **daily** cron:
+
+```
+uv run python -m adsbtrack.cli watch --hex a66ad3 --hex adf64f
+```
+
+Each run fetches from every healthy readsb source through *yesterday*, never today - archives take time to finalize after UTC midnight, so a source can hand back a terminal "no data" answer for today that's really just "not posted yet," and that answer would otherwise be recorded as fetched and never retried. This caps alert latency at roughly a day; running more often than daily doesn't get you fresher data, just redundant fetches against a window that hasn't moved.
+
+The run then extracts and compares each aircraft's state before and after. Three things fire an alert: an aircraft going quiet for `watch_dormancy_days` (default 30) and then reappearing, a new flight carrying an emergency squawk (7500/7600/7700) or the `had_emergency` flag, and a new row landing in `spoofed_broadcasts`. A hex with no prior trace history baselines silently on its first run instead of flooding on a backfill, and a reactivation alert additionally requires a fetch_log row from an *earlier* run somewhere inside the gap - so pointing `watch` at a database `fetch` already populated doesn't misread watch's own first look as a dormancy period.
+
+`--watchlist <path>` reads one hex per line from a file and unions it with any `--hex` flags (duplicates deduped); blank lines and `#` comments (wherever they start on the line) are ignored:
+
+```
+# rotating watchlist
+a66ad3   # G650 tail N512WB
+adf64f
+```
+
+Exit code is `3` when any alert fired, `0` otherwise, so a cron entry only needs to react to failure:
+
+```
+0 2 * * * adsbtrack watch --watchlist ~/.config/adsbtrack/watchlist.txt --webhook https://ntfy.sh/mytopic
+```
+
+`--webhook <url>` POSTs the run's alerts as JSON to that URL, but only when at least one fired. `--dormancy-days N` overrides the reactivation threshold for one run. `--json` prints a single machine-readable document (`generated_at`, `alerts`, per-hex `hexes` status) instead of the status lines and table; anything the run would otherwise print to the terminal goes to stderr instead, so stdout stays valid JSON.
+
 ## Interactive surfaces
 
 ### Terminal UI

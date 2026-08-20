@@ -1,7 +1,9 @@
+import contextlib
 import dataclasses
 import json
 import os
 import re
+import sys
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from importlib.metadata import version as pkg_version
@@ -10,6 +12,7 @@ from urllib.parse import urlparse
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
@@ -33,6 +36,7 @@ from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
 from .runways import refresh_runways
+from .watch import WatchAlert, evaluate, post_webhook, snapshot_state
 
 ALL_SOURCES = list(SOURCE_URLS.keys()) + ["opensky"]
 # "all" fetches from every readsb source (excludes opensky which needs creds)
@@ -158,6 +162,13 @@ def _validate_hex(ctx: click.Context, param: click.Parameter, value: str | None)
             f"{value!r} is not a valid ICAO hex code; expected exactly 6 hex digits (0-9, a-f), e.g. adf64f."
         )
     return normalized
+
+
+def _validate_hex_multi(ctx: click.Context, param: click.Parameter, value: tuple[str, ...]) -> tuple[str, ...]:
+    """Click callback for a --hex option with multiple=True: apply
+    _validate_hex's normalization/error to each element of the tuple Click
+    hands back for a repeatable option."""
+    return tuple(_validate_hex(ctx, param, v) for v in value)
 
 
 def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None) -> str:
@@ -2095,6 +2106,180 @@ def events(hex_code, tail_number, db_path, since_str, severity, output_json):
     console.print(
         f"\n[bold]Summary:[/] [red]{summary['emergency']} emergency[/], [yellow]{summary['unusual']} unusual[/]"
     )
+
+
+# -----------------------------------------------------------------------------
+# watch (#24)
+# -----------------------------------------------------------------------------
+
+
+def _parse_watchlist(path: Path) -> list[str]:
+    """Parse a `watch --watchlist` file: one hex per line, blank lines
+    ignored, and a '#' -- whether it starts the line or trails a hex --
+    starting a comment that runs to end of line. Each surviving line is
+    normalized and validated the same way --hex is."""
+    hexes: list[str] = []
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        normalized = line.lower()
+        if not _HEX_RE.fullmatch(normalized):
+            raise click.UsageError(
+                f"{line!r} in watchlist {path} is not a valid ICAO hex code; expected exactly 6 hex digits (0-9, a-f)."
+            )
+        hexes.append(normalized)
+    return hexes
+
+
+def _collect_watch_hexes(hex_codes: tuple[str, ...], watchlist_path: str | None) -> list[str]:
+    """Union of --hex values and watchlist-file entries, deduped preserving
+    first-seen order. Raises click.UsageError when the union is empty."""
+    hexes: list[str] = []
+    seen: set[str] = set()
+    for h in hex_codes:
+        if h not in seen:
+            seen.add(h)
+            hexes.append(h)
+    if watchlist_path:
+        for h in _parse_watchlist(Path(watchlist_path)):
+            if h not in seen:
+                seen.add(h)
+                hexes.append(h)
+    if not hexes:
+        raise click.UsageError("Provide at least one --hex or a --watchlist file with at least one hex code.")
+    return hexes
+
+
+@cli.command("watch")
+@click.option("--hex", "hex_codes", multiple=True, callback=_validate_hex_multi, help="Hex to watch (repeatable)")
+@click.option(
+    "--watchlist",
+    "watchlist_path",
+    type=click.Path(exists=True),
+    default=None,
+    help="File with one hex per line; '#' comments and blank lines ignored",
+)
+@click.option("--webhook", default=None, help="POST alerts as JSON to this URL when any fire")
+@click.option("--dormancy-days", type=click.IntRange(min=1), default=None, help="Override Config.watch_dormancy_days")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+@_db_option()
+def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_path):
+    """Fetch a hex watchlist and alert on reactivation, emergencies, and new spoof quarantines."""
+    hexes = _collect_watch_hexes(hex_codes, watchlist_path)
+
+    config = _load_config(db_path)
+    if dormancy_days is not None:
+        config.watch_dormancy_days = dormancy_days
+
+    # Archives finalize sometime after UTC midnight; a source can hand back
+    # a terminal 404/204 for TODAY well before today is actually over, and
+    # that terminal answer gets recorded as "fetched" -- ending the window
+    # at today would mark it done for good and it would never be
+    # re-requested. Ending at yesterday accepts up to ~24h of alert latency
+    # in exchange for never silently losing a day's data.
+    end = date.today() - timedelta(days=1)
+    hex_statuses: dict[str, str] = {}
+    all_alerts: list[WatchAlert] = []
+    document: dict = {}
+
+    # --json must be one valid JSON document on stdout. Anything this run
+    # would normally print (skip notes, failures, parser.py's own
+    # incremental-refusal prints) still needs to reach the operator, so
+    # redirect stdout to stderr for the duration instead of suppressing it.
+    # Rich's Console and the stdlib print() both resolve sys.stdout at
+    # write time, so this catches every source, not just our own calls.
+    stdout_guard = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+
+    with stdout_guard, Database(Path(db_path)) as db:
+        ensure_airports(db, config)
+
+        for hex_code in hexes:
+            run_started_at = datetime.now(UTC).isoformat()
+            pre = snapshot_state(db, hex_code)
+            try:
+                last = _resume_starts_per_source(db, hex_code)
+                unhealthy: dict[str, int] = {}
+                for src in SOURCE_URLS:
+                    is_unhealthy, leading = _source_is_unhealthy(db, src, config)
+                    if is_unhealthy:
+                        unhealthy[src] = leading
+                if unhealthy and len(unhealthy) == len(SOURCE_URLS):
+                    console.print(
+                        f"[yellow]{hex_code}: every readsb source looks unhealthy; fetching all of them "
+                        "anyway instead of skipping everything.[/]"
+                    )
+                    unhealthy = {}
+
+                for src in SOURCE_URLS:
+                    if src in unhealthy:
+                        console.print(
+                            f"[dim]{hex_code}: skipping {src} (unhealthy, last {unhealthy[src]} attempts failed)[/]"
+                        )
+                        continue
+                    if src in last:
+                        start = date.fromisoformat(last[src]) + timedelta(days=1)
+                    else:
+                        start = end - timedelta(days=config.resume_max_lookback_days)
+                    if (end - start).days > config.resume_max_lookback_days:
+                        clamped = end - timedelta(days=config.resume_max_lookback_days)
+                        console.print(
+                            f"[dim]{hex_code}: {src} resume date {start} is more than "
+                            f"{config.resume_max_lookback_days} days behind; clamping to {clamped}[/]"
+                        )
+                        start = clamped
+                    fetch_traces(db, config, hex_code, start, end, source=src, progress=None)
+
+                # Re-extract only what this run's new trace days can affect,
+                # same as `fetch` does -- a run that landed nothing changes no
+                # flight, so there is nothing to redo, and a quiet cron tick
+                # over a long-lived aircraft's whole history stays cheap.
+                earliest_new = db.get_earliest_trace_date_since(hex_code, run_started_at)
+                if earliest_new is not None:
+                    extract_flights(db, config, hex_code, since_date=date.fromisoformat(earliest_new))
+
+                alerts = evaluate(db, hex_code, pre, run_started_at, config)
+            except Exception as exc:
+                console.print(f"[red]{hex_code}: watch run failed: {escape(str(exc))}[/]")
+                hex_statuses[hex_code] = "error"
+                continue
+
+            all_alerts.extend(alerts)
+            if not pre.has_any_trace:
+                status = "baselined"
+            elif alerts:
+                status = f"{len(alerts)} alert(s)"
+            else:
+                status = "no alerts"
+            hex_statuses[hex_code] = status
+            if not as_json:
+                console.print(f"{hex_code}: {status}")
+
+        document = {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "alerts": [dataclasses.asdict(a) for a in all_alerts],
+            "hexes": hex_statuses,
+        }
+
+        if all_alerts and webhook:
+            try:
+                post_webhook(webhook, document, config.watch_webhook_timeout_secs)
+            except Exception as exc:
+                console.print(f"[red]webhook POST to {escape(webhook)} failed: {escape(str(exc))}[/]")
+
+    if as_json:
+        click.echo(json.dumps(document, indent=2))
+    elif all_alerts:
+        table = Table(title=f"{len(all_alerts)} alert(s)")
+        table.add_column("KIND")
+        table.add_column("ICAO")
+        table.add_column("SUMMARY")
+        for alert in all_alerts:
+            table.add_row(alert.kind, alert.icao, alert.summary)
+        console.print(table)
+
+    if all_alerts:
+        sys.exit(3)
 
 
 # -----------------------------------------------------------------------------

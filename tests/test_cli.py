@@ -2830,6 +2830,10 @@ def test_inspect_cli_no_trace_data_exits_zero_with_message(tmp_path):
 def test_inspect_cli_unknown_airport_errors(tmp_path):
     db_path = tmp_path / "inspect.db"
     _seed_inspect_trace(db_path)
+    # Seed EGLL so ensure_airports() sees a non-empty table and doesn't try to
+    # download the OurAirports CSV; query a distinct ident ("ZZZZ") so the
+    # unknown-ident path is still exercised.
+    _seed_airport(db_path)
 
     result = CliRunner().invoke(
         cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--airport", "ZZZZ", "--db", str(db_path)]

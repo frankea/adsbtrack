@@ -1902,7 +1902,7 @@ def inspect_cmd(hex_code, tail_number, date_str, source, gap_secs, airport, as_j
                 "SELECT latitude_deg, longitude_deg FROM airports WHERE ident = ?", (ident,)
             ).fetchone()
             if apt_row is None:
-                raise click.UsageError(f"Unknown airport ident {airport!r}.")
+                raise click.UsageError(f"Unknown airport ident {ident!r}.")
             approach = closest_approach(
                 combined_base_ts, combined_trace, apt_row["latitude_deg"], apt_row["longitude_deg"]
             )
@@ -2002,7 +2002,7 @@ def inspect_cmd(hex_code, tail_number, date_str, source, gap_secs, airport, as_j
         dist_km, ts, alt = approach
         alt_str = f"{alt:.0f} ft" if alt is not None else "unknown alt"
         console.print(
-            f"\n[bold]Closest approach to {airport.strip().upper()}:[/] "
+            f"\n[bold]Closest approach to {ident}:[/] "
             f"{dist_km:.2f} km at {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')} ({alt_str})"
         )
 

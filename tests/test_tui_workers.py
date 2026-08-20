@@ -40,7 +40,13 @@ async def _settle(app, pilot) -> None:
     for _ in range(500):
         active = [w for w in app.workers if w.state.name in ("PENDING", "RUNNING")]
         if not active:
-            return
+            # A worker that just finished delivers its UI updates via
+            # messages that may not have been pumped yet, and those
+            # handlers can start follow-on workers: flush, then re-check.
+            await pilot.pause()
+            if not [w for w in app.workers if w.state.name in ("PENDING", "RUNNING")]:
+                return
+            continue
         await pilot.pause()
         await asyncio.sleep(0.01)
     raise AssertionError("workers did not settle in time")

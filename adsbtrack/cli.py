@@ -2192,13 +2192,21 @@ def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_pat
                     if (end - start).days > config.resume_max_lookback_days:
                         start = end - timedelta(days=config.resume_max_lookback_days)
                     fetch_traces(db, config, hex_code, start, end, source=src, progress=None)
-                extract_flights(db, config, hex_code)
+
+                # Re-extract only what this run's new trace days can affect,
+                # same as `fetch` does -- a run that landed nothing changes no
+                # flight, so there is nothing to redo, and a quiet cron tick
+                # over a long-lived aircraft's whole history stays cheap.
+                earliest_new = db.get_earliest_trace_date_since(hex_code, run_started_at)
+                if earliest_new is not None:
+                    extract_flights(db, config, hex_code, since_date=date.fromisoformat(earliest_new))
+
+                alerts = evaluate(db, hex_code, pre, run_started_at, config)
             except Exception as exc:
-                console.print(f"[red]{hex_code}: fetch/extract failed: {exc}[/]")
+                console.print(f"[red]{hex_code}: watch run failed: {exc}[/]")
                 hex_statuses[hex_code] = "error"
                 continue
 
-            alerts = evaluate(db, hex_code, pre, run_started_at, config)
             all_alerts.extend(alerts)
             if not pre.has_any_trace:
                 status = "baselined"

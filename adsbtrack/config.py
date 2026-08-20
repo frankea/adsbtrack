@@ -299,6 +299,21 @@ class Config:
     # skipped; pass --start explicitly to backfill deeper. Only applies to
     # --source all resumes - a single named source is explicit user intent.
     resume_max_lookback_days: int = 90
+
+    # Source health (fetch --source all planning). A source whose most recent
+    # source_health_skip_threshold day-requests were ALL retryable failures
+    # (403/429/5xx - see is_retryable_fetch_status) is skipped for the run
+    # with a warning; --include-unhealthy forces it back in. Derived from
+    # fetch_log.fetched_at at plan time - no separate health table.
+    source_health_window: int = 30
+    source_health_skip_threshold: int = 20
+    # Observed archive retention per source (days), None = unknown/unlimited.
+    # theairtraffic: returned no data for dates ~90 days old that two other
+    # networks had dense coverage for (2026-08 observation). Used only to
+    # annotate fetch output - a 404 beyond retention reads "probably
+    # expired", not "aircraft not seen".
+    source_retention_days: dict[str, int | None] = field(default_factory=lambda: {"theairtraffic": 90})
+
     airport_match_threshold_km: float = 10.0
     airport_types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")
     landing_speed_threshold_kts: float = 80.0  # ground speed above which a "ground" alt reading is ignored

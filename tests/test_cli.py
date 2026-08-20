@@ -2061,6 +2061,210 @@ def test_fetch_cli_source_all_single_source_history_unaffected(tmp_path, monkeyp
     assert "Resuming from 2026-05-02 (last fetched day; pass --start to override)" in result.output
 
 
+# ---------------------------------------------------------------------------
+# source health skip + retention annotations (#20)
+# ---------------------------------------------------------------------------
+
+
+def _seed_sick_source(db, icao: str, source: str, num_days: int = 20, status: int = 502, start_month_day=1) -> None:
+    """Seed `num_days` consecutive retryable-failure fetch_log rows for one
+    source, starting at 2026-01-<start_month_day>."""
+    for i in range(num_days):
+        db.insert_fetch_log(icao, f"2026-01-{start_month_day + i:02d}", status, source=source)
+
+
+def test_source_all_skips_unhealthy_source(tmp_path, monkeypatch):
+    """`fetch --source all` skips a readsb source whose last
+    source_health_skip_threshold (20) day-requests were all retryable
+    failures (403/429/5xx), instead of burning a full backoff ladder on a
+    source known to be sick. The other (healthy) readsb sources still run."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        _seed_sick_source(db, "ff11ff", "adsblol")
+        db.insert_fetch_log("ff11ff", "2026-02-01", 200, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "ff11ff",
+            "--source",
+            "all",
+            "--start",
+            "2026-02-01",
+            "--end",
+            "2026-02-10",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    sources_called = {c[0] for c in calls}
+    assert "adsblol" not in sources_called
+    assert sources_called == {"adsbx", "adsbfi", "airplaneslive", "theairtraffic"}
+    assert "Skipping adsblol" in result.output
+    assert "--include-unhealthy" in result.output
+
+
+def test_include_unhealthy_forces_sick_source(tmp_path, monkeypatch):
+    """--include-unhealthy overrides the health skip, forcing the sick
+    source back into the fetch."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        _seed_sick_source(db, "ff12ff", "adsblol")
+        db.insert_fetch_log("ff12ff", "2026-02-01", 200, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "ff12ff",
+            "--source",
+            "all",
+            "--include-unhealthy",
+            "--start",
+            "2026-02-01",
+            "--end",
+            "2026-02-10",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    sources_called = {c[0] for c in calls}
+    assert "adsblol" in sources_called
+    assert "Skipping adsblol" not in result.output
+
+
+def test_named_single_source_never_health_skipped(tmp_path, monkeypatch):
+    """A named single source (not 'all') is explicit user intent, so it
+    always runs regardless of its recent health history."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        _seed_sick_source(db, "ff13ff", "adsblol")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "ff13ff",
+            "--source",
+            "adsblol",
+            "--start",
+            "2026-02-01",
+            "--end",
+            "2026-02-10",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls and calls[0][0] == "adsblol"
+    assert "skipping" not in result.output.lower()
+
+
+def test_all_sources_unhealthy_falls_back_to_unfiltered(tmp_path, monkeypatch):
+    """Health filtering must never brick the fetch entirely: if every readsb
+    source looks unhealthy, the filter backs off and fetches all of them
+    anyway, with a warning instead of a skip."""
+    from adsbtrack.config import SOURCE_URLS
+
+    calls = _capture_fetch_calls(monkeypatch)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        for src in SOURCE_URLS:
+            _seed_sick_source(db, "aa33aa", src)
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "aa33aa",
+            "--source",
+            "all",
+            "--start",
+            "2026-02-01",
+            "--end",
+            "2026-02-10",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    sources_called = {c[0] for c in calls}
+    assert sources_called == set(SOURCE_URLS)
+    assert "unhealthy" in result.output.lower()
+
+
+def test_retention_note_printed_for_old_window(tmp_path, monkeypatch):
+    """theairtraffic's observed ~90-day archive retention (source_retention_days)
+    gets annotated when a fetch's start predates that window, so a 404 out
+    there reads as "probably expired" rather than "aircraft not seen"."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.conn.commit()
+
+    old_start = date(2026, 1, 1)  # > 90 days before the --end below
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "aa44aa",
+            "--source",
+            "theairtraffic",
+            "--start",
+            old_start.isoformat(),
+            "--end",
+            "2026-08-01",
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [("theairtraffic", old_start, date(2026, 8, 1))]
+    assert "theairtraffic" in result.output
+    assert "90" in result.output
+    assert "expired" in result.output.lower()
+
+
 def test_fetch_cli_default_start_is_jan_1_of_last_year(tmp_path, monkeypatch):
     """No prior fetch_log rows and no --start: default start is January 1 of
     the previous calendar year, computed at runtime rather than a frozen date."""

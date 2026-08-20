@@ -15,7 +15,7 @@ from rich.table import Table
 from .acars import fetch_acars
 from .airframes import AirframesClient
 from .airports import download_airports, enrich_helipad_names
-from .config import SOURCE_URLS, Config
+from .config import SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database
 from .events import collect_events
 from .fetcher import fetch_traces, fetch_traces_opensky
@@ -93,6 +93,40 @@ def _resume_starts_per_source(db: Database, hex_code: str) -> dict[str, str]:
         if fetched_dates:
             starts[src] = max(fetched_dates)
     return starts
+
+
+def _source_is_unhealthy(db: Database, source: str, config: Config) -> tuple[bool, int]:
+    """(unhealthy, leading_failures): unhealthy when the source's most recent
+    outcomes are an unbroken run of at least source_health_skip_threshold
+    retryable failures (403/429/5xx)."""
+    outcomes = db.recent_source_outcomes(source, limit=config.source_health_window)
+    leading = 0
+    for status in outcomes:
+        if is_retryable_fetch_status(status):
+            leading += 1
+        else:
+            break
+    return leading >= config.source_health_skip_threshold, leading
+
+
+def _warn_retention_gaps(
+    config: Config, sources_to_fetch: list[str], per_source_start: dict[str, date], end: date
+) -> None:
+    """Print a dim note for any source whose start predates its known
+    archive retention window (config.source_retention_days), so a 404 out
+    there reads as "probably expired" instead of "aircraft not seen"."""
+    for src in sources_to_fetch:
+        retention = config.source_retention_days.get(src)
+        if retention is None:
+            continue
+        start = per_source_start.get(src)
+        if start is None or (end - start).days <= retention:
+            continue
+        console.print(
+            f"[dim]{src}: fetching from {start}, more than ~{retention} days before {end}. "
+            f"{src}'s archive may not retain data that old, so 404s past that point could mean "
+            "expired rather than not seen.[/]"
+        )
 
 
 _HEX_RE = re.compile(r"[0-9a-f]{6}")
@@ -232,8 +266,27 @@ def cli():
     "caps request-start spacing; concurrency only helps when request latency "
     "exceeds --rate. Set to 1 for byte-identical serial behavior.",
 )
+@click.option(
+    "--include-unhealthy",
+    is_flag=True,
+    default=False,
+    help="With --source all, fetch every readsb source even if its recent history "
+    "looks like a dead source (all retryable failures). Ignored for a single named source.",
+)
 @_db_option()
-def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end_date, rate, concurrency, db_path):
+def fetch(
+    hex_code,
+    tail_number,
+    source,
+    custom_url,
+    start_date,
+    since_last,
+    end_date,
+    rate,
+    concurrency,
+    include_unhealthy,
+    db_path,
+):
     """Download trace data from ADS-B data sources."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
@@ -252,8 +305,8 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
 
         if source == "all" and not custom_url:
             # Fetch from every readsb source + opensky if credentials exist.
-            # sources_to_fetch is computed first (Task 2 inserts a
-            # source-health filter here), then per-source start dates.
+            # sources_to_fetch is computed first, then filtered by source
+            # health (below), then per-source start dates.
             sources_to_fetch = list(SOURCE_URLS.keys())
             opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
             if not opensky_available:
@@ -269,6 +322,29 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                         pass
             if opensky_available:
                 sources_to_fetch.append("opensky")
+
+            if not include_unhealthy:
+                unhealthy = {}
+                for src in sources_to_fetch:
+                    if src not in SOURCE_URLS:
+                        continue  # opensky isn't tracked in fetch_log by readsb source name
+                    is_unhealthy, leading = _source_is_unhealthy(db, src, config)
+                    if is_unhealthy:
+                        unhealthy[src] = leading
+                if unhealthy:
+                    remaining_readsb = [s for s in sources_to_fetch if s in SOURCE_URLS and s not in unhealthy]
+                    if not remaining_readsb:
+                        console.print(
+                            "[yellow]Every readsb source looks unhealthy; fetching all of them anyway "
+                            "instead of skipping everything.[/]"
+                        )
+                    else:
+                        for src, leading in unhealthy.items():
+                            console.print(
+                                f"[yellow]Skipping {src}: last {leading} attempts all failed (403/429/5xx); "
+                                "pass --include-unhealthy to force[/]"
+                            )
+                        sources_to_fetch = [s for s in sources_to_fetch if s not in unhealthy]
 
             if start_date:
                 # Explicit --start is user intent: every source uses it
@@ -289,9 +365,15 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                     # peer's start so it can catch up, instead of being
                     # skipped forever or stalling at the default start.
                     fallback = min(date.fromisoformat(d) for d in last.values()) + timedelta(days=1)
+                    # Aligned to the (health-filtered) readsb members of
+                    # sources_to_fetch, not the full SOURCE_URLS -- a
+                    # skipped source must not leave a dangling entry that
+                    # feeds the "uniform start" banner below or gets
+                    # clamped for nothing.
                     per_source_start = {
                         src: (date.fromisoformat(last[src]) + timedelta(days=1) if src in last else fallback)
-                        for src in SOURCE_URLS
+                        for src in sources_to_fetch
+                        if src in SOURCE_URLS
                     }
                     for src, resume_start in list(per_source_start.items()):
                         if (end - resume_start).days > config.resume_max_lookback_days:
@@ -363,6 +445,8 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                 sources_to_fetch = [source]
                 per_source_start = {source: start}
                 console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
+
+        _warn_retention_gaps(config, sources_to_fetch, per_source_start, end)
 
         # Marks this run's trace_days rows, whichever source writes them, so
         # the auto-extract below knows where its new data starts.

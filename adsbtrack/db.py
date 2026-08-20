@@ -1142,6 +1142,17 @@ class Database:
         ).fetchall()
         return {row["date"] for row in rows}
 
+    def recent_source_outcomes(self, source: str, limit: int = 30) -> list[int]:
+        """Most recent day-request statuses for a source across all aircraft,
+        newest first. The fetch planner's health check reads the leading run
+        of retryable failures from this; bounded by ``limit`` so the scan
+        stays cheap however large fetch_log grows."""
+        rows = self.conn.execute(
+            "SELECT status FROM fetch_log WHERE source = ? ORDER BY fetched_at DESC, rowid DESC LIMIT ?",
+            (source, limit),
+        ).fetchall()
+        return [row["status"] for row in rows]
+
     # -- flights --
 
     def clear_flights(self, icao: str):

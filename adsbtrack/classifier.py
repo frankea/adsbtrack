@@ -211,6 +211,12 @@ class FlightMetrics:
     _last_callsign: str | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
     # last airborne baro altitude
     last_airborne_alt: int | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
+    # First airborne baro/geom altitude observed this fragment (mirror of
+    # last_airborne_alt, set once and never overwritten). keep_first: the
+    # fresh-departure stitch veto (parser._stitch_fragments, #21) needs the
+    # REAPPEARING fragment's own first altitude to tell a new sortie's
+    # climb-out from a coverage hole in ongoing cruise.
+    first_airborne_alt: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_FIRST})
     last_airborne_geom: int | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
     last_airborne_gs: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
     last_airborne_baro_rate: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_LAST})
@@ -352,6 +358,17 @@ class FlightMetrics:
         return self._persisted_max_altitude if self._persisted_max_altitude > 0 else self._raw_max_altitude
 
     @property
+    def raw_peak_altitude_ft(self) -> int:
+        """RAW observed altitude peak, bypassing the AP-validated
+        persistence filter that backs max_altitude. Used by
+        parser._stitch_fragments's fresh-departure veto (#21): a short
+        reappearance fragment may have no AP corroboration at all, in which
+        case max_altitude would fall back to 0 and silently disable the
+        veto. The raw peak is always populated once the fragment has seen
+        any airborne sample."""
+        return self._raw_max_altitude
+
+    @property
     def max_gs_kt(self) -> int:
         return self._persisted_max_gs_kt if self._persisted_max_gs_kt > 0 else self._raw_max_gs_kt
 
@@ -486,6 +503,8 @@ class FlightMetrics:
             elif isinstance(geom_alt, (int, float)):
                 self.last_airborne_alt = int(geom_alt)
                 candidate_alt = int(geom_alt)
+            if self.first_airborne_alt is None and candidate_alt is not None:
+                self.first_airborne_alt = float(candidate_alt)
             if candidate_alt is not None:
                 # Always track raw max (fallback for flights without
                 # mode-S extended data). Type ceiling catches extremes.

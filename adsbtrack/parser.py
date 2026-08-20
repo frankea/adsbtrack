@@ -277,6 +277,13 @@ def _stitch_fragments(
          is less than time_gap * cruise_speed * slack.
       5. Altitude difference between prev.last_seen_alt_ft and next's first
          airborne altitude is less than config.stitch_max_alt_delta_ft.
+      6. Fresh-departure veto (#21) does NOT fire: the gap exceeds
+         config.stitch_min_ground_gap_secs AND next's first airborne
+         altitude is below config.stitch_fresh_departure_alt_ft AND next's
+         raw altitude peak climbs more than config.stitch_fresh_departure_climb_ft
+         above that first altitude. That combination means next is a new
+         sortie taking off after real ground time, not a coverage hole in
+         the same flight.
 
     Effective stitch window:
       max(config.stitch_max_gap_minutes,
@@ -341,7 +348,22 @@ def _stitch_fragments(
                         alt_delta = abs(metrics.last_seen_alt_ft - next_metrics.last_airborne_alt)
                         alt_ok = alt_delta <= max_alt_delta
 
-                    if dist_km <= plausible and alt_ok:
+                    # Fresh-departure veto (#21): a long gap followed by a
+                    # reappearance that starts low and then climbs away is a
+                    # new sortie, not a coverage hole in the same flight.
+                    # raw_peak_altitude_ft, not max_altitude: max_altitude requires
+                    # AP corroboration and can fall back to 0 for a short
+                    # reappearance fragment, which would silently disable the veto.
+                    next_peak = next_metrics.raw_peak_altitude_ft
+                    fresh_departure = (
+                        gap_secs > config.stitch_min_ground_gap_secs
+                        and next_metrics.first_airborne_alt is not None
+                        and next_metrics.first_airborne_alt < config.stitch_fresh_departure_alt_ft
+                        and next_peak is not None
+                        and next_peak - next_metrics.first_airborne_alt > config.stitch_fresh_departure_climb_ft
+                    )
+
+                    if dist_km <= plausible and alt_ok and not fresh_departure:
                         # Merge: the next fragment inherits prev's takeoff
                         # position and time (the originally-observed takeoff
                         # if prev was observed, otherwise prev's first point).

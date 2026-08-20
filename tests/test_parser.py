@@ -817,6 +817,177 @@ def _make_found_mid_flight_fragment(
     return flight, metrics
 
 
+# ---------------------------------------------------------------------------
+# Feature: fresh-departure stitch veto (#21)
+# ---------------------------------------------------------------------------
+
+
+def _make_reappearance_fragment(
+    icao: str,
+    start_ts: float,
+    start_lat: float,
+    start_lon: float,
+    first_airborne_alt: float,
+    raw_peak_alt_ft: int,
+    last_airborne_alt: int,
+) -> tuple[Flight, FlightMetrics]:
+    """Build a synthetic found_mid_flight fragment with independent control
+    over its first airborne altitude, raw altitude peak, and last airborne
+    altitude. Unlike _make_found_mid_flight_fragment (which derives all
+    three from a single start_alt_ft for the plain cruise-coverage-hole
+    tests), the fresh-departure veto needs these three decoupled: a fragment
+    that starts low, climbs to a much higher peak, then descends again
+    before its own coverage ends (e.g. toward its own landing)."""
+    flight = Flight(
+        icao=icao,
+        takeoff_time=datetime.fromtimestamp(start_ts, tz=UTC),
+        takeoff_lat=start_lat,
+        takeoff_lon=start_lon,
+        takeoff_date=datetime.fromtimestamp(start_ts, tz=UTC).date().isoformat(),
+    )
+    metrics = FlightMetrics()
+    metrics.first_point_ts = start_ts
+    metrics.last_point_ts = start_ts + 60.0
+    metrics.last_seen_ts = start_ts + 60.0
+    metrics.last_seen_lat = start_lat
+    metrics.last_seen_lon = start_lon
+    metrics.first_airborne_alt = first_airborne_alt
+    metrics._raw_max_altitude = raw_peak_alt_ft
+    metrics.last_airborne_alt = last_airborne_alt
+    metrics.takeoff_type = "found_mid_flight"
+    return flight, metrics
+
+
+def test_stitch_vetoes_fresh_departure_after_ground_gap():
+    """RAF Hawk ZK019 (#21): a 90-minute ground gap followed by a fragment
+    that starts low and climbs away is a new sortie taking off, not a
+    coverage hole in the same flight - the two fragments must NOT stitch.
+    """
+    t0 = _ts("2026-08-17", hour=13, minute=8, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="43c556",
+        start_ts=t0 - 3600,
+        end_ts=t0,
+        start_lat=51.5,
+        start_lon=-1.0,
+        end_lat=51.7,
+        end_lon=-1.2,
+        end_alt_ft=1050,
+    )
+    f2_start = t0 + 90 * 60  # 90-minute ground gap
+    f2, m2 = _make_reappearance_fragment(
+        icao="43c556",
+        start_ts=f2_start,
+        start_lat=51.7,
+        start_lon=-1.2,
+        first_airborne_alt=1200.0,
+        raw_peak_alt_ft=17_000,
+        last_airborne_alt=900,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 2, "Fresh departure after a long ground gap must not be stitched into one flight"
+
+
+def test_stitch_still_merges_go_around_reappearance():
+    """A short gap (well under stitch_min_ground_gap_secs) must still merge
+    even though the reappearing fragment climbs a lot afterward - the veto
+    only fires on gaps long enough to represent real ground time."""
+    t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="aaaaaa",
+        start_ts=t0 - 600,
+        end_ts=t0,
+        start_lat=40.0,
+        start_lon=-74.0,
+        end_lat=40.05,
+        end_lon=-74.05,
+        end_alt_ft=900,
+    )
+    f2_start = t0 + 180  # 3-minute gap, well under the 900s veto floor
+    f2, m2 = _make_reappearance_fragment(
+        icao="aaaaaa",
+        start_ts=f2_start,
+        start_lat=40.05,
+        start_lon=-74.05,
+        first_airborne_alt=1500.0,
+        raw_peak_alt_ft=3000,
+        last_airborne_alt=100,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 1, "Go-around reappearance within the ground-gap floor must still stitch into one flight"
+
+
+def test_stitch_still_merges_cruise_coverage_hole():
+    """A high-altitude reappearance (>= stitch_fresh_departure_alt_ft) is a
+    coverage hole in ongoing cruise, not a fresh departure, even across a
+    gap long enough to trip the ground-gap floor."""
+    t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="aaaaaa",
+        start_ts=t0 - 3600,
+        end_ts=t0,
+        start_lat=40.0,
+        start_lon=-74.0,
+        end_lat=41.0,
+        end_lon=-75.0,
+        end_alt_ft=39_000,
+    )
+    f2_start = t0 + 60 * 60  # 60-minute coverage hole
+    f2, m2 = _make_reappearance_fragment(
+        icao="aaaaaa",
+        start_ts=f2_start,
+        start_lat=41.0,
+        start_lon=-75.0,
+        first_airborne_alt=39_000.0,
+        raw_peak_alt_ft=39_000,
+        last_airborne_alt=39_000,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 1, "High-altitude reappearance must still stitch as a cruise coverage hole"
+
+
+def test_stitch_still_merges_low_descending_reappearance():
+    """A low reappearance that only continues descending toward landing (no
+    climb above first_airborne_alt + stitch_fresh_departure_climb_ft) is
+    still a coverage hole, not a fresh departure - only a genuine climb-away
+    distinguishes a new sortie."""
+    t0 = _ts("2024-06-15", hour=10, minute=0, second=0)
+    f1, m1 = _make_signal_lost_fragment(
+        icao="aaaaaa",
+        start_ts=t0 - 1200,
+        end_ts=t0,
+        start_lat=40.0,
+        start_lon=-74.0,
+        end_lat=40.2,
+        end_lon=-74.2,
+        end_alt_ft=3000,
+    )
+    f2_start = t0 + 20 * 60  # 20-minute gap
+    f2, m2 = _make_reappearance_fragment(
+        icao="aaaaaa",
+        start_ts=f2_start,
+        start_lat=40.2,
+        start_lon=-74.2,
+        first_airborne_alt=2500.0,
+        raw_peak_alt_ft=2500,  # only descends after reappearing: peak == first sample
+        last_airborne_alt=200,
+    )
+
+    config = Config()
+    stitched, _ = _stitch_fragments([f1, f2], [m1, m2], config, type_code=None)
+
+    assert len(stitched) == 1, "Descending-only reappearance must still stitch; no climb means no fresh departure"
+
+
 def test_stitch_uses_type_endurance_for_long_endurance_aircraft():
     """A KC-135-style long-endurance type should allow stitching across gaps
     larger than the default stitch_max_gap_minutes (90 min). The stitch

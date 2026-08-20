@@ -503,6 +503,17 @@ class Config:
     # without changing behavior for light GA.
     stitch_endurance_ratio: float = 0.4
 
+    # Fresh-departure veto: a stitch candidate whose gap exceeds
+    # stitch_min_ground_gap_secs AND whose next fragment starts airborne
+    # below stitch_fresh_departure_alt_ft AND then climbs more than
+    # stitch_fresh_departure_climb_ft above that first altitude is a new
+    # sortie taking off, not a coverage hole - refuse the stitch. Keeps
+    # go-arounds (short gap) and cruise coverage holes (high reappearance)
+    # stitching exactly as before. See issue #21 (ZK019 double-sortie merge).
+    stitch_min_ground_gap_secs: float = 900.0
+    stitch_fresh_departure_alt_ft: float = 8000.0
+    stitch_fresh_departure_climb_ft: float = 2000.0
+
     # dropped_on_approach gating: require sustained descent in the last few
     # baro_rate samples before committing the classification.
     dropped_tail_window: int = 5

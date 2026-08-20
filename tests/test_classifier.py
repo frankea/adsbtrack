@@ -556,6 +556,40 @@ def test_squawk_durations_no_squawk_points_stays_empty() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Feature: first_airborne_alt (fresh-departure stitch veto, #21)
+# ---------------------------------------------------------------------------
+
+
+def test_first_airborne_alt_records_first_sample_ignores_ground_and_merges_keep_first() -> None:
+    """first_airborne_alt is a takeoff-side accumulator (mirror of
+    last_airborne_alt): it records only the FIRST airborne sample's
+    altitude, is untouched by ground samples, and is never overwritten by
+    later airborne samples. merge() uses keep_first so a stitched flight's
+    fresh-departure veto (#21) reads the REAPPEARING fragment's own first
+    altitude, not whatever the earlier fragment held.
+    """
+    cfg = _cfg()
+    m = FlightMetrics()
+
+    m.record_point(_point(0.0, baro_alt=0), ground_state="ground", ground_reason="ground", config=cfg)
+    m.record_point(_point(5.0, baro_alt=50), ground_state="ground", ground_reason="ground", config=cfg)
+    assert m.first_airborne_alt is None, "Ground samples must not set first_airborne_alt"
+
+    m.record_point(_point(10.0, baro_alt=1200), ground_state="airborne", ground_reason="airborne", config=cfg)
+    assert m.first_airborne_alt == 1200
+
+    m.record_point(_point(20.0, baro_alt=5000), ground_state="airborne", ground_reason="airborne", config=cfg)
+    assert m.first_airborne_alt == 1200, "Later airborne samples must not overwrite the first one"
+
+    earlier = FlightMetrics()
+    earlier.first_airborne_alt = 1200.0
+    later = FlightMetrics()
+    later.first_airborne_alt = 300.0
+    earlier.merge(later)
+    assert earlier.first_airborne_alt == 1200.0, "keep_first: earlier fragment's own value wins on merge"
+
+
+# ---------------------------------------------------------------------------
 # A2: FlightMetrics.merge with declared per-field semantics
 # ---------------------------------------------------------------------------
 

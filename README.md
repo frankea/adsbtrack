@@ -99,6 +99,14 @@ uv run python -m adsbtrack.cli events --hex a66ad3
 
 Chronological log of emergency squawks (7500/7600/7700), emergency flags, off-airport landings, sustained hover (>= 5 min), and multiple go-arounds (>= 2 per flight) - all read from pre-computed columns on the `flights` table, no new heuristics. Options: `--since` (filter from a date), `--severity` (`emergency`, `unusual`, or `all`). Pass `--json` to emit a single JSON document instead of the table.
 
+### Day forensics
+
+```
+uv run python -m adsbtrack.cli inspect --hex a66ad3 --date 2026-03-27
+```
+
+Deep-dive on one aircraft-day: splits each source's raw trace into fragments on inter-point gaps (`--gap-secs`, default 300), and reports per-fragment point count, position, altitude/speed range, DO-260B v2/sil0/nic0 integrity counts, and the callsigns/squawks seen. Also prints the squawk and callsign change-point timeline across every source merged into one chronological stream. Pass `--airport <ident>` to add a closest-approach line (distance, time, altitude) against a known airport. `--source` limits to one source; `--json` emits a single JSON document instead of the tables.
+
 ### Re-extract flights
 
 ```

@@ -2740,3 +2740,111 @@ def test_extract_rejects_since_with_reprocess(tmp_path):
     )
     assert result.exit_code != 0
     assert "--reprocess" in result.output and "--since" in result.output
+
+
+# ---------------------------------------------------------------------------
+# inspect: day-level trace forensics (#23)
+# ---------------------------------------------------------------------------
+
+
+def _seed_inspect_trace(db_path: Path) -> None:
+    """One trace_days row with a v2 detail dict carrying a callsign/squawk,
+    so the fragment table, integrity counts, and timelines all have
+    something to show."""
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "aaaaaa",
+            "2024-01-01",
+            {
+                "r": "N512WB",
+                "t": "C172",
+                "desc": "Cessna 172",
+                "ownOp": "unknown",
+                "year": "1966",
+                "timestamp": datetime(2024, 1, 1, tzinfo=UTC).timestamp(),
+                "trace": [
+                    [
+                        0,
+                        51.47,
+                        -0.45,
+                        1000,
+                        100,
+                        None,
+                        None,
+                        None,
+                        {"version": 2, "sil": 0, "nic": 0, "flight": "TEST1", "squawk": "1200"},
+                    ],
+                    [
+                        60,
+                        51.48,
+                        -0.44,
+                        1500,
+                        120,
+                        None,
+                        None,
+                        None,
+                        {"version": 2, "sil": 0, "nic": 0, "flight": "TEST1", "squawk": "7700"},
+                    ],
+                ],
+            },
+        )
+
+
+def test_inspect_cli_renders_and_json_round_trips(tmp_path):
+    db_path = tmp_path / "inspect.db"
+    _seed_inspect_trace(db_path)
+
+    json_result = CliRunner().invoke(
+        cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--json", "--db", str(db_path)]
+    )
+    assert json_result.exit_code == 0, json_result.output
+    payload = json.loads(json_result.output)
+    assert payload["hex"] == "aaaaaa"
+    assert payload["date"] == "2024-01-01"
+    assert "adsbx" in payload["sources"]
+    assert len(payload["sources"]["adsbx"]) >= 1
+    assert payload["squawk_timeline"][0][1] == "1200"
+    assert payload["closest_approach"] is None
+
+    table_result = CliRunner().invoke(cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--db", str(db_path)])
+    assert table_result.exit_code == 0, table_result.output
+    assert "FRAG" in table_result.output
+
+
+def test_inspect_cli_no_trace_data_exits_zero_with_message(tmp_path):
+    db_path = tmp_path / "inspect.db"
+    with Database(db_path):
+        pass  # empty DB, schema only
+
+    result = CliRunner().invoke(cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "no trace data" in result.output.lower()
+
+    json_result = CliRunner().invoke(
+        cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--json", "--db", str(db_path)]
+    )
+    assert json_result.exit_code == 0, json_result.output
+    assert json.loads(json_result.output)["sources"] == {}
+
+
+def test_inspect_cli_unknown_airport_errors(tmp_path):
+    db_path = tmp_path / "inspect.db"
+    _seed_inspect_trace(db_path)
+
+    result = CliRunner().invoke(
+        cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--airport", "ZZZZ", "--db", str(db_path)]
+    )
+    assert result.exit_code != 0
+    assert "zzzz" in result.output.lower()
+
+
+def test_inspect_cli_closest_approach_with_airport(tmp_path):
+    db_path = tmp_path / "inspect.db"
+    _seed_inspect_trace(db_path)
+    _seed_airport(db_path)
+
+    result = CliRunner().invoke(
+        cli, ["inspect", "--hex", "aaaaaa", "--date", "2024-01-01", "--airport", "EGLL", "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    assert "EGLL" in result.output

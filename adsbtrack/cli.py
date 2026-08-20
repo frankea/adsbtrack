@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import os
 import re
@@ -16,9 +17,16 @@ from .acars import fetch_acars
 from .airframes import AirframesClient
 from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config, is_retryable_fetch_status
-from .db import Database
+from .db import Database, iter_parsed_trace_days
 from .events import collect_events
 from .fetcher import fetch_traces, fetch_traces_opensky
+from .forensics import (
+    DEFAULT_FRAGMENT_GAP_SECS,
+    callsign_timeline,
+    closest_approach,
+    squawk_timeline,
+    summarize_fragments,
+)
 from .gaps import detect_gaps
 from .models import LandingType
 from .navaids import refresh_navaids as _refresh_navaids
@@ -1836,6 +1844,167 @@ def _pct(mix: dict, key: str) -> str:
     if total == 0:
         return "-"
     return f"{100 * mix.get(key, 0) // total}%"
+
+
+@cli.command("inspect")
+@click.option("--hex", "hex_code", callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", help=TAIL_HELP)
+@click.option("--date", "date_str", required=True, help="Day to inspect (YYYY-MM-DD)")
+@click.option("--source", default=None, help="Limit to one source (default: every source with data)")
+@click.option("--gap-secs", default=None, type=float, help="Fragment split gap in seconds (default 300)")
+@click.option("--airport", default=None, help="Airport ident for closest-approach (e.g. EGOV, KTYS)")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+@_db_option()
+def inspect_cmd(hex_code, tail_number, date_str, source, gap_secs, airport, as_json, db_path):
+    """Forensic view of one aircraft-day: fragments, integrity, squawks.
+
+    Splits each source's trace into fragments on inter-point gaps, reports
+    per-fragment integrity (v2/sil0/nic0) and identity (callsigns, squawks)
+    counts, and shows the squawk/callsign timeline and (with --airport)
+    closest-approach distance across every source's points merged into one
+    chronological stream.
+    """
+    gap_threshold = gap_secs if gap_secs is not None else DEFAULT_FRAGMENT_GAP_SECS
+
+    with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
+        config = _load_config(db_path)
+
+        rows = db.get_trace_day(hex_code, date_str)
+        if source:
+            rows = [row for row in rows if row["source"] == source]
+        parsed_rows = list(iter_parsed_trace_days(rows, hex_code))
+
+        sources: dict[str, list] = {}
+        combined_points: list[tuple[float, list]] = []
+        for row, trace in parsed_rows:
+            sources[row["source"]] = summarize_fragments(row["source"], row["timestamp"], trace, gap_threshold)
+            for point in trace:
+                if isinstance(point, list):
+                    combined_points.append((row["timestamp"] + point[0], point))
+
+        combined_points.sort(key=lambda item: item[0])
+        combined_base_ts = combined_points[0][0] if combined_points else 0.0
+        combined_trace = []
+        for abs_ts, point in combined_points:
+            shifted = list(point)
+            shifted[0] = abs_ts - combined_base_ts
+            combined_trace.append(shifted)
+
+        sq_timeline = squawk_timeline(combined_base_ts, combined_trace)
+        cs_timeline = callsign_timeline(combined_base_ts, combined_trace)
+
+        approach = None
+        if airport:
+            ensure_airports(db, config)
+            ident = airport.strip().upper()
+            apt_row = db.conn.execute(
+                "SELECT latitude_deg, longitude_deg FROM airports WHERE ident = ?", (ident,)
+            ).fetchone()
+            if apt_row is None:
+                raise click.UsageError(f"Unknown airport ident {airport!r}.")
+            approach = closest_approach(
+                combined_base_ts, combined_trace, apt_row["latitude_deg"], apt_row["longitude_deg"]
+            )
+
+    if not sources:
+        suffix = f" (source={source})" if source else ""
+        if as_json:
+            click.echo(
+                json.dumps(
+                    {
+                        "hex": hex_code,
+                        "date": date_str,
+                        "sources": {},
+                        "squawk_timeline": [],
+                        "callsign_timeline": [],
+                        "closest_approach": None,
+                    },
+                    indent=2,
+                )
+            )
+        else:
+            console.print(f"[yellow]No trace data for {hex_code} on {date_str}{suffix}.[/]")
+        return
+
+    if as_json:
+        payload = {
+            "hex": hex_code,
+            "date": date_str,
+            "sources": {src: [dataclasses.asdict(frag) for frag in frags] for src, frags in sources.items()},
+            "squawk_timeline": sq_timeline,
+            "callsign_timeline": cs_timeline,
+            "closest_approach": {"dist_km": approach[0], "ts": approach[1], "alt": approach[2]} if approach else None,
+        }
+        click.echo(json.dumps(payload, indent=2))
+        return
+
+    for src, fragments in sources.items():
+        table = Table(title=f"{hex_code} {date_str} -- source={src}")
+        table.add_column("FRAG", justify="right")
+        table.add_column("START Z")
+        table.add_column("END Z")
+        table.add_column("PTS", justify="right")
+        table.add_column("FROM")
+        table.add_column("TO")
+        table.add_column("ALT")
+        table.add_column("GS")
+        table.add_column("V2/SIL0/NIC0")
+        table.add_column("CS")
+        table.add_column("SQ")
+        table.add_column("SRC-MIX")
+
+        for i, frag in enumerate(fragments, start=1):
+            start_z = datetime.fromtimestamp(frag.start_ts, UTC).strftime("%H:%M:%SZ")
+            end_z = datetime.fromtimestamp(frag.end_ts, UTC).strftime("%H:%M:%SZ")
+            alt = (
+                f"{frag.alt_min:.0f}-{frag.alt_max:.0f} ft"
+                if frag.alt_min is not None and frag.alt_max is not None
+                else "-"
+            )
+            gs_known = frag.gs_min is not None and frag.gs_max is not None
+            gs = f"{frag.gs_min:.0f}-{frag.gs_max:.0f} kt" if gs_known else "-"
+            integrity = f"{frag.v2_samples}/{frag.v2_sil0}/{frag.v2_nic0}"
+            cs = ", ".join(frag.callsigns) if frag.callsigns else "-"
+            sq = ", ".join(frag.squawks) if frag.squawks else "-"
+            src_mix = (
+                ", ".join(f"{k}:{v}" for k, v in sorted(frag.position_sources.items()))
+                if frag.position_sources
+                else "-"
+            )
+            table.add_row(
+                str(i),
+                start_z,
+                end_z,
+                str(frag.n_points),
+                f"{frag.start_lat:.4f},{frag.start_lon:.4f}",
+                f"{frag.end_lat:.4f},{frag.end_lon:.4f}",
+                alt,
+                gs,
+                integrity,
+                cs,
+                sq,
+                src_mix,
+            )
+        console.print(table)
+
+    if sq_timeline:
+        console.print("\n[bold]Squawk timeline:[/]")
+        for ts, val in sq_timeline:
+            console.print(f"  {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')}  {val}")
+
+    if cs_timeline:
+        console.print("\n[bold]Callsign timeline:[/]")
+        for ts, val in cs_timeline:
+            console.print(f"  {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')}  {val}")
+
+    if approach:
+        dist_km, ts, alt = approach
+        alt_str = f"{alt:.0f} ft" if alt is not None else "unknown alt"
+        console.print(
+            f"\n[bold]Closest approach to {airport.strip().upper()}:[/] "
+            f"{dist_km:.2f} km at {datetime.fromtimestamp(ts, UTC).strftime('%H:%M:%SZ')} ({alt_str})"
+        )
 
 
 @cli.command()

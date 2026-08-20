@@ -1828,16 +1828,32 @@ def test_fetch_cli_source_all_resumes_each_source_from_its_own_history(tmp_path,
 
 
 def _capture_fetch_calls(monkeypatch):
-    """Shared fetch_traces stub for the per-source resume tests below.
-    Records (source, start, end) for every call instead of the summary
-    stats -- these tests care about which window each source was given."""
+    """Shared fetch_traces/fetch_traces_opensky stub for the per-source
+    resume and health tests below. Records (source, start, end) for every
+    call instead of the summary stats -- these tests care about which
+    window each source was given.
+
+    Also stubs fetch_traces_opensky, not just fetch_traces: the fetch
+    command's opensky-availability check falls back to reading
+    config.credentials_path (a relative "credentials.json" in the CWD) when
+    the OPENSKY_CLIENT_ID/SECRET env vars aren't set. On a machine (or repo
+    checkout) where that file happens to exist with real-looking
+    credentials, opensky_available flips True and an unmocked
+    fetch_traces_opensky would make a live network call from inside these
+    tests. Stubbing both here, in one place, keeps every consumer hermetic
+    regardless of host credentials."""
     calls: list[tuple[str, date, date]] = []
 
     def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
         calls.append((source, start, end))
         return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
 
+    def fake_fetch_traces_opensky(db, config, hex_code, start, end):
+        calls.append(("opensky", start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
     monkeypatch.setattr("adsbtrack.cli.fetch_traces", fake_fetch_traces)
+    monkeypatch.setattr("adsbtrack.cli.fetch_traces_opensky", fake_fetch_traces_opensky)
     return calls
 
 

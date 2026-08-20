@@ -64,6 +64,15 @@ class PointData:
     # detail object and is under 10 elements long (e.g. OpenSky synthesized
     # traces).
     position_source: str | None = None
+    # DO-260B v2 aircraft-state integrity fields (issue #22 flight-scoped
+    # spoof gate). Sourced from the same detail dict as position_source;
+    # None when the point has no detail object or the fields aren't ints.
+    # Must be read with the identical predicate as
+    # integrity.count_v2_integrity so flight-scoped and day-scoped stats
+    # can never disagree about the same point.
+    adsb_version: int | None = None
+    sil: int | None = None
+    nic: int | None = None
 
 
 @dataclass
@@ -182,6 +191,15 @@ class FlightMetrics:
     tisb_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
     other_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
     adsc_points: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    # DO-260B v2 integrity-field counters (issue #22 flight-scoped spoof
+    # gate). Predicate MUST match adsbtrack.integrity.count_v2_integrity
+    # point-for-point (ac["version"] == 2, sil == 0, nic == 0) so flight-
+    # scoped and day-scoped (events.py) stats can never disagree about the
+    # same point. Counted for every recorded point, ground or airborne, to
+    # match count_v2_integrity's own unconditional scan.
+    v2_samples: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    v2_sil0: int = field(default=0, metadata={"merge": _MERGE_SUM})
+    v2_nic0: int = field(default=0, metadata={"merge": _MERGE_SUM})
     # Dual-track raw and persisted peaks. The raw value is updated every
     # point (warmup fallback). The persisted value is updated only when
     # the persistence filter has >= min_samples points in its window.
@@ -290,6 +308,11 @@ class FlightMetrics:
     origin_lon: float | None = field(default=None, metadata={"merge": _MERGE_KEEP_FIRST})
     path_length_km: float = field(default=0.0, metadata={"merge": _MERGE_SUM})
     max_distance_from_origin_km: float = field(default=0.0, metadata={"merge": _MERGE_MAX})
+    # Peak inter-fix implied ground speed (issue #22 teleport corroboration).
+    # Computed at the same site as path_length_km, from consecutive-point
+    # great-circle distance / dt; skipped when dt < 10.0s (sub-10s spacing
+    # is jitter-dominated, not a corroborating signal).
+    max_implied_speed_kt: float | None = field(default=None, metadata={"merge": _MERGE_MAX})
     _prev_path_lat: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
     _prev_path_lon: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
     _prev_path_ts: float | None = field(default=None, metadata={"merge": _MERGE_EXCLUDE})
@@ -421,6 +444,15 @@ class FlightMetrics:
                 self.adsc_points += 1
             else:
                 self.other_points += 1
+        # DO-260B v2 integrity counters (issue #22). Same predicate as
+        # integrity.count_v2_integrity, applied to every recorded point so
+        # flight-scoped stats can never disagree with day-scoped ones.
+        if point.adsb_version == 2:
+            self.v2_samples += 1
+            if point.sil == 0:
+                self.v2_sil0 += 1
+            if point.nic == 0:
+                self.v2_nic0 += 1
         prev_ts = self.last_point_ts
         if self.first_point_ts is None:
             self.first_point_ts = ts
@@ -577,6 +609,15 @@ class FlightMetrics:
         if self._prev_path_lat is not None and self._prev_path_lon is not None:
             seg_m = _haversine_m(self._prev_path_lat, self._prev_path_lon, lat, lon)
             self.path_length_km += seg_m / 1000.0
+            # Implied ground speed between consecutive fixes (issue #22
+            # teleport corroboration). dt < 10.0s is skipped: sub-10s spacing
+            # makes the divide-by-dt noise-dominated rather than a real
+            # corroborating signal.
+            if self._prev_path_ts is not None:
+                dt = ts - self._prev_path_ts
+                if dt >= 10.0:
+                    speed_kt = (seg_m / 1000.0) / (dt / 3600.0) / 1.852
+                    self.max_implied_speed_kt = _merge_max(self.max_implied_speed_kt, speed_kt)
         self._prev_path_lat = lat
         self._prev_path_lon = lon
         self._prev_path_ts = ts

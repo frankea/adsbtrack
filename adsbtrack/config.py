@@ -364,6 +364,18 @@ class Config:
     spoof_min_v2_samples: int = 25
     spoof_crude_max_altitude_ft: float = 500.0
 
+    # Flight-scoped gate (issue #22). Day-scoped rejection quarantined real
+    # flights that merely transited GPS-jamming corridors on days that also
+    # carried ghost broadcasts (A6-EUY 2026-05-19: real DXB-DUS leg ~18-25%
+    # sil0 vs ghost fragments 87-100% sil0 at 1,000+ kt implied speed).
+    # Reject a flight when its own sil0 share >= spoof_flight_sil0_hard_pct,
+    # OR when it is >= spoof_v2_sil0_pct AND the flight contains an inter-fix
+    # jump faster than spoof_teleport_speed_kt (no aircraft in this DB's
+    # scope sustains 900 kt over ground; Hormuz-style 25-50% sil0 spoofs
+    # teleport, jammed-but-real flights do not).
+    spoof_flight_sil0_hard_pct: float = 60.0
+    spoof_teleport_speed_kt: float = 900.0
+
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km

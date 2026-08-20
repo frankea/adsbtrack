@@ -24,6 +24,9 @@ def _point(
     gs=300.0,
     callsign=None,
     nav_altitude_mcp=None,
+    adsb_version=None,
+    sil=None,
+    nic=None,
 ) -> PointData:
     return PointData(
         ts=ts,
@@ -42,6 +45,9 @@ def _point(
         emergency_field=None,
         true_heading=None,
         callsign=callsign,
+        adsb_version=adsb_version,
+        sil=sil,
+        nic=nic,
     )
 
 
@@ -748,3 +754,114 @@ def test_merge_raises_for_field_without_declared_strategy(monkeypatch: pytest.Mo
 
     with pytest.raises(ValueError, match="fake_undeclared_counter"):
         a.merge(b)
+
+
+# ---------------------------------------------------------------------------
+# Feature: flight-scoped v2 integrity counters + implied speed (#22)
+# ---------------------------------------------------------------------------
+
+
+def test_v2_integrity_counters_accumulate_and_merge():
+    """v2_samples/v2_sil0/v2_nic0 use the identical predicate as
+    integrity.count_v2_integrity (version == 2, sil == 0, nic == 0) so
+    flight-scoped and day-scoped (events.py) stats can never disagree about
+    the same point. version None or version 1 points must not bump any of
+    the three counters. merge() sums all three (fragments count points, and
+    a stitched flight's total must be the sum of its fragments' totals)."""
+    cfg = _cfg()
+    m = FlightMetrics()
+
+    # v2, sil=0, nic=0: bumps all three.
+    m.record_point(
+        _point(0.0, adsb_version=2, sil=0, nic=0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    # v2, sil and nic not zero: bumps only v2_samples.
+    m.record_point(
+        _point(5.0, adsb_version=2, sil=3, nic=1),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    # version None: bumps nothing.
+    m.record_point(
+        _point(10.0, adsb_version=None, sil=0, nic=0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    # version 1: bumps nothing.
+    m.record_point(
+        _point(15.0, adsb_version=1, sil=0, nic=0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+
+    assert m.v2_samples == 2
+    assert m.v2_sil0 == 1
+    assert m.v2_nic0 == 1
+
+    earlier = FlightMetrics()
+    earlier.v2_samples = 100
+    earlier.v2_sil0 = 10
+    earlier.v2_nic0 = 5
+    later = FlightMetrics()
+    later.v2_samples = 50
+    later.v2_sil0 = 45
+    later.v2_nic0 = 40
+    earlier.merge(later)
+
+    assert earlier.v2_samples == 150
+    assert earlier.v2_sil0 == 55
+    assert earlier.v2_nic0 == 45
+
+
+def test_max_implied_speed_records_teleports_and_ignores_jitter():
+    """max_implied_speed_kt is computed at the same site as path_length_km:
+    great-circle distance between consecutive points divided by elapsed
+    time. Sub-10s spacing is ignored (jitter-dominated); dt >= 10.0s folds
+    the implied speed in via a None-safe max, so a later slower point never
+    overwrites a genuine teleport."""
+    cfg = _cfg()
+    m = FlightMetrics()
+
+    # Two points 100.0 km apart along a meridian (0.899519 deg latitude at
+    # Earth radius 6,371 km), dt=60s. implied speed = 100 km / (60/3600 h) /
+    # 1.852 (km/h -> kt) ~= 3,240 kt.
+    m.record_point(
+        _point(0.0, lat=0.0, lon=0.0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    m.record_point(
+        _point(60.0, lat=0.899519, lon=0.0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    assert m.max_implied_speed_kt is not None
+    assert m.max_implied_speed_kt == pytest.approx(3240.0, rel=0.01)
+
+    prior_peak = m.max_implied_speed_kt
+
+    # Two points ~1 km apart, dt=2s (< 10.0s floor): ignored regardless of
+    # how large the implied speed would otherwise be.
+    m.record_point(
+        _point(62.0, lat=1.0, lon=0.0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    m.record_point(
+        _point(64.0, lat=1.009, lon=0.0),
+        ground_state="airborne",
+        ground_reason="ok",
+        config=cfg,
+    )
+    assert m.max_implied_speed_kt == pytest.approx(prior_peak, rel=0.01), (
+        "sub-10s inter-fix jitter must not update max_implied_speed_kt"
+    )

@@ -1557,6 +1557,164 @@ def test_extract_flights_parses_trace_json_once_per_row_with_spoof_checks():
     assert len(calls) == 3
 
 
+# ---------------------------------------------------------------------------
+# Flight-scoped spoof gate with teleport corroboration (#22)
+# ---------------------------------------------------------------------------
+
+
+def _v2_point(time_offset, lat, lon, alt, gs, *, sil, nic=0, version=2):
+    """Trace point carrying DO-260B v2 aircraft-state fields in the same
+    detail-dict slot integrity.count_v2_integrity reads (point[8])."""
+    return _make_trace_point(time_offset, lat, lon, alt, gs=gs, detail={"version": version, "sil": sil, "nic": nic})
+
+
+def test_mixed_day_extracts_clean_flight_and_quarantines_ghost():
+    """The core #22 regression: a single trace day carrying both a real
+    flight and a ghost broadcast must not quarantine the real one. Day-level
+    pooling would see the combined sil0 rate for the whole day cross the
+    threshold and reject both; the flight-scoped gate judges each flight on
+    its own v2 samples."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+    t = 0.0
+
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+
+    # Flight A: 60 v2 points, all sil != 0 (clean), modest inter-point
+    # spacing (~1.11 km / 60s -> ~36 kt implied speed, nowhere near the
+    # teleport threshold) -> must land in flights.
+    lat = 40.0
+    for _ in range(60):
+        lat += 0.01
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=8, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))  # Flight A lands
+    t += 3600.0  # ground turnaround before Flight B departs
+
+    # Flight B: 60 v2 points, 55/60 (91.7%) sil=0 -- clears the hard tier
+    # (>= 60%) on its own, no teleport corroboration needed -> quarantined.
+    lat2 = 45.0
+    for i in range(60):
+        lat2 += 0.01
+        sil = 0 if i < 55 else 8
+        trace.append(_v2_point(t, lat2, -74.0, 10_000, 250, sil=sil, nic=0))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat2, -74.0, "ground", gs=5))  # Flight B lands
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 1, "the clean flight must be persisted"
+    inserted = db.insert_flight.call_args[0][0]
+    assert inserted.takeoff_lat == 40.0
+
+    assert db.insert_spoofed_broadcast.call_count == 1, "the ghost flight must be quarantined"
+    kwargs = db.insert_spoofed_broadcast.call_args[1]
+    assert kwargs["reason"] == "bimodal_integrity"
+    detail = json.loads(kwargs["reason_detail"])
+    assert detail["scope"] == "flight"
+    assert detail["trigger"] == "hard_sil0"
+
+
+def test_jammed_but_real_flight_passes_flight_gate():
+    """A real flight transiting a GPS-jamming corridor shows a moderate sil0
+    rate (18-25% in the #22 spec evidence) but never exceeds physical ground
+    speeds. Tier 2 (moderate sil0 + teleport) must not fire without the
+    teleport corroboration, so this flight is extracted normally."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+    t = 0.0
+
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+
+    # 40 v2 points, 10/40 (25%) sil=0. Steady ~469 kt ground speed the whole
+    # way (0.13 deg lat per 60s) -- well under the 900 kt teleport threshold.
+    lat = 40.0
+    for i in range(40):
+        lat += 0.13
+        sil = 0 if i < 10 else 8
+        trace.append(_v2_point(t, lat, -74.0, 35_000, 480, sil=sil, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 1
+    assert db.insert_spoofed_broadcast.call_count == 0
+
+
+def test_moderate_sil0_with_teleport_is_quarantined():
+    """Tier 2: a flight at moderate sil0 (between spoof_v2_sil0_pct and the
+    hard tier) is rejected only when corroborated by an inter-fix jump
+    faster than spoof_teleport_speed_kt -- the Hormuz-style spoof profile
+    from the #22 spec evidence."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+    t = 0.0
+
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+
+    lat = 40.0
+    # 40 v2 points, 12/40 (30%) sil=0. All fixes are near-stationary except
+    # one ~1,500 kt inter-fix jump (0.416 deg over 60s) at index 20.
+    for i in range(40):
+        lat += 0.416 if i == 20 else 0.001
+        sil = 0 if i < 12 else 8
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=sil, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 0
+    assert db.insert_spoofed_broadcast.call_count == 1
+    kwargs = db.insert_spoofed_broadcast.call_args[1]
+    assert kwargs["reason"] == "bimodal_integrity"
+    detail = json.loads(kwargs["reason_detail"])
+    assert detail["trigger"] == "sil0_plus_teleport"
+
+
+def test_crude_ek_callsign_gate_still_fires():
+    """The crude shallow-EK heuristic is unchanged by the #22 flight-scoped
+    rewrite: a low-altitude flight with an EK-numbered (IATA-style, not
+    ATC-style) callsign and no matched endpoints is still rejected, even
+    with zero v2 samples at all (below spoof_min_v2_samples, so the bimodal
+    gate never evaluates)."""
+    config = _make_config()
+    base_ts = _ts("2024-06-15")
+
+    trace = [
+        _make_trace_point(0, 40.0, -74.0, "ground", gs=0),
+        _make_trace_point(60, 40.01, -74.0, 300, gs=90, detail={"flight": "EK123"}),
+        _make_trace_point(300, 40.02, -74.0, 300, gs=90, detail={"flight": "EK123"}),
+        _make_trace_point(600, 40.03, -74.0, "ground", gs=5),
+    ]
+    rows = [_make_trace_row("2024-06-15", base_ts, trace)]
+    db = _make_db_mock(rows)
+
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+
+    assert db.insert_flight.call_count == 0
+    assert db.insert_spoofed_broadcast.call_count == 1
+    kwargs = db.insert_spoofed_broadcast.call_args[1]
+    assert kwargs["reason"] == "crude_heuristic"
+
+
 def test_extract_flights_skips_corrupt_trace_json_row_with_warning(capsys):
     """A trace_days row with malformed trace_json must be warned about and
     skipped, not crash the whole extract and not silently vanish -- the

@@ -248,10 +248,6 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
         if since_last and custom_url:
             raise click.UsageError("--since-last is not supported with --url; pass --start explicitly.")
 
-        # --url resolves its own source name (from the URL's netloc) further
-        # below; resuming here against --source's fetch history would look up
-        # the wrong source, so resume/--since-last only applies to a plain
-        # --source fetch.
         end = date.fromisoformat(end_date) if end_date else date.today()
 
         if source == "all" and not custom_url:
@@ -328,6 +324,10 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                 for src in sources_to_fetch:
                     console.print(f"  [dim]{src}: from {per_source_start[src]}[/]")
         else:
+            # --url resolves its own source name (from the URL's netloc)
+            # below; resuming here against --source's fetch history would
+            # look up the wrong source, so resume/--since-last only applies
+            # to a plain --source fetch.
             last_fetched = None
             if not custom_url:
                 fetched_dates = db.get_fetched_dates(hex_code, source=source)

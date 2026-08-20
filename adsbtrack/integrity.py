@@ -2,10 +2,14 @@
 
 The raw counting loop over one decoded trace's sample points used to live
 duplicated wherever it was needed. `parser.pool_spoof_scores` (the
-bimodal-integrity pooling scan shared by the reject-in-extract gate and
-`events._detect_spoof_events`) now calls `count_v2_integrity` here, and so
-does `db.insert_trace_day`'s materialized per-day stat columns (Task 12),
-so the two can never drift apart.
+day-level bimodal-integrity pooling scan backing `events._detect_spoof_events`)
+calls `count_v2_integrity` here, and so does `db.insert_trace_day`'s
+materialized per-day stat columns (Task 12), so the two can never drift
+apart. The flight-scoped reject-in-extract gate (issue #22) does not call
+this module directly -- it applies the identical predicate (version == 2,
+sil == 0, nic == 0) per point via `classifier.FlightMetrics.record_point`
+instead of a decoded-trace scan, so flight-scoped and day-scoped stats
+still can never disagree about the same point.
 
 This module has no dependency on `db.py` or `parser.py`. `parser.py`
 already imports `db.py`, so `db.py` importing `parser.py` back would

@@ -83,33 +83,16 @@ def _default_fetch_start() -> date:
     return date(date.today().year - 1, 1, 1)
 
 
-def _resume_start_for_all_sources(db: Database, hex_code: str) -> tuple[str | None, str | None]:
-    """Resume date for `fetch --source all`, reduced across every readsb
-    source instead of looked up under the literal (and never-matching)
-    source name "all".
-
-    Returns ``(earliest_last_fetched_date, driving_source)``: the MIN of
-    each source's own last-fetched day (success-filtered, same as the
-    single-source path), and the name of the source that produced it. A
-    source with no success-filtered history is excluded, not treated as
-    "already caught up" -- that would let it get skipped forever. Resuming
-    every source from `MIN(last_day) + 1` (the +1 is applied uniformly by
-    the caller) makes every source catch up; sources that are already
-    further ahead just skip their already-fetched days cheaply via the
-    per-day check inside fetch_traces. Returns (None, None) when no readsb
-    source has any history yet.
-    """
-    earliest_date: str | None = None
-    earliest_source: str | None = None
+def _resume_starts_per_source(db: Database, hex_code: str) -> dict[str, str]:
+    """Last success-filtered fetch date per readsb source. Sources with no
+    history are absent from the dict (a missing source resumes from the
+    earliest peer's start so it can catch up; see the fetch command)."""
+    starts: dict[str, str] = {}
     for src in SOURCE_URLS:
         fetched_dates = db.get_fetched_dates(hex_code, source=src)
-        if not fetched_dates:
-            continue
-        last_day = max(fetched_dates)
-        if earliest_date is None or last_day < earliest_date:
-            earliest_date = last_day
-            earliest_source = src
-    return earliest_date, earliest_source
+        if fetched_dates:
+            starts[src] = max(fetched_dates)
+    return starts
 
 
 _HEX_RE = re.compile(r"[0-9a-f]{6}")
@@ -268,58 +251,13 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
         # --url resolves its own source name (from the URL's netloc) further
         # below; resuming here against --source's fetch history would look up
         # the wrong source, so resume/--since-last only applies to a plain
-        # --source fetch. source == "all" fans out across every readsb
-        # source below, so its resume date is reduced across all of them
-        # too (db.get_fetched_dates(hex, source="all") would never match
-        # any fetch_log row -- "all" isn't a source name that gets written).
-        last_fetched = None
-        resume_driver = None
-        if not custom_url:
-            if source == "all":
-                last_fetched, resume_driver = _resume_start_for_all_sources(db, hex_code)
-            else:
-                fetched_dates = db.get_fetched_dates(hex_code, source=source)
-                last_fetched = max(fetched_dates) if fetched_dates else None
-
-        if since_last:
-            if last_fetched is None:
-                if source == "all":
-                    raise click.UsageError(
-                        f"--since-last requested but no prior fetches found for {hex_code} via any of the "
-                        f"readsb sources under --source all ({', '.join(sorted(SOURCE_URLS))})."
-                    )
-                raise click.UsageError(
-                    f"--since-last requested but no prior fetches found for {hex_code} via source {source!r}."
-                )
-            start = date.fromisoformat(last_fetched) + timedelta(days=1)
-        elif start_date:
-            start = date.fromisoformat(start_date)
-        elif last_fetched is not None:
-            start = date.fromisoformat(last_fetched) + timedelta(days=1)
-            if resume_driver:
-                console.print(
-                    f"[dim]Resuming from {start} ({resume_driver} is furthest behind; pass --start to override)[/]"
-                )
-            else:
-                console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
-        else:
-            start = _default_fetch_start()
-
+        # --source fetch.
         end = date.fromisoformat(end_date) if end_date else date.today()
 
-        if custom_url:
-            parsed = urlparse(custom_url)
-            if not parsed.scheme or not parsed.netloc:
-                raise click.BadParameter(
-                    f"Invalid URL: {custom_url}. Must be a full URL like https://example.com/globe_history",
-                    param_hint="--url",
-                )
-            source_name = parsed.netloc.replace(".", "_")
-            SOURCE_URLS[source_name] = custom_url
-            sources_to_fetch = [source_name]
-            console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{custom_url}[/]")
-        elif source == "all":
-            # Fetch from every readsb source + opensky if credentials exist
+        if source == "all" and not custom_url:
+            # Fetch from every readsb source + opensky if credentials exist.
+            # sources_to_fetch is computed first (Task 2 inserts a
+            # source-health filter here), then per-source start dates.
             sources_to_fetch = list(SOURCE_URLS.keys())
             opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
             if not opensky_available:
@@ -335,14 +273,96 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                         pass
             if opensky_available:
                 sources_to_fetch.append("opensky")
-            console.print(
-                f"Fetching [bold]{hex_code}[/] from {start} to {end} via "
-                f"[cyan]all {len(sources_to_fetch)} sources[/]"
-                + (" (incl. OpenSky)" if opensky_available else " (OpenSky skipped: no credentials)")
-            )
+
+            if start_date:
+                # Explicit --start is user intent: every source uses it
+                # verbatim, unclamped.
+                explicit_start = date.fromisoformat(start_date)
+                per_source_start: dict[str, date] = dict.fromkeys(sources_to_fetch, explicit_start)
+            else:
+                last = _resume_starts_per_source(db, hex_code)
+                if not last:
+                    if since_last:
+                        raise click.UsageError(
+                            f"--since-last requested but no prior fetches found for {hex_code} via any of the "
+                            f"readsb sources under --source all ({', '.join(sorted(SOURCE_URLS))})."
+                        )
+                    per_source_start = dict.fromkeys(sources_to_fetch, _default_fetch_start())
+                else:
+                    # A source with no history resumes from the earliest
+                    # peer's start so it can catch up, instead of being
+                    # skipped forever or stalling at the default start.
+                    fallback = min(date.fromisoformat(d) for d in last.values()) + timedelta(days=1)
+                    per_source_start = {
+                        src: (date.fromisoformat(last[src]) + timedelta(days=1) if src in last else fallback)
+                        for src in SOURCE_URLS
+                    }
+                    for src, resume_start in list(per_source_start.items()):
+                        if (end - resume_start).days > config.resume_max_lookback_days:
+                            clamped = end - timedelta(days=config.resume_max_lookback_days)
+                            console.print(
+                                f"[yellow]{src}: resume date {resume_start} is more than "
+                                f"{config.resume_max_lookback_days} days behind; clamping to {clamped} "
+                                "(older days skipped -- pass --start to backfill)[/]"
+                            )
+                            per_source_start[src] = clamped
+                    if "opensky" in sources_to_fetch:
+                        # opensky isn't a readsb source (not in SOURCE_URLS),
+                        # so it has no history of its own to resume from --
+                        # use the min of the (already clamped) readsb starts.
+                        per_source_start["opensky"] = min(per_source_start.values())
+
+            starts = set(per_source_start.values())
+            opensky_suffix = " (incl. OpenSky)" if opensky_available else " (OpenSky skipped: no credentials)"
+            if len(starts) == 1:
+                (uniform_start,) = starts
+                console.print(
+                    f"Fetching [bold]{hex_code}[/] from {uniform_start} to {end} via "
+                    f"[cyan]all {len(sources_to_fetch)} sources[/]{opensky_suffix}"
+                )
+            else:
+                console.print(
+                    f"Fetching [bold]{hex_code}[/] to {end} via "
+                    f"[cyan]all {len(sources_to_fetch)} sources[/]{opensky_suffix}"
+                )
+                for src in sources_to_fetch:
+                    console.print(f"  [dim]{src}: from {per_source_start[src]}[/]")
         else:
-            sources_to_fetch = [source]
-            console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
+            last_fetched = None
+            if not custom_url:
+                fetched_dates = db.get_fetched_dates(hex_code, source=source)
+                last_fetched = max(fetched_dates) if fetched_dates else None
+
+            if since_last:
+                if last_fetched is None:
+                    raise click.UsageError(
+                        f"--since-last requested but no prior fetches found for {hex_code} via source {source!r}."
+                    )
+                start = date.fromisoformat(last_fetched) + timedelta(days=1)
+            elif start_date:
+                start = date.fromisoformat(start_date)
+            elif last_fetched is not None:
+                start = date.fromisoformat(last_fetched) + timedelta(days=1)
+                console.print(f"[dim]Resuming from {start} (last fetched day; pass --start to override)[/]")
+            else:
+                start = _default_fetch_start()
+
+            if custom_url:
+                parsed = urlparse(custom_url)
+                if not parsed.scheme or not parsed.netloc:
+                    raise click.BadParameter(
+                        f"Invalid URL: {custom_url}. Must be a full URL like https://example.com/globe_history",
+                        param_hint="--url",
+                    )
+                source_name = parsed.netloc.replace(".", "_")
+                SOURCE_URLS[source_name] = custom_url
+                sources_to_fetch = [source_name]
+                per_source_start = {source_name: start}
+                console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{custom_url}[/]")
+            else:
+                sources_to_fetch = [source]
+                per_source_start = {source: start}
+                console.print(f"Fetching [bold]{hex_code}[/] from {start} to {end} via [cyan]{source}[/]")
 
         # Marks this run's trace_days rows, whichever source writes them, so
         # the auto-extract below knows where its new data starts.
@@ -380,11 +400,18 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                         thread_config = _load_config(db_path)
                         thread_config.rate_limit = rate
                         thread_config.fetch_concurrency = concurrency
+                        src_start = per_source_start[src]
                         if src == "opensky":
-                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, start, end)
+                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
                         else:
                             stats = fetch_traces(
-                                thread_db, thread_config, hex_code, start, end, source=src, progress=shared_progress
+                                thread_db,
+                                thread_config,
+                                hex_code,
+                                src_start,
+                                end,
+                                source=src,
+                                progress=shared_progress,
                             )
                         with lock:
                             per_source_stats[src] = stats
@@ -406,10 +433,11 @@ def fetch(hex_code, tail_number, source, custom_url, start_date, since_last, end
                 )
         else:
             src = sources_to_fetch[0]
+            src_start = per_source_start[src]
             if src == "opensky":
-                stats = fetch_traces_opensky(db, config, hex_code, start, end)
+                stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
             else:
-                stats = fetch_traces(db, config, hex_code, start, end, source=src)
+                stats = fetch_traces(db, config, hex_code, src_start, end, source=src)
             _accumulate(stats)
 
         console.print(

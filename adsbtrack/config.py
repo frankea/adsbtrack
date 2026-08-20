@@ -292,6 +292,13 @@ class Config:
     # rate_limit seconds apart, so concurrency only helps when request
     # latency exceeds rate_limit and in-flight overlap is possible.
     fetch_concurrency: int = 4
+    # fetch --source all resume: cap how far back a per-source resume may
+    # reach. A source that has been dead for months (adsblol, 2025-10 to
+    # present) otherwise drags its own catch-up window back across its whole
+    # outage on every run. Clamped sources print a warning naming the days
+    # skipped; pass --start explicitly to backfill deeper. Only applies to
+    # --source all resumes - a single named source is explicit user intent.
+    resume_max_lookback_days: int = 90
     airport_match_threshold_km: float = 10.0
     airport_types: tuple[str, ...] = ("large_airport", "medium_airport", "small_airport")
     landing_speed_threshold_kts: float = 80.0  # ground speed above which a "ground" alt reading is ignored

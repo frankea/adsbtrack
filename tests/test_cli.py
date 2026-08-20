@@ -4,7 +4,7 @@ import io
 import json
 import re
 import zipfile
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 from click.testing import CliRunner
@@ -1770,13 +1770,14 @@ def test_fetch_cli_since_last_errors_without_history(tmp_path):
     assert "no prior fetches found" in result.output.lower()
 
 
-def test_fetch_cli_source_all_resumes_from_source_furthest_behind(tmp_path, monkeypatch):
-    """`fetch --source all` (no --start/--since-last) resumes from the day
-    after the earliest last-fetched day across every readsb source, so a
-    source that's behind isn't stranded at its old resume point just
-    because another source is further along. A source with only
-    retry-exhausted (403) fetch_log rows counts as having no history, and a
-    source with zero fetch_log rows doesn't error the whole command."""
+def test_fetch_cli_source_all_resumes_each_source_from_its_own_history(tmp_path, monkeypatch):
+    """`fetch --source all` (no --start/--since-last) resumes each source
+    from the day after ITS OWN last-fetched day, not a single date reduced
+    across every source -- a source that's behind no longer drags every
+    other source's window back with it. A source with only retry-exhausted
+    (403) fetch_log rows counts as having no history, and a source with
+    zero fetch_log rows resumes from the earliest peer's start (so it can
+    catch up) instead of erroring the whole command."""
     from adsbtrack import cli as cli_module
 
     calls: list[tuple[str, date, date]] = []
@@ -1796,8 +1797,7 @@ def test_fetch_cli_source_all_resumes_from_source_furthest_behind(tmp_path, monk
         # adsbx is furthest along.
         for d in ("2026-05-01", "2026-05-02", "2026-05-03", "2026-05-04", "2026-05-05"):
             db.insert_fetch_log("dd44ee", d, 200, source="adsbx")
-        # adsbfi is furthest behind -- this is the source that should drive
-        # the resume date.
+        # adsbfi is furthest behind.
         db.insert_fetch_log("dd44ee", "2026-05-01", 200, source="adsbfi")
         # airplaneslive has only retry-exhausted rows, which don't count as
         # history at all (same success-filtering as the single-source path).
@@ -1811,9 +1811,203 @@ def test_fetch_cli_source_all_resumes_from_source_furthest_behind(tmp_path, monk
     )
     assert result.exit_code == 0, result.output
     assert len(calls) == 5
-    assert {c[1] for c in calls} == {date(2026, 5, 2)}
+    starts_by_source = {c[0]: c[1] for c in calls}
+    # adsbx resumes from its own last day + 1, not adsbfi's earlier date.
+    assert starts_by_source["adsbx"] == date(2026, 5, 6)
+    assert starts_by_source["adsbfi"] == date(2026, 5, 2)
+    # Sources with no success-filtered history (including the 403-only
+    # airplaneslive) catch up from the earliest peer's start.
+    assert starts_by_source["airplaneslive"] == date(2026, 5, 2)
+    assert starts_by_source["adsblol"] == date(2026, 5, 2)
+    assert starts_by_source["theairtraffic"] == date(2026, 5, 2)
     assert {c[2] for c in calls} == {date(2026, 5, 10)}
-    assert "Resuming from 2026-05-02 (adsbfi is furthest behind; pass --start to override)" in result.output
+    # Per-source starts differ, so the banner prints one line per source
+    # instead of a single uniform "Resuming from ..." message.
+    assert "adsbx: from 2026-05-06" in result.output
+    assert "adsbfi: from 2026-05-02" in result.output
+
+
+def _capture_fetch_calls(monkeypatch):
+    """Shared fetch_traces stub for the per-source resume tests below.
+    Records (source, start, end) for every call instead of the summary
+    stats -- these tests care about which window each source was given."""
+    calls: list[tuple[str, date, date]] = []
+
+    def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
+        calls.append((source, start, end))
+        return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
+
+    monkeypatch.setattr("adsbtrack.cli.fetch_traces", fake_fetch_traces)
+    return calls
+
+
+def test_source_all_resumes_each_source_from_its_own_history(tmp_path, monkeypatch):
+    """Two sources with different histories resume from their own last
+    fetched day, not a single date reduced across every source (#19)."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    today = date.today()
+    adsbx_last = today - timedelta(days=10)
+    airplaneslive_last = today - timedelta(days=40)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("aa11aa", adsbx_last.isoformat(), 200, source="adsbx")
+        db.insert_fetch_log("aa11aa", airplaneslive_last.isoformat(), 200, source="airplaneslive")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli, ["fetch", "--hex", "aa11aa", "--source", "all", "--end", today.isoformat(), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    starts_by_source = {c[0]: c[1] for c in calls}
+    assert starts_by_source["adsbx"] == adsbx_last + timedelta(days=1)
+    assert starts_by_source["airplaneslive"] == airplaneslive_last + timedelta(days=1)
+    # Not both resuming from airplaneslive's older date.
+    assert starts_by_source["adsbx"] != starts_by_source["airplaneslive"]
+
+
+def test_source_all_clamps_dead_source_to_lookback(tmp_path, monkeypatch):
+    """A source with success-filtered history older than
+    Config.resume_max_lookback_days has its resume start clamped to that
+    lookback floor instead of dragging its whole outage into every run.
+    The output warns which source was clamped and how to override it."""
+    from adsbtrack.config import Config
+
+    calls = _capture_fetch_calls(monkeypatch)
+
+    today = date.today()
+    lookback = Config().resume_max_lookback_days
+    adsblol_last = today - timedelta(days=300)
+    adsbx_last = today - timedelta(days=5)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("bb22bb", adsblol_last.isoformat(), 200, source="adsblol")
+        db.insert_fetch_log("bb22bb", adsbx_last.isoformat(), 200, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli, ["fetch", "--hex", "bb22bb", "--source", "all", "--end", today.isoformat(), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    starts_by_source = {c[0]: c[1] for c in calls}
+
+    clamp_floor = today - timedelta(days=lookback)
+    assert starts_by_source["adsblol"] == clamp_floor
+    # adsbx is well within the lookback window and resumes normally.
+    assert starts_by_source["adsbx"] == adsbx_last + timedelta(days=1)
+    # A source with no history at all falls back to adsblol's (pre-clamp)
+    # date, which is also older than the lookback, so it's clamped too.
+    assert starts_by_source["adsbfi"] == clamp_floor
+
+    assert "adsblol" in result.output
+    assert "pass --start to backfill" in result.output
+
+
+def test_single_source_resume_never_clamped(tmp_path, monkeypatch):
+    """A single named source (not 'all') is explicit user intent, so its
+    resume start is never clamped by resume_max_lookback_days -- even
+    across a gap of hundreds of days."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    today = date.today()
+    adsblol_last = today - timedelta(days=300)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("cc33cc", adsblol_last.isoformat(), 200, source="adsblol")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli,
+        ["fetch", "--hex", "cc33cc", "--source", "adsblol", "--end", today.isoformat(), "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert calls == [("adsblol", adsblol_last + timedelta(days=1), today)]
+    assert "clamp" not in result.output.lower()
+
+
+def test_explicit_start_overrides_per_source_resume(tmp_path, monkeypatch):
+    """`fetch --source all --start <date>` uses that date for every source
+    verbatim, ignoring per-source history and the lookback clamp entirely --
+    an explicit --start is user intent."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    today = date.today()
+    # Seed history that would otherwise drive a clamp, to prove --start wins.
+    old_last = today - timedelta(days=300)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("dd44dd", old_last.isoformat(), 200, source="adsblol")
+        db.conn.commit()
+
+    explicit_start = today - timedelta(days=200)
+    result = CliRunner().invoke(
+        cli,
+        [
+            "fetch",
+            "--hex",
+            "dd44dd",
+            "--source",
+            "all",
+            "--start",
+            explicit_start.isoformat(),
+            "--end",
+            today.isoformat(),
+            "--db",
+            str(db_path),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 5
+    assert {c[1] for c in calls} == {explicit_start}
+    assert "clamp" not in result.output.lower()
+
+
+def test_source_with_no_history_uses_earliest_peer_start(tmp_path, monkeypatch):
+    """A readsb source with no fetch history under --source all starts from
+    the same date as the earliest peer's resume start, so it can catch up
+    instead of defaulting to the Jan-1-last-year fallback."""
+    calls = _capture_fetch_calls(monkeypatch)
+
+    today = date.today()
+    adsbx_last = today - timedelta(days=10)
+
+    db_path = tmp_path / "fetch.db"
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO airports (ident, name, latitude_deg, longitude_deg, type) "
+            "VALUES ('EGLL', 'London Heathrow', 51.47, -0.45, 'large_airport')"
+        )
+        db.insert_fetch_log("ee55ee", adsbx_last.isoformat(), 200, source="adsbx")
+        db.conn.commit()
+
+    result = CliRunner().invoke(
+        cli, ["fetch", "--hex", "ee55ee", "--source", "all", "--end", today.isoformat(), "--db", str(db_path)]
+    )
+    assert result.exit_code == 0, result.output
+    starts_by_source = {c[0]: c[1] for c in calls}
+    expected = adsbx_last + timedelta(days=1)
+    assert starts_by_source["adsbx"] == expected
+    assert starts_by_source["theairtraffic"] == expected
 
 
 def test_fetch_cli_source_all_since_last_errors_without_any_history(tmp_path):

@@ -117,9 +117,14 @@ def test_reactivation_fires_after_dormancy_gap(db):
 
     new_day = last_day + timedelta(days=100)
     db.insert_trace_day(ICAO, new_day.isoformat(), _trace_data())
+    # Observation evidence (I2): an earlier run already asked about a day
+    # inside the gap and logged the answer, strictly before run_started_at.
+    mid_gap_day = last_day + timedelta(days=50)
+    db.insert_fetch_log(ICAO, mid_gap_day.isoformat(), 404, source="adsbx")
     db.commit()
 
-    alerts = evaluate(db, ICAO, pre, datetime.now(UTC).isoformat(), Config())
+    run_started_at = datetime.now(UTC).isoformat()
+    alerts = evaluate(db, ICAO, pre, run_started_at, Config())
 
     assert len(alerts) == 1
     alert = alerts[0]
@@ -145,6 +150,24 @@ def test_reactivation_respects_dormancy_floor(db):
     config = Config()
     assert config.watch_dormancy_days == 30
     alerts = evaluate(db, ICAO, pre, datetime.now(UTC).isoformat(), config)
+    assert alerts == []
+
+
+def test_reactivation_suppressed_without_observation_evidence(db):
+    """A dormancy gap with no fetch_log row logged inside it before this run
+    started must not fire (I2): without evidence someone actually asked and
+    got nothing during the gap, this looks identical to watch's first-ever
+    look at a hex that already had sporadic history from `fetch`."""
+    last_day = date(2026, 1, 1)
+    db.insert_trace_day(ICAO, last_day.isoformat(), _trace_data())
+    db.commit()
+    pre = snapshot_state(db, ICAO)
+
+    new_day = last_day + timedelta(days=100)
+    db.insert_trace_day(ICAO, new_day.isoformat(), _trace_data())
+    db.commit()
+
+    alerts = evaluate(db, ICAO, pre, datetime.now(UTC).isoformat(), Config())
     assert alerts == []
 
 
@@ -176,20 +199,55 @@ def test_emergency_fires_only_for_new_flights(db):
     assert alert.detail["emergency_squawk"] == "7700"
 
 
-def test_spoof_fires_only_for_rows_detected_after_run_start(db):
+def test_emergency_baselines_when_no_prior_flights_exist(db):
+    """A hex with trace history but zero flights extracted yet at snapshot
+    time (e.g. this run's incremental extract hit parser.py's
+    incremental-refusal fallback and silently upgraded to a full reprocess,
+    writing years of flights in one pass) must not flood on every
+    historical emergency once flights appear -- baseline instead (M7)."""
     db.insert_trace_day(ICAO, "2026-01-01", _trace_data())
     db.commit()
     pre = snapshot_state(db, ICAO)
+    assert pre.has_any_trace is True
+    assert pre.max_flight_takeoff_time is None
 
-    run_started_at = datetime(2026, 1, 2, 12, tzinfo=UTC)
-    before_run = run_started_at - timedelta(hours=1)
-    after_run = run_started_at + timedelta(minutes=1)
-
-    _spoof(db, ICAO, datetime(2026, 1, 2, 1, tzinfo=UTC), before_run.isoformat(), callsign="OLD")
-    _spoof(db, ICAO, datetime(2026, 1, 2, 2, tzinfo=UTC), after_run.isoformat(), callsign="NEW")
+    db.insert_flight(
+        _flight(ICAO, datetime(2020, 1, 1, 10, tzinfo=UTC), callsign="OLD", had_emergency=1, emergency_squawk="7700")
+    )
+    db.insert_flight(_flight(ICAO, datetime(2026, 1, 1, 10, tzinfo=UTC), callsign="RECENT"))
     db.commit()
 
-    alerts = evaluate(db, ICAO, pre, run_started_at.isoformat(), Config())
+    alerts = evaluate(db, ICAO, pre, datetime.now(UTC).isoformat(), Config())
+    assert alerts == []
+
+
+def test_spoof_fires_only_for_new_identity_keys(db):
+    """Spoof suppression is keyed on (takeoff_time, reason) identity, not
+    row presence or detected_at (C2) -- a full reprocess that deletes and
+    re-inserts spoofed_broadcasts wholesale (stamping a fresh detected_at on
+    content that never actually changed) must not re-fire the same row."""
+    db.insert_trace_day(ICAO, "2026-01-01", _trace_data())
+    old_takeoff = datetime(2026, 1, 1, 1, tzinfo=UTC)
+    _spoof(db, ICAO, old_takeoff, datetime.now(UTC).isoformat(), callsign="OLD")
+    db.commit()
+
+    pre = snapshot_state(db, ICAO)
+    assert pre.spoof_keys == {(old_takeoff.isoformat(), "bimodal_integrity")}
+
+    # Simulate a full reprocess rewriting the SAME row: delete + re-insert,
+    # stamping a fresh detected_at, identical (takeoff_time, reason).
+    db.conn.execute(
+        "DELETE FROM spoofed_broadcasts WHERE icao = ? AND takeoff_time = ?",
+        (ICAO, old_takeoff.isoformat()),
+    )
+    _spoof(db, ICAO, old_takeoff, datetime.now(UTC).isoformat(), callsign="OLD")
+
+    # A genuinely new spoof row, different takeoff_time.
+    new_takeoff = datetime(2026, 1, 2, 2, tzinfo=UTC)
+    _spoof(db, ICAO, new_takeoff, datetime.now(UTC).isoformat(), callsign="NEW")
+    db.commit()
+
+    alerts = evaluate(db, ICAO, pre, datetime.now(UTC).isoformat(), Config())
 
     assert len(alerts) == 1
     alert = alerts[0]
@@ -200,7 +258,9 @@ def test_spoof_fires_only_for_rows_detected_after_run_start(db):
 
 def test_snapshot_state_shapes(db):
     empty = snapshot_state(db, ICAO)
-    assert empty == WatchState(has_any_trace=False, last_data_day=None, max_flight_takeoff_time=None)
+    assert empty == WatchState(
+        has_any_trace=False, last_data_day=None, max_flight_takeoff_time=None, spoof_keys=frozenset()
+    )
 
     db.insert_trace_day(ICAO, "2026-01-01", _trace_data())
     db.insert_trace_day(ICAO, "2026-01-05", _trace_data())
@@ -215,11 +275,18 @@ def test_snapshot_state_shapes(db):
         has_any_trace=True,
         last_data_day="2026-01-05",
         max_flight_takeoff_time=latest.isoformat(),
+        spoof_keys=frozenset(),
     )
+
+    spoof_takeoff = datetime(2026, 1, 5, 10, tzinfo=UTC)
+    _spoof(db, ICAO, spoof_takeoff, datetime.now(UTC).isoformat(), reason="bimodal_integrity")
+    db.commit()
+    with_spoof = snapshot_state(db, ICAO)
+    assert with_spoof.spoof_keys == {(spoof_takeoff.isoformat(), "bimodal_integrity")}
 
 
 def test_watch_alert_and_state_are_plain_dataclasses():
     alert = WatchAlert(kind="emergency", icao=ICAO, summary="x", detail={})
     assert alert.kind == "emergency"
-    state = WatchState(has_any_trace=True, last_data_day=None, max_flight_takeoff_time=None)
+    state = WatchState(has_any_trace=True, last_data_day=None, max_flight_takeoff_time=None, spoof_keys=frozenset())
     assert state.has_any_trace is True

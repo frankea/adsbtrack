@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import json
 import os
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 
 import click
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 from rich.table import Table
 
@@ -34,7 +36,7 @@ from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
 from .parser import extract_flights
 from .runways import refresh_runways
-from .watch import WatchAlert, _post_webhook, evaluate, snapshot_state
+from .watch import WatchAlert, evaluate, post_webhook, snapshot_state
 
 ALL_SOURCES = list(SOURCE_URLS.keys()) + ["opensky"]
 # "all" fetches from every readsb source (excludes opensky which needs creds)
@@ -2159,7 +2161,7 @@ def _collect_watch_hexes(hex_codes: tuple[str, ...], watchlist_path: str | None)
     help="File with one hex per line; '#' comments and blank lines ignored",
 )
 @click.option("--webhook", default=None, help="POST alerts as JSON to this URL when any fire")
-@click.option("--dormancy-days", type=int, default=None, help="Override Config.watch_dormancy_days")
+@click.option("--dormancy-days", type=click.IntRange(min=1), default=None, help="Override Config.watch_dormancy_days")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
 @_db_option()
 def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_path):
@@ -2170,27 +2172,62 @@ def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_pat
     if dormancy_days is not None:
         config.watch_dormancy_days = dormancy_days
 
-    end = date.today()
+    # Archives finalize sometime after UTC midnight; a source can hand back
+    # a terminal 404/204 for TODAY well before today is actually over, and
+    # that terminal answer gets recorded as "fetched" -- ending the window
+    # at today would mark it done for good and it would never be
+    # re-requested. Ending at yesterday accepts up to ~24h of alert latency
+    # in exchange for never silently losing a day's data.
+    end = date.today() - timedelta(days=1)
     hex_statuses: dict[str, str] = {}
     all_alerts: list[WatchAlert] = []
+    document: dict = {}
 
-    with Database(Path(db_path)) as db:
+    # --json must be one valid JSON document on stdout. Anything this run
+    # would normally print (skip notes, failures, parser.py's own
+    # incremental-refusal prints) still needs to reach the operator, so
+    # redirect stdout to stderr for the duration instead of suppressing it.
+    # Rich's Console and the stdlib print() both resolve sys.stdout at
+    # write time, so this catches every source, not just our own calls.
+    stdout_guard = contextlib.redirect_stdout(sys.stderr) if as_json else contextlib.nullcontext()
+
+    with stdout_guard, Database(Path(db_path)) as db:
+        ensure_airports(db, config)
+
         for hex_code in hexes:
             run_started_at = datetime.now(UTC).isoformat()
             pre = snapshot_state(db, hex_code)
             try:
                 last = _resume_starts_per_source(db, hex_code)
+                unhealthy: dict[str, int] = {}
                 for src in SOURCE_URLS:
                     is_unhealthy, leading = _source_is_unhealthy(db, src, config)
                     if is_unhealthy:
-                        console.print(f"[dim]{hex_code}: skipping {src} (unhealthy, last {leading} attempts failed)[/]")
+                        unhealthy[src] = leading
+                if unhealthy and len(unhealthy) == len(SOURCE_URLS):
+                    console.print(
+                        f"[yellow]{hex_code}: every readsb source looks unhealthy; fetching all of them "
+                        "anyway instead of skipping everything.[/]"
+                    )
+                    unhealthy = {}
+
+                for src in SOURCE_URLS:
+                    if src in unhealthy:
+                        console.print(
+                            f"[dim]{hex_code}: skipping {src} (unhealthy, last {unhealthy[src]} attempts failed)[/]"
+                        )
                         continue
                     if src in last:
                         start = date.fromisoformat(last[src]) + timedelta(days=1)
                     else:
                         start = end - timedelta(days=config.resume_max_lookback_days)
                     if (end - start).days > config.resume_max_lookback_days:
-                        start = end - timedelta(days=config.resume_max_lookback_days)
+                        clamped = end - timedelta(days=config.resume_max_lookback_days)
+                        console.print(
+                            f"[dim]{hex_code}: {src} resume date {start} is more than "
+                            f"{config.resume_max_lookback_days} days behind; clamping to {clamped}[/]"
+                        )
+                        start = clamped
                     fetch_traces(db, config, hex_code, start, end, source=src, progress=None)
 
                 # Re-extract only what this run's new trace days can affect,
@@ -2203,7 +2240,7 @@ def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_pat
 
                 alerts = evaluate(db, hex_code, pre, run_started_at, config)
             except Exception as exc:
-                console.print(f"[red]{hex_code}: watch run failed: {exc}[/]")
+                console.print(f"[red]{hex_code}: watch run failed: {escape(str(exc))}[/]")
                 hex_statuses[hex_code] = "error"
                 continue
 
@@ -2218,17 +2255,17 @@ def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_pat
             if not as_json:
                 console.print(f"{hex_code}: {status}")
 
-    document = {
-        "generated_at": datetime.now(UTC).isoformat(),
-        "alerts": [dataclasses.asdict(a) for a in all_alerts],
-        "hexes": hex_statuses,
-    }
+        document = {
+            "generated_at": datetime.now(UTC).isoformat(),
+            "alerts": [dataclasses.asdict(a) for a in all_alerts],
+            "hexes": hex_statuses,
+        }
 
-    if all_alerts and webhook:
-        try:
-            _post_webhook(webhook, document, config.watch_webhook_timeout_secs)
-        except Exception as exc:
-            console.print(f"[red]webhook POST to {webhook} failed: {exc}[/]")
+        if all_alerts and webhook:
+            try:
+                post_webhook(webhook, document, config.watch_webhook_timeout_secs)
+            except Exception as exc:
+                console.print(f"[red]webhook POST to {escape(webhook)} failed: {escape(str(exc))}[/]")
 
     if as_json:
         click.echo(json.dumps(document, indent=2))
@@ -2242,7 +2279,7 @@ def watch_cmd(hex_codes, watchlist_path, webhook, dormancy_days, as_json, db_pat
         console.print(table)
 
     if all_alerts:
-        sys.exit(2)
+        sys.exit(3)
 
 
 # -----------------------------------------------------------------------------

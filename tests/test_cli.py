@@ -2894,19 +2894,30 @@ def _watch_trace_data(timestamp: float = 1700000000.0) -> dict:
     return {"timestamp": timestamp, "trace": [[0, 40.0, -74.0, 5000, 200, None, None, None, {}]]}
 
 
-def _capture_watch_fetch_calls(monkeypatch, *, inject_hex: str | None = None, inject_source: str = "adsbx"):
+def _capture_watch_fetch_calls(monkeypatch, tmp_path, *, inject_hex: str | None = None, inject_source: str = "adsbx"):
     """Stub adsbtrack.cli.fetch_traces for `watch` tests: records every
     (hex, source) call. When `inject_hex` is given, the call for that hex on
-    `inject_source` inserts a trace day for today via the real db handle it
-    receives -- simulating a fetch that discovered new data."""
+    `inject_source` inserts a trace day for *yesterday* via the real db
+    handle it receives -- simulating a fetch that discovered new data (watch
+    never fetches through today; end is always yesterday, see C1).
+
+    Mirrors _capture_fetch_calls's hermeticity guards even though watch
+    never touches opensky itself (SOURCE_URLS has no opensky entry) -- a
+    stray real credentials.json or ADSBTRACK_CONFIG at the repo root should
+    still not be able to influence these tests."""
     from adsbtrack import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
 
     calls: list[tuple[str, str]] = []
 
     def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
         calls.append((hex_code, source))
         if inject_hex is not None and hex_code == inject_hex and source == inject_source:
-            db.insert_trace_day(hex_code, date.today().isoformat(), _watch_trace_data(), source=source)
+            yesterday = (date.today() - timedelta(days=1)).isoformat()
+            db.insert_trace_day(hex_code, yesterday, _watch_trace_data(), source=source)
             db.commit()
         return {"fetched": 0, "with_data": 0, "skipped": 0, "errors": 0, "failed_days": []}
 
@@ -2915,7 +2926,7 @@ def _capture_watch_fetch_calls(monkeypatch, *, inject_hex: str | None = None, in
 
 
 def _capture_webhook(monkeypatch):
-    """Stub the urllib.request.urlopen that adsbtrack.watch._post_webhook
+    """Stub the urllib.request.urlopen that adsbtrack.watch.post_webhook
     calls, recording (url, body, timeout) for each POST."""
     calls: list[tuple[str, bytes, float | None]] = []
 
@@ -2939,7 +2950,8 @@ def _capture_webhook(monkeypatch):
 
 
 def test_watch_requires_some_hex(tmp_path):
-    """No --hex and no --watchlist -> click.UsageError (exit code 2)."""
+    """No --hex and no --watchlist -> click.UsageError (exit code 2, Click's
+    own UsageError code -- unrelated to and never opens the db)."""
     result = CliRunner().invoke(cli, ["watch", "--db", str(tmp_path / "watch.db")])
     assert result.exit_code == 2, result.output
     assert "at least one" in result.output.lower()
@@ -2948,10 +2960,11 @@ def test_watch_requires_some_hex(tmp_path):
 def test_watch_first_run_baselines_without_alerts(tmp_path, monkeypatch):
     """An aircraft with no prior trace history baselines instead of firing
     alerts for its whole backfilled history, and never touches the webhook."""
-    calls = _capture_watch_fetch_calls(monkeypatch)
+    db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    calls = _capture_watch_fetch_calls(monkeypatch, tmp_path)
     webhook_calls = _capture_webhook(monkeypatch)
 
-    db_path = tmp_path / "watch.db"
     result = CliRunner().invoke(
         cli, ["watch", "--hex", "aa11bb", "--webhook", "http://example.invalid/hook", "--db", str(db_path)]
     )
@@ -2962,23 +2975,54 @@ def test_watch_first_run_baselines_without_alerts(tmp_path, monkeypatch):
 
 
 def test_watch_reactivation_alert_and_exit_code(tmp_path, monkeypatch):
-    """A hex dormant for 100 days that gets new trace data during the run
-    fires a reactivation alert and exits 2; no --webhook means no POST."""
+    """A hex dormant for 100 days, with a fetch_log row from an earlier run
+    proving the gap was actually observed (I2 -- see the suppression test
+    below for the case without that evidence), fires a reactivation alert
+    when new trace data lands and exits 3; no --webhook means no POST."""
     hex_code = "aa22cc"
-    old_day = (date.today() - timedelta(days=100)).isoformat()
-    calls = _capture_watch_fetch_calls(monkeypatch, inject_hex=hex_code)
-    webhook_calls = _capture_webhook(monkeypatch)
+    old_day = date.today() - timedelta(days=100)
+    mid_gap_day = old_day + timedelta(days=50)
 
     db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    calls = _capture_watch_fetch_calls(monkeypatch, tmp_path, inject_hex=hex_code)
+    webhook_calls = _capture_webhook(monkeypatch)
+
     with Database(db_path) as db:
-        db.insert_trace_day(hex_code, old_day, _watch_trace_data(), source="adsbx")
+        db.insert_trace_day(hex_code, old_day.isoformat(), _watch_trace_data(), source="adsbx")
+        # Observation evidence: an earlier run already asked about a day
+        # inside the gap and logged the answer, strictly before this run.
+        db.insert_fetch_log(hex_code, mid_gap_day.isoformat(), 404, source="adsbx")
         db.commit()
 
     result = CliRunner().invoke(cli, ["watch", "--hex", hex_code, "--db", str(db_path)])
-    assert result.exit_code == 2, result.output
+    assert result.exit_code == 3, result.output
     assert "reactivation" in result.output
     assert len(calls) == 5
     assert webhook_calls == []
+
+
+def test_watch_reactivation_suppressed_without_observation_evidence(tmp_path, monkeypatch):
+    """The same 100-day-gap scenario WITHOUT any fetch_log row logged during
+    the gap must not fire (I2): this is watch's first-ever look at a hex
+    that already had sporadic history from `fetch` before watch was
+    adopted, not proof the aircraft was actually silent the whole time."""
+    hex_code = "ee88ff"
+    old_day = date.today() - timedelta(days=100)
+
+    db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    calls = _capture_watch_fetch_calls(monkeypatch, tmp_path, inject_hex=hex_code)
+
+    with Database(db_path) as db:
+        db.insert_trace_day(hex_code, old_day.isoformat(), _watch_trace_data(), source="adsbx")
+        db.commit()
+
+    result = CliRunner().invoke(cli, ["watch", "--hex", hex_code, "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "reactivation" not in result.output
+    assert "no alerts" in result.output
+    assert len(calls) == 5
 
 
 def test_watch_webhook_posts_on_alerts_only(tmp_path, monkeypatch):
@@ -2987,19 +3031,23 @@ def test_watch_webhook_posts_on_alerts_only(tmp_path, monkeypatch):
     from adsbtrack.config import Config
 
     hex_code = "bb33dd"
-    old_day = (date.today() - timedelta(days=100)).isoformat()
-    _capture_watch_fetch_calls(monkeypatch, inject_hex=hex_code)
-    webhook_calls = _capture_webhook(monkeypatch)
+    old_day = date.today() - timedelta(days=100)
+    mid_gap_day = old_day + timedelta(days=50)
 
     db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    _capture_watch_fetch_calls(monkeypatch, tmp_path, inject_hex=hex_code)
+    webhook_calls = _capture_webhook(monkeypatch)
+
     with Database(db_path) as db:
-        db.insert_trace_day(hex_code, old_day, _watch_trace_data(), source="adsbx")
+        db.insert_trace_day(hex_code, old_day.isoformat(), _watch_trace_data(), source="adsbx")
+        db.insert_fetch_log(hex_code, mid_gap_day.isoformat(), 404, source="adsbx")
         db.commit()
 
     result = CliRunner().invoke(
         cli, ["watch", "--hex", hex_code, "--webhook", "http://example.invalid/hook", "--db", str(db_path)]
     )
-    assert result.exit_code == 2, result.output
+    assert result.exit_code == 3, result.output
     assert len(webhook_calls) == 1
     url, body, timeout = webhook_calls[0]
     assert url == "http://example.invalid/hook"
@@ -3011,9 +3059,10 @@ def test_watch_webhook_posts_on_alerts_only(tmp_path, monkeypatch):
     # A clean second run (fresh hex, no prior history -> baselines) must not
     # call the webhook at all.
     webhook_calls.clear()
+    db_path2 = tmp_path / "w2.db"
+    _seed_airport(db_path2)
     result2 = CliRunner().invoke(
-        cli,
-        ["watch", "--hex", "cc44ee", "--webhook", "http://example.invalid/hook", "--db", str(tmp_path / "w2.db")],
+        cli, ["watch", "--hex", "cc44ee", "--webhook", "http://example.invalid/hook", "--db", str(db_path2)]
     )
     assert result2.exit_code == 0, result2.output
     assert webhook_calls == []
@@ -3022,12 +3071,13 @@ def test_watch_webhook_posts_on_alerts_only(tmp_path, monkeypatch):
 def test_watch_watchlist_file_parsing(tmp_path, monkeypatch):
     """Watchlist entries union with --hex, with comments/blanks ignored and
     a cross-source duplicate (mixed case) deduped rather than double-fetched."""
-    calls = _capture_watch_fetch_calls(monkeypatch)
+    db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    calls = _capture_watch_fetch_calls(monkeypatch, tmp_path)
 
     watchlist = tmp_path / "watchlist.txt"
     watchlist.write_text("# my watchlist\n\nAA11BB   # dup of --hex, mixed case\n   \ncc22dd\n")
 
-    db_path = tmp_path / "watch.db"
     result = CliRunner().invoke(cli, ["watch", "--hex", "aa11bb", "--watchlist", str(watchlist), "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     hexes_called = {c[0] for c in calls}
@@ -3040,9 +3090,10 @@ def test_watch_watchlist_file_parsing(tmp_path, monkeypatch):
 def test_watch_skips_unhealthy_sources(tmp_path, monkeypatch):
     """A readsb source whose last 20 attempts were all retryable failures is
     skipped for every hex, with a skip note naming it."""
-    calls = _capture_watch_fetch_calls(monkeypatch)
-
     db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    calls = _capture_watch_fetch_calls(monkeypatch, tmp_path)
+
     with Database(db_path) as db:
         _seed_sick_source(db, "dd55ee", "adsblol")
         db.commit()
@@ -3056,11 +3107,55 @@ def test_watch_skips_unhealthy_sources(tmp_path, monkeypatch):
     assert "skip" in result.output.lower()
 
 
+def test_watch_all_sources_unhealthy_fetches_anyway(tmp_path, monkeypatch):
+    """When every readsb source looks unhealthy, watch falls back to
+    fetching all of them anyway (I3, mirrors `fetch --source all`) instead
+    of silently doing nothing and reporting a clean run."""
+    db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    calls = _capture_watch_fetch_calls(monkeypatch, tmp_path)
+
+    with Database(db_path) as db:
+        for src in ("adsbx", "adsbfi", "airplaneslive", "adsblol", "theairtraffic"):
+            _seed_sick_source(db, "ff99aa", src)
+        db.commit()
+
+    result = CliRunner().invoke(cli, ["watch", "--hex", "ff99aa", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert len(calls) == 5  # fetched from every source anyway, none skipped
+    assert "unhealthy" in result.output.lower()
+    assert "anyway" in result.output.lower()
+
+
+def test_watch_json_output_is_valid_with_warnings(tmp_path, monkeypatch):
+    """--json must still be a single valid JSON document on stdout even when
+    the run also prints a warning (a skipped unhealthy source here, I1) --
+    the warning goes to stderr instead of interleaving into stdout."""
+    db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
+    _capture_watch_fetch_calls(monkeypatch, tmp_path)
+
+    with Database(db_path) as db:
+        _seed_sick_source(db, "aa00bb", "adsblol")
+        db.commit()
+
+    result = CliRunner().invoke(cli, ["watch", "--hex", "aa00bb", "--json", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.stdout)
+    assert payload["hexes"]["aa00bb"] == "baselined"
+    assert "adsblol" in result.stderr
+    assert "adsblol" not in result.stdout
+
+
 def test_watch_continues_after_one_hex_fails(tmp_path, monkeypatch):
     """A fetch/extract exception for one hex warns and continues to the next
     hex; the run still completes with an exit code reflecting only real
     alerts (neither hex here fires one)."""
     from adsbtrack import cli as cli_module
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("OPENSKY_CLIENT_ID", raising=False)
+    monkeypatch.delenv("OPENSKY_CLIENT_SECRET", raising=False)
 
     def fake_fetch_traces(db, config, hex_code, start, end, source="adsbx", progress=None):
         if hex_code == "ff66aa" and source == "adsbx":
@@ -3070,6 +3165,7 @@ def test_watch_continues_after_one_hex_fails(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_module, "fetch_traces", fake_fetch_traces)
 
     db_path = tmp_path / "watch.db"
+    _seed_airport(db_path)
     result = CliRunner().invoke(cli, ["watch", "--hex", "ff66aa", "--hex", "bb77cc", "--db", str(db_path)])
     assert result.exit_code == 0, result.output
     assert "ff66aa" in result.output

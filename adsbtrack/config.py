@@ -289,6 +289,19 @@ class Config:
     # keeps adsbtrack a polite consumer.
     adsbdb_base_url: str = "https://api.adsbdb.com"
     adsbdb_rate_limit_per_min: int = 30
+    # Live callsign -> hex resolution networks (issue #29, `resolve`
+    # command), queried in dict order. adsb.lol and adsb.fi expose open
+    # readsb-style /v2/callsign endpoints; adsb.fi asks for at most one
+    # request per second, which the shared per-minute throttle stays well
+    # under. airplanes.live is deliberately absent: its API requires a key
+    # granted on application.
+    resolve_source_urls: dict[str, str] = field(
+        default_factory=lambda: {
+            "adsblol": "https://api.adsb.lol",
+            "adsbfi": "https://opendata.adsb.fi/api",
+        }
+    )
+    resolve_rate_limit_per_min: int = 30
     rate_limit: float = 0.5  # seconds between requests
     rate_limit_max: float = 30.0  # max backoff after 429s
     rate_limit_recovery: int = 10  # successes before reducing delay

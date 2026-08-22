@@ -199,6 +199,14 @@ Or use `--tail` instead of `--hex` on any command:
 uv run python -m adsbtrack.cli fetch --tail N512WB --start 2020-01-01
 ```
 
+Starting from a callsign / flight number instead? `resolve` asks the open live-traffic APIs (adsb.lol, then adsb.fi) which airframes are broadcasting it right now:
+
+```
+uv run python -m adsbtrack.cli resolve UAE201
+```
+
+Each match prints hex, registration, and type, and is cached into `hex_crossref` so follow-on `fetch` / `extract` runs can use `--hex` or `--tail` offline. Live-only by design: an aircraft that is not currently broadcasting will not be found (exit code 1), and historical callsign search is out of scope. airplanes.live is not queried - its API requires a key granted on application.
+
 External lookup sites: [aircraftdata.org](https://aircraftdata.org), [FAA Aircraft Registry](https://registry.faa.gov/aircraftinquiry), [ADS-B Exchange](https://globe.adsbexchange.com/)
 
 ## Generate trace URLs

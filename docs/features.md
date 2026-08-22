@@ -147,6 +147,8 @@ Every hex is also checked against `mil_hex_ranges` independently of the civilian
 
 `lookup <hex|registration>` runs the same merge for a single ad-hoc query - any country's registration format, not just FAA N-numbers - and adds a final adsbdb fallback for foreign airframes hexdb.io misses, caching whatever it finds into `hex_crossref`. An unresolvable hex inside a military allocation block still gets the range annotation (country, branch, notes) as its answer.
 
+`resolve <callsign>` covers the remaining entry point: casework that starts from a flight number. It asks the open live-traffic APIs (adsb.lol, then adsb.fi) which airframes are broadcasting that callsign right now and returns hex + registration + type per match, caching identities into `hex_crossref` under a `<network>_live` tag (never overwriting an existing identity row). Live-only: historical callsign search is out of scope.
+
 ## Navaid alignment
 
 **Column:** `navaid_track` (JSON string or NULL).

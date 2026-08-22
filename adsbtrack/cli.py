@@ -1370,6 +1370,78 @@ def lookup(query, tail_number, offline, mictronics_dir, output_json, db_path):
 
 
 @cli.command()
+@click.argument("callsign")
+@click.option("--no-cache", is_flag=True, help="Do not cache matches into hex_crossref.")
+@_json_option()
+@_db_option()
+def resolve(callsign, no_cache, output_json, db_path):
+    """Resolve a live callsign to airframe hex + registration.
+
+    Queries the open live-traffic APIs (adsb.lol, then adsb.fi) for
+    currently-airborne aircraft broadcasting CALLSIGN and prints hex,
+    registration, and type for each match. Live-only: an aircraft that is
+    not broadcasting right now will not be found - historical callsign
+    search is out of scope. Matches are cached into hex_crossref so
+    follow-on fetch/extract runs can resolve the tail offline. Exit code
+    is 1 when nothing matched, 2 when every network errored.
+    """
+    from .resolve import LiveNetworkClient, resolve_callsign
+
+    normalized = callsign.strip().upper()
+    if not normalized:
+        raise click.UsageError("Provide a non-empty callsign.")
+
+    cfg = _load_config(db_path)
+    clients = [
+        LiveNetworkClient(name, url, rate_limit_per_min=cfg.resolve_rate_limit_per_min)
+        for name, url in cfg.resolve_source_urls.items()
+    ]
+    try:
+        with Database(cfg.db_path) as db:
+            matches, errors = resolve_callsign(db, normalized, clients=clients, cache=not no_cache)
+    finally:
+        for client in clients:
+            client.close()
+
+    if output_json:
+        payload = {
+            "callsign": normalized,
+            "matches": [dataclasses.asdict(m) for m in matches],
+            "errors": errors,
+        }
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        for name, err in errors.items():
+            console.print(f"[yellow]{name}: {escape(err)}[/]")
+        if matches:
+            table = Table(title=f"Live matches for {normalized}")
+            table.add_column("Hex")
+            table.add_column("Registration")
+            table.add_column("Type")
+            table.add_column("Altitude")
+            table.add_column("GS kt")
+            table.add_column("Seen by")
+            for m in matches:
+                alt = str(m.alt_baro) if m.alt_baro is not None else "-"
+                gs = f"{m.ground_speed:.0f}" if m.ground_speed is not None else "-"
+                type_display = m.type_code or "-"
+                if m.type_description:
+                    type_display = f"{type_display} ({m.type_description})"
+                table.add_row(m.hex_code, m.registration or "-", type_display, alt, gs, ", ".join(m.networks))
+            console.print(table)
+            if not no_cache:
+                console.print("[dim]Matches cached into hex_crossref; fetch/extract can now use --hex or --tail.[/]")
+        else:
+            queried = [c.name for c in clients if c.name not in errors]
+            where = ", ".join(queried) if queried else "any network"
+            console.print(f"[yellow]No currently-airborne aircraft broadcasting {normalized!r} on {where}.[/]")
+            console.print("[dim]resolve is live-only; try again while the flight is in the air.[/]")
+
+    if not matches:
+        sys.exit(2 if len(errors) == len(clients) else 1)
+
+
+@cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number")
 @_db_option()

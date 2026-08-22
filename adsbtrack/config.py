@@ -284,6 +284,11 @@ class Config:
     mictronics_cache_dir: Path = Path(".cache/mictronics")
     hexdb_base_url: str = "https://hexdb.io"
     hexdb_rate_limit_per_min: int = 60
+    # adsbdb final-fallback identity lookup (issue #27, `lookup` command).
+    # Free community API with no published hard limit; the self-throttle
+    # keeps adsbtrack a polite consumer.
+    adsbdb_base_url: str = "https://api.adsbdb.com"
+    adsbdb_rate_limit_per_min: int = 30
     rate_limit: float = 0.5  # seconds between requests
     rate_limit_max: float = 30.0  # max backoff after 429s
     rate_limit_recovery: int = 10  # successes before reducing delay

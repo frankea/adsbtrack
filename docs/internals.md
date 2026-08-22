@@ -208,6 +208,10 @@ Each import validates the file's header line against a required-columns list bef
 
 Conflicts (differing registrations or type codes between sources) are reported in the return value but don't block the write. An independent check against `mil_hex_ranges` runs on every hex and stamps `is_military` / `mil_country` / `mil_branch` regardless of which civilian source supplied the row, so e.g. a hex with a Mictronics registration can still be flagged as military when it sits in a DoD allocation block.
 
+## Universal lookup
+
+`adsbtrack lookup <hex|registration>` (`adsbtrack/lookup.py`) reuses the same merge for ad-hoc queries. A hex query answers from the `hex_crossref` cache when a row with actual identity exists, runs the FAA -> Mictronics -> hexdb.io merge on a miss, then falls back to adsbdb (`api.adsbdb.com/v0/aircraft/{query}`) - which covers many foreign civil and military registrations hexdb.io misses. A registration query resolves to a hex via algorithmic FAA N-number conversion, the local `hex_crossref` / `aircraft_registry` tables, hexdb.io's plain-text `reg-hex` converter, then adsbdb (whose aircraft payload doubles as the identity, avoiding a second fetch). Online answers are cached into `hex_crossref` with their source tag, and the `mil_hex_ranges` annotation (country / branch / notes) is reported even when no identity source resolves the hex - so a US DoD-pool address still gets a useful answer. The adsbdb client self-throttles per `Config.adsbdb_rate_limit_per_min` and treats both HTTP 404 and `{"response": "unknown aircraft"}` bodies as misses.
+
 ## Interactive surfaces (TUI + GUI)
 
 Two read-only surfaces sit on top of the same `adsbtrack.db`. Neither introduces a

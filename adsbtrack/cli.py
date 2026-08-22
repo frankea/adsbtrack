@@ -1275,14 +1275,98 @@ def status(hex_code, tail_number, output_json, db_path):
 
 
 @cli.command()
-@click.option("--tail", "tail_number", required=True, help="FAA N-number (e.g. N512WB)")
-def lookup(tail_number):
-    """Convert an FAA N-number to an ICAO hex code."""
+@click.argument("query", required=False)
+@click.option("--tail", "tail_number", default=None, help="Deprecated alias for QUERY (kept for old scripts).")
+@click.option("--offline", is_flag=True, help="Local sources only: skip the hexdb.io and adsbdb fallbacks.")
+@click.option(
+    "--mictronics-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory holding Mictronics JSON files (defaults to config path).",
+)
+@_json_option()
+@_db_option()
+def lookup(query, tail_number, offline, mictronics_dir, output_json, db_path):
+    """Resolve an aircraft identity from an ICAO hex or a registration.
+
+    QUERY is either a 6-digit ICAO hex (e.g. 896483) or a registration in
+    any country's format (A6-EUY, ZK019, N512WB). Local sources are
+    consulted first (hex_crossref cache, FAA registry, Mictronics); the
+    online fallback tries hexdb.io then adsbdb and caches what it finds
+    into hex_crossref. A hex inside a known military allocation block is
+    annotated even when no identity source resolves it. Exit code is 1
+    when the query produced no answer at all.
+    """
+    from .hex_crossref import HexdbClient, _load_mictronics_files
+    from .lookup import AdsbdbClient, lookup_aircraft
+
+    if query and tail_number:
+        raise click.UsageError("Provide QUERY or --tail, not both.")
+    query = query or tail_number
+    if not query:
+        raise click.UsageError("Provide a hex or registration to look up.")
+
+    cfg = _load_config(db_path)
+    resolved_mictronics = mictronics_dir or cfg.mictronics_cache_dir
+    mictronics_cache = None
+    if (resolved_mictronics / "aircrafts.json").exists():
+        aircrafts, types, operators, _ = _load_mictronics_files(resolved_mictronics)
+        mictronics_cache = (aircrafts, types, operators)
+
+    hexdb_client: HexdbClient | None = None
+    adsbdb_client: AdsbdbClient | None = None
+    if not offline:
+        hexdb_client = HexdbClient(base_url=cfg.hexdb_base_url, rate_limit_per_min=cfg.hexdb_rate_limit_per_min)
+        adsbdb_client = AdsbdbClient(base_url=cfg.adsbdb_base_url, rate_limit_per_min=cfg.adsbdb_rate_limit_per_min)
+
     try:
-        hex_code = nnumber_to_icao(tail_number)
-    except ValueError as e:
-        raise click.BadParameter(str(e), param_hint="--tail") from e
-    console.print(hex_code)
+        with Database(cfg.db_path) as db:
+            result = lookup_aircraft(
+                db,
+                query,
+                hexdb_client=hexdb_client,
+                adsbdb_client=adsbdb_client,
+                mictronics_cache=mictronics_cache,
+            )
+    finally:
+        for client in (hexdb_client, adsbdb_client):
+            if client is not None:
+                client.close()
+
+    if output_json:
+        click.echo(json.dumps(dataclasses.asdict(result), indent=2))
+        if not result.resolved:
+            sys.exit(1)
+        return
+
+    if result.hex_code is None:
+        console.print(f"[yellow]Could not resolve {result.query!r} to an ICAO hex.[/]")
+        for note in result.notes:
+            console.print(f"  [dim]{note}[/]")
+        sys.exit(1)
+
+    if result.record is not None:
+        _print_hex_crossref_row(result.record)
+        if result.country:
+            console.print(f"  Country:         {result.country}")
+    else:
+        if result.kind == "registration":
+            console.print(f"  ICAO hex:        [bold]{result.hex_code}[/]")
+        console.print(f"[yellow]No identity record found for hex {result.hex_code}.[/]")
+    if result.derived_registration:
+        console.print(f"  Derived tail:    {result.derived_registration} [dim](algorithmic N-number, unverified)[/]")
+    if result.mil_range:
+        mil = result.mil_range
+        console.print(f"\n[bold red]Military allocation:[/] {mil['country']} {mil['branch']}")
+        console.print(f"  Range:  {mil['range_start']}-{mil['range_end']}")
+        if mil["notes"]:
+            console.print(f"  Notes:  {mil['notes']}")
+    if result.conflicts:
+        console.print("\n[bold yellow]Source conflicts:[/]")
+        for note in result.conflicts:
+            console.print(f"  - {note}")
+    if not result.resolved:
+        sys.exit(1)
 
 
 @cli.command()

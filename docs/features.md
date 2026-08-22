@@ -145,6 +145,8 @@ Matched timestamps are anchored to the flight's calendar day (+/-1 day) via clos
 
 Every hex is also checked against `mil_hex_ranges` independently of the civilian identity sources: a hex can carry a Mictronics registration AND be flagged `is_military=1` with country / branch attribution, which surfaces government-operated aircraft sitting in known military allocation blocks (e.g. Bell 407s in the US DoD AE-prefix range).
 
+`lookup <hex|registration>` runs the same merge for a single ad-hoc query - any country's registration format, not just FAA N-numbers - and adds a final adsbdb fallback for foreign airframes hexdb.io misses, caching whatever it finds into `hex_crossref`. An unresolvable hex inside a military allocation block still gets the range annotation (country, branch, notes) as its answer.
+
 ## Navaid alignment
 
 **Column:** `navaid_track` (JSON string or NULL).

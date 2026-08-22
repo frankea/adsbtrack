@@ -257,6 +257,21 @@ Exit code is `3` when any alert fired, `0` otherwise, so a cron entry only needs
 
 `--webhook <url>` POSTs the run's alerts as JSON to that URL, but only when at least one fired. `--dormancy-days N` overrides the reactivation threshold for one run. `--json` prints a single machine-readable document (`generated_at`, `alerts`, per-hex `hexes` status) instead of the status lines and table; anything the run would otherwise print to the terminal goes to stderr instead, so stdout stays valid JSON.
 
+## Exporting a deliverable bundle
+
+```
+uv run python -m adsbtrack.cli export --hex a54c0c --window 2026-04-18:2026-04-24 --analysis --zip
+```
+
+Writes the package previously assembled by hand for third parties (journalists, researchers) into one directory (default `exports/<hex>/`, override with `--out`):
+
+- `<hex>.sqlite` - SQLite extract with the `flights`, `trace_days`, and `fetch_log` tables scoped to the aircraft; `trace_days.trace_json` is decompressed to plain JSON text so any SQLite browser can read it.
+- `flights.csv` - every extracted flight, all columns of the `flights` table.
+- `flights_<window>.csv` / `trace_<window>.csv` per `--window START:END` (repeatable; dates or datetimes, e.g. `2026-04-21T14:00:2026-04-22`) - the window's flights (overlap semantics) and its raw trace points from every source merged chronologically at native resolution (time, source, lat/lon, altitude, ground flag, ground speed, callsign, squawk).
+- `README.md` describing every file, plus `analysis.md` (with `--analysis`) - an analyst-notes stub carrying the aircraft's registry/crossref/FAA identity.
+
+The command is read-only over the working database. `--zip` also writes `<out-dir>.zip` next to the bundle directory, ready to hand off.
+
 ## Interactive surfaces
 
 ### Terminal UI

@@ -226,8 +226,19 @@ Traces from multiple sources are automatically merged during extraction. `--sour
 | [airplanes.live](https://globe.airplanes.live/) | `--source airplaneslive` | |
 | [adsb.lol](https://adsb.lol/) | `--source adsblol` | |
 | [TheAirTraffic](https://globe.theairtraffic.com/) | `--source theairtraffic` | |
-| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
+| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | OAuth2 API client credentials (see below) |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
+
+### OpenSky credentials
+
+OpenSky retired HTTP Basic auth; the current flow is OAuth2 client-credentials. Create an API client on your [opensky-network.org](https://opensky-network.org/) account page (these are API client credentials, not your website login), then either export them or add them to `credentials.json`:
+
+```
+export OPENSKY_CLIENT_ID=...       # or put "clientId" / "clientSecret" in credentials.json
+export OPENSKY_CLIENT_SECRET=...
+```
+
+The fetcher exchanges these for a Bearer token (~30 minute lifetime, refreshed automatically) and paces requests at `Config.opensky_rate_limit` since the authenticated REST quota is credit-based. `--source all` includes OpenSky automatically whenever credentials exist. OpenSky's REST API is not a readsb archive: flight metadata is available for any date, but detailed track waypoints only for roughly the last 30 days - older days are logged as checked with no trace stored. Synthesized OpenSky traces carry no ground speed, so flights extracted purely from OpenSky data land with lower confidence than readsb-source days.
 
 ## Watching a hex list
 

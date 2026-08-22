@@ -99,6 +99,12 @@ uv run python -m adsbtrack.bench \
   --source ${SRC} --concurrency 4 --rate 0.5 --db bench-sigint.db
 ```
 
+## OpenSky fetcher
+
+`fetch_traces_opensky` is deliberately serial (the async machinery above is for readsb archives; OpenSky's quota is credit-based, so concurrency buys nothing). Auth is OAuth2 client-credentials against OpenSky's Keycloak token endpoint (`Config.opensky_token_url`): `_OpenSkyAuth` posts the clientId/clientSecret, caches the Bearer token (~30 min lifetime observed), refreshes it `Config.opensky_token_refresh_margin_secs` before expiry, and retries once on 401 in case the token was revoked early. Credentials come from `OPENSKY_CLIENT_ID`/`OPENSKY_CLIENT_SECRET` env vars or `credentials.json` (`clientId`/`clientSecret`); `opensky_credentials_available` is the single source of truth the CLI uses to decide whether `--source all` includes OpenSky.
+
+The REST API is not a per-day trace archive, so day coverage is synthesized: `/flights/aircraft` is queried in UTC-midnight-aligned 2-day windows (the API 400s on any span touching more than 2 day partitions), and each returned flight's `/tracks/all` waypoints (available only ~30 days back) are converted to a readsb-compatible trace inserted under the flight's `firstSeen` date. Tracks carry no ground speed, so purely-OpenSky flights extract with lower confidence. Failure handling: a 403 (insufficient historical access) and a 429 that persists after one waited retry (daily credits exhausted) both log the remaining days with their status and stop the run instead of raising - both statuses are retryable in `fetch_log` terms, so those days stay eligible for the next run, and under `--source all` the other sources' threads are unaffected.
+
 ## Trace merging
 
 When multiple data sources are fetched for the same aircraft, traces are merged by absolute timestamp and deduplicated (points within 1 second and 0.001 degrees of each other are collapsed). Different receiver networks catch different points for the same flight, so combining them improves coverage.

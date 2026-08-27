@@ -107,6 +107,18 @@ uv run python -m adsbtrack.cli inspect --hex a66ad3 --date 2026-03-27
 
 Deep-dive on one aircraft-day: splits each source's raw trace into fragments on inter-point gaps (`--gap-secs`, default 300), and reports per-fragment point count, position, altitude/speed range, DO-260B v2/sil0/nic0 integrity counts, and the callsigns/squawks seen. Also prints the squawk and callsign change-point timeline across every source merged into one chronological stream. Pass `--airport <ident>` to add a closest-approach line (distance, time, altitude) against a known airport. `--source` limits to one source; `--json` emits a single JSON document instead of the tables.
 
+### Destination weather (METAR)
+
+```
+uv run python -m adsbtrack.cli wx OMAA --hours 6
+uv run python -m adsbtrack.cli wx KTYS --date 2026-08-10T12:00Z --hours 3
+uv run python -m adsbtrack.cli trips --hex a66ad3 --fetch-wx --verbose
+```
+
+`wx` is a live passthrough to the free [aviationweather.gov data API](https://aviationweather.gov/data/api/): METAR/SPECI history for one or more stations, `--hours` back from now (or from `--date`). Every observation is also stored in the `metars` table, deduped by station + observation time. `trips --fetch-wx` does the same per flight - a `metar_window_hours` (default 3 h) window centered on each takeoff and landing, for the matched origin/destination airports - and `trips --verbose` renders whatever the table holds near each flight's endpoints. The TUI flight detail (Enter on a flight row) shows the same data.
+
+The API serves roughly 30 days of history, so the `metars` table is the permanent archive: capture the weather while the window is open (a cron'd `wx` for airports you care about composes well with `watch`) and diversion/go-around forensics keep their destination weather forever. Flights older than the window are skipped with a warning, not errors.
+
 ### Re-extract flights
 
 ```

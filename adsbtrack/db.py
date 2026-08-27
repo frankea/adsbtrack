@@ -392,6 +392,31 @@ CREATE TABLE IF NOT EXISTS spoofed_broadcasts (
     UNIQUE(icao, takeoff_time)
 );
 
+-- METAR/SPECI observation history (issue #26). Fed by `adsbtrack wx` and
+-- `trips --fetch-wx` from the aviationweather.gov data API, read by
+-- `trips --verbose` and the TUI flight detail. Keyed by station +
+-- observation time so repeated fetches over overlapping windows dedupe.
+-- The API only serves ~30 days back, so this table is the permanent
+-- archive of whatever was captured while the window was open. raw_text
+-- is the forensic authority - the parsed columns exist for SQL filtering.
+-- (No semicolons in this comment: _SCHEMA_STATEMENTS splits on them.)
+CREATE TABLE IF NOT EXISTS metars (
+    station TEXT NOT NULL,
+    obs_time TEXT NOT NULL,
+    metar_type TEXT,
+    raw_text TEXT NOT NULL,
+    temp_c REAL,
+    dewpoint_c REAL,
+    wind_dir_deg INTEGER,
+    wind_speed_kt INTEGER,
+    wind_gust_kt INTEGER,
+    visibility_mi REAL,
+    altim_hpa REAL,
+    flight_category TEXT,
+    fetched_at TEXT NOT NULL,
+    PRIMARY KEY (station, obs_time)
+);
+
 CREATE INDEX IF NOT EXISTS idx_airports_lat ON airports(latitude_deg);
 CREATE INDEX IF NOT EXISTS idx_airports_lon ON airports(longitude_deg);
 CREATE INDEX IF NOT EXISTS idx_runways_airport_ident ON runways(airport_ident);
@@ -469,7 +494,13 @@ _SCHEMA_STATEMENTS = [stmt.strip() for stmt in SCHEMA.split(";") if stmt.strip()
 # v2: added trace_days.v2_samples / v2_sil0 / v2_nic0 / v2_callsigns
 # (Task 12 materialized integrity stats; see _migrate_add_trace_day_stat_columns).
 # v3: added flights.extractor_version (Task 13; see _migrate_add_flight_columns).
-SCHEMA_VERSION = 3
+# v4: added the metars table (issue #26). A brand-new table needs no ALTER
+# migration function -- its CREATE TABLE IF NOT EXISTS in _SCHEMA_STATEMENTS
+# runs on every open, version match or not -- but the bump still matters:
+# an existing DB stamped 3 would otherwise never re-enter the migration
+# branch, and any future ALTER against metars would assume this version
+# boundary already passed.
+SCHEMA_VERSION = 4
 
 
 def _needs_source_migration(conn: sqlite3.Connection) -> bool:
@@ -2130,6 +2161,57 @@ class Database:
                WHERE icao = ? AND takeoff_time = ?""",
             (out, off, on, in_, icao, takeoff_time_iso),
         )
+
+    # -- METAR history (issue #26) --
+
+    def upsert_metars(self, rows: Iterable[dict]) -> int:
+        """Insert or replace metars rows keyed by (station, obs_time).
+
+        ``rows`` are dicts shaped like adsbtrack.metar.Metar (its
+        dataclasses.asdict form) -- accepted as plain dicts, mirroring
+        insert_mil_hex_range, so this module never imports metar.py.
+        Returns the number of rows written; re-writing an already-stored
+        observation is harmless (METAR history is immutable, so a replace
+        is byte-identical apart from fetched_at).
+        """
+        fetched_at = datetime.now(UTC).isoformat()
+        count = 0
+        for row in rows:
+            self.conn.execute(
+                """INSERT OR REPLACE INTO metars
+                   (station, obs_time, metar_type, raw_text, temp_c, dewpoint_c,
+                    wind_dir_deg, wind_speed_kt, wind_gust_kt, visibility_mi,
+                    altim_hpa, flight_category, fetched_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    row["station"].upper(),
+                    row["obs_time"],
+                    row.get("metar_type"),
+                    row["raw_text"],
+                    row.get("temp_c"),
+                    row.get("dewpoint_c"),
+                    row.get("wind_dir_deg"),
+                    row.get("wind_speed_kt"),
+                    row.get("wind_gust_kt"),
+                    row.get("visibility_mi"),
+                    row.get("altim_hpa"),
+                    row.get("flight_category"),
+                    fetched_at,
+                ),
+            )
+            count += 1
+        return count
+
+    def get_metars(self, station: str, start_iso: str, end_iso: str) -> list[sqlite3.Row]:
+        """Stored observations for one station inside [start_iso, end_iso],
+        oldest first. Bounds must use the same ISO form obs_time is stored
+        in (datetime.isoformat(), +00:00 suffix) so the lexicographic
+        BETWEEN is a real time comparison; adsbtrack.metar.stored_metars_near
+        is the canonical caller and formats them that way."""
+        return self.conn.execute(
+            "SELECT * FROM metars WHERE station = ? AND obs_time BETWEEN ? AND ? ORDER BY obs_time",
+            (station.upper(), start_iso, end_iso),
+        ).fetchall()
 
     # -- Hex cross-reference (hex_crossref / mil_hex_ranges) --
 

@@ -128,6 +128,19 @@ The bimodal tiers win if either fires; a flight below `config.spoof_min_v2_sampl
 
 Day-level pooling (`pool_spoof_scores`) still exists, but only backs the events-layer detector above -- it is no longer consulted by the reject-in-extract gate.
 
+## Integrity/jamming surface columns
+
+GPS jamming/spoofing corridor cases keep recurring (Levant, Gulf/Iran), and the reject-in-extract gate above deliberately keeps real flights that merely transited a jammed corridor. Issue #30 surfaces the gate's already-computed per-flight stats as first-class `flights` columns so those kept-but-degraded flights are queryable without decoding raw traces:
+
+* `v2_sample_count` -- the flight's DO-260B version-2 sample count (`FlightMetrics.v2_samples`).
+* `integrity_degraded_pct` -- share of those samples reporting `sil=0`, the exact number `parser._flight_is_spoofed` computes for its tiers. NULL when the flight carried no v2 samples.
+* `max_implied_speed_kt` -- the issue #22 teleport detector: peak consecutive-fix great-circle distance / elapsed time, sub-10s spacing skipped as jitter-dominated.
+* `integrity_flagged` -- 1 when `integrity_degraded_pct >= Config.integrity_flag_degraded_pct` (default 5%) with at least `Config.spoof_min_v2_samples` (25) v2 samples, or when `max_implied_speed_kt > Config.integrity_flag_teleport_kt` (default 800 kt) AND `integrity_degraded_pct >= Config.integrity_flag_teleport_min_degraded_pct` (default 2%, same v2 floor).
+
+The flag thresholds are deliberately lower than the spoof gate's (5% vs the 10% tier-2 floor / 60% hard tier; 800 kt vs the 900 kt quarantine teleport): the gate quarantines fabrications into `spoofed_broadcasts`, while the flag marks degraded-but-kept flights. The teleport trigger requires corroborating sil0 degradation, mirroring the gate's own corroboration structure: the 2026-08 three-aircraft calibration (per the CLAUDE.md rule) showed a standalone >800 kt trigger flagging 18.5% (152/820) of the clean-corridor US GA baseline (ad3f65) -- historical ADS-B traces carry position-decode garbage with implied jumps up to ~468,000 kt on flights whose integrity fields are pristine, and those spikes are decode noise, not GPS interference. With corroboration required, the calibration spread is: ad3f65 (clean corridor) 0/820 flagged, degraded pct 0.0 throughout (one 5.00% outlier sat below the 25-sample floor); A6-EUY 896483 (Gulf/Levant corridor) 1/14 kept legs flagged (2026-05-21, 4.08% sil0 + 3,118 kt implied jump) on top of 2 quarantined jammed legs; ZK019 43c556 0/9 (no v2 data at all, so the metric is correctly silent rather than spuriously firing on its 100%-MLAT position jitter). A transparency-spectrum panel run at the same thresholds (open-operator PC-12 N512WB a66ad3 1/695 flagged, manufacturer-demo N999YY adf64f 1/723, trust-anonymized N9527C ad3f65 0/820) stayed flat at 0-0.14% while the corridor-exposed A6-EUY sat at 1/14 kept + 2 quarantined: the contrast tracks route exposure, not operator opacity, which is the expected ground truth for a GNSS-integrity flag.
+
+All four columns are populated by `_copy_metrics_to_flight` at extract time and are NULL on rows written before the columns shipped -- run `extract --reprocess` to backfill. The TUI flights view and the GUI flight table render an `INTEG` pill for flagged flights, and the TUI/GUI spoof views surface `max_implied_speed_kt` and the firing trigger as proper columns.
+
 ## ACARS OOOI on flights
 
 When `acars --hex <icao> --start <date>` runs, the fetcher pulls ACARS / VDL2 / HFDL messages for the aircraft from airframes.io and the OOOI parser scans each message against the flight timeline. Supported formats:

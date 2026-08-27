@@ -32,7 +32,9 @@ from .takeoff_runway import TakeoffRunwayResult, detect_takeoff_runway
 # algorithmic effect, a new derived field -- so rows can be told apart by
 # which revision produced them. Legacy rows written before this column
 # existed stay NULL.
-EXTRACTOR_VERSION = 1
+# v2: integrity/jamming surface columns (issue #30) -- v2_sample_count,
+# integrity_degraded_pct, max_implied_speed_kt, integrity_flagged.
+EXTRACTOR_VERSION = 2
 
 
 def _detail_callsign(detail: dict | None) -> str | None:
@@ -1235,7 +1237,7 @@ def _match_airports(
                 flight.nearest_destination_distance_km = dest.distance_km
 
 
-def _copy_metrics_to_flight(flight: Flight, metrics: FlightMetrics) -> None:
+def _copy_metrics_to_flight(flight: Flight, metrics: FlightMetrics, config: Config) -> None:
     """Copy the accumulator's counters onto the Flight row."""
     flight.data_points = metrics.data_points
     flight.sources = ",".join(sorted(metrics.sources)) if metrics.sources else None
@@ -1263,6 +1265,30 @@ def _copy_metrics_to_flight(flight: Flight, metrics: FlightMetrics) -> None:
         flight.adsb_pct = 0.0
         flight.other_pct = 0.0
         flight.adsc_pct = 0.0
+
+    # Integrity/jamming surface columns (issue #30): the same FlightMetrics
+    # counters the spoof gate reads (_flight_is_spoofed), persisted on the
+    # flights that survive it. The gate quarantines outright fabrications;
+    # the lower Config integrity_flag_* thresholds mark kept-but-degraded
+    # flights -- real traffic that transited a GPS-jamming corridor.
+    v2 = metrics.v2_samples
+    flight.v2_sample_count = v2
+    degraded_pct = 100.0 * metrics.v2_sil0 / v2 if v2 > 0 else None
+    flight.integrity_degraded_pct = round(degraded_pct, 2) if degraded_pct is not None else None
+    teleport = metrics.max_implied_speed_kt
+    flight.max_implied_speed_kt = round(teleport, 1) if teleport is not None else None
+    has_v2_signal = degraded_pct is not None and v2 >= config.spoof_min_v2_samples
+    degraded = has_v2_signal and degraded_pct >= config.integrity_flag_degraded_pct
+    # The teleport trigger requires corroborating degradation (see the
+    # Config comment): standalone implied-speed spikes are dominated by
+    # position-decode garbage in historical traces, not GPS interference.
+    teleported = (
+        teleport is not None
+        and teleport > config.integrity_flag_teleport_kt
+        and has_v2_signal
+        and degraded_pct >= config.integrity_flag_teleport_min_degraded_pct
+    )
+    flight.integrity_flagged = 1 if (degraded or teleported) else 0
 
 
 def _apply_type_caps(flight: Flight, ctx: _EnrichContext) -> None:
@@ -1493,7 +1519,7 @@ def _enrich_flight(flight: Flight, metrics: FlightMetrics, ctx: _EnrichContext) 
     flight.takeoff_confidence = takeoff_conf
     flight.landing_confidence = landing_conf
 
-    _copy_metrics_to_flight(flight, metrics)
+    _copy_metrics_to_flight(flight, metrics, config)
 
     features.derive_all(
         flight,

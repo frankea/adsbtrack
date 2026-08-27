@@ -425,6 +425,35 @@ class Config:
     spoof_flight_sil0_hard_pct: float = 60.0
     spoof_teleport_speed_kt: float = 900.0
 
+    # Integrity/jamming surface columns (issue #30). The spoof gate above
+    # quarantines outright fabrications; these lower "degraded" thresholds
+    # mark the flights the gate deliberately keeps: real traffic that
+    # transited a GPS-jamming corridor with elevated integrity stats.
+    # flights.integrity_flagged = 1 when integrity_degraded_pct (the
+    # flight's own v2 sil=0 share, the same number the gate computes) is
+    # >= integrity_flag_degraded_pct with >= spoof_min_v2_samples v2
+    # samples, OR when max_implied_speed_kt > integrity_flag_teleport_kt
+    # AND integrity_degraded_pct >= integrity_flag_teleport_min_degraded_pct
+    # (same v2 floor). The teleport trigger deliberately requires that
+    # corroborating degradation, mirroring the quarantine gate's structure:
+    # 2026-08 calibration showed a standalone >800 kt trigger flagging
+    # 18.5% of a clean-corridor GA baseline (ad3f65) -- historical ADS-B
+    # traces carry position-decode garbage with implied jumps up to
+    # ~468,000 kt on flights whose integrity fields are pristine. An
+    # implied-speed teleport is only evidence of GPS interference when the
+    # flight's own integrity stats are also degraded.
+    # 5% sits above the transparent-operator noise ceiling (0-1.4% sil0 on
+    # the Hormuz airframes' legitimate 2025-12 legs) and below the 10%
+    # spoof-gate floor. 800 kt is above any ground speed sustainable in
+    # this DB's scope (record jet-stream GS is ~800 kt) but below the
+    # 900 kt quarantine threshold, so a jammed leg's teleport can flag
+    # without being rejected; 2% is half the flag floor -- enough sil0 to
+    # rule out pure decode noise (A6-EUY's kept 2026-05-21 corridor leg:
+    # 4.08% sil0 + 3,118 kt implied jump).
+    integrity_flag_degraded_pct: float = 5.0
+    integrity_flag_teleport_kt: float = 800.0
+    integrity_flag_teleport_min_degraded_pct: float = 2.0
+
     # watch: minimum days of silence before a reappearance counts as a
     # "reactivation" alert. Grounded/sanctioned airframes waking up is the
     # signal this exists for; routine overnight gaps must not fire it.

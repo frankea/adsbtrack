@@ -23,6 +23,7 @@ from ..widgets import (
     ACCENT_MAGENTA,
     ACCENT_OK,
     ACCENT_RED,
+    ACCENT_VIOLET,
     DOT,
     FG_0,
     FG_1,
@@ -104,6 +105,14 @@ def _fmt_flags(row: FlightRow) -> Text:
         parts.append(pill_markup("GA", ACCENT_AMBER))
     if row.max_hover_secs and row.max_hover_secs >= 300:
         parts.append(pill_markup("HOVER", ACCENT_AMBER))
+    if row.integrity_flagged:
+        # Kept-but-degraded integrity (issue #30): the flight survived the
+        # spoof gate but its own v2 sil=0 share or implied-speed peak
+        # crossed the Config integrity_flag_* thresholds.
+        label = "INTEG"
+        if row.integrity_degraded_pct is not None:
+            label = f"INTEG {row.integrity_degraded_pct:.0f}%"
+        parts.append(pill_markup(label, ACCENT_VIOLET))
     if row.landing_type == "signal_lost":
         parts.append(pill_markup("LOST", FG_2))
     return Text.from_markup(" ".join(parts)) if parts else dash()

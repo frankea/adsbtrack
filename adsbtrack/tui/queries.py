@@ -255,6 +255,12 @@ class FlightRow:
     # bare dash for flights the extractor still resolved to a nearby field.
     nearest_origin_icao: str | None
     probable_destination_icao: str | None
+    # Integrity/jamming surface (issue #30): the flight's own DO-260B v2
+    # integrity stats. All None on rows extracted before the columns shipped.
+    v2_sample_count: int | None
+    integrity_degraded_pct: float | None
+    max_implied_speed_kt: float | None
+    integrity_flagged: int | None
     # Landing timestamp (ISO, +00:00 suffix) for the flight-detail modal's
     # destination METAR window (issue #26). Defaulted (and therefore last)
     # so pre-existing keyword construction sites keep working.
@@ -274,7 +280,9 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
                mission_type, max_altitude, cruise_gs_kt,
                landing_type, landing_confidence,
                emergency_squawk, had_go_around, max_hover_secs,
-               nearest_origin_icao, probable_destination_icao
+               nearest_origin_icao, probable_destination_icao,
+               v2_sample_count, integrity_degraded_pct,
+               max_implied_speed_kt, integrity_flagged
           FROM flights
          WHERE icao = ?
          ORDER BY takeoff_time DESC
@@ -299,6 +307,10 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
             max_hover_secs=r["max_hover_secs"],
             nearest_origin_icao=r["nearest_origin_icao"],
             probable_destination_icao=r["probable_destination_icao"],
+            v2_sample_count=r["v2_sample_count"],
+            integrity_degraded_pct=r["integrity_degraded_pct"],
+            max_implied_speed_kt=r["max_implied_speed_kt"],
+            integrity_flagged=r["integrity_flagged"],
         )
         for r in db.conn.execute(sql, (icao, limit)).fetchall()
     ]

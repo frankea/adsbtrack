@@ -267,6 +267,25 @@ class Flight:
     # before this column existed.
     extractor_version: int | None = None
 
+    # --- v5: integrity/jamming surface (issue #30) ---
+    # Flight-scoped DO-260B v2 integrity stats, surfaced from the same
+    # FlightMetrics counters the spoof gate reads (parser._flight_is_spoofed)
+    # so the columns and the gate can never disagree. All four are NULL on
+    # rows extracted before this shipped (re-extract to populate).
+    # v2_sample_count: points carrying version == 2 aircraft state.
+    # integrity_degraded_pct: 100 * v2 sil=0 count / v2_sample_count -- the
+    # gate's own tier metric. NULL when v2_sample_count == 0.
+    # max_implied_speed_kt: peak inter-fix implied ground speed (teleport
+    # detector: consecutive-fix great-circle distance / dt, dt >= 10 s).
+    # integrity_flagged: 1 when either Config integrity_flag_* threshold is
+    # crossed (the degraded-pct trigger also needs >= spoof_min_v2_samples);
+    # 0 otherwise. Marks kept-but-degraded flights; quarantined flights
+    # never reach this table at all.
+    v2_sample_count: int | None = None
+    integrity_degraded_pct: float | None = None
+    max_implied_speed_kt: float | None = None
+    integrity_flagged: int | None = None
+
 
 @dataclass
 class AirportMatch:

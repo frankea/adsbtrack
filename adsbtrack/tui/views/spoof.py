@@ -81,6 +81,11 @@ class SpoofView(Vertical):
         self._table.add_column(Text("V2 SMP", justify="right"), width=8)
         self._table.add_column(Text("SIL=0%", justify="right"), width=8)
         self._table.add_column(Text("NIC=0%", justify="right"), width=8)
+        # Flight-scoped gate fields (issues #22/#30): peak inter-fix implied
+        # speed and which tier fired. Previously visible only in the raw
+        # reason_detail JSON pane; day-scoped legacy rows render dashes.
+        self._table.add_column(Text("IMPL KT", justify="right"), width=9)
+        self._table.add_column("TRIGGER", width=18)
         self._table.add_column("PER-SOURCE")
         # Trailing expand indicator: `+` collapsed, `−` expanded.
         self._table.add_column(Text("", justify="center"), width=3)
@@ -187,6 +192,9 @@ class SpoofView(Vertical):
             nic = detail.get("v2_nic0_pct")
             sil_fmt = f"{sil:.1f}" if isinstance(sil, (int, float)) else "-"
             nic_fmt = f"{nic:.1f}" if isinstance(nic, (int, float)) else "-"
+            impl = detail.get("max_implied_speed_kt")
+            impl_fmt = f"{impl:,.0f}" if isinstance(impl, (int, float)) else "-"
+            trigger = detail.get("trigger")
             per_source = _format_source_rates(detail) or "-"
             is_expanded = self._expanded_key == (row.icao, row.takeoff_time)
             indicator = "−" if is_expanded else "+"
@@ -198,6 +206,8 @@ class SpoofView(Vertical):
                 num_cell(f"{v2:,}" if isinstance(v2, int) else str(v2) if v2 is not None else "-", style=FG_0),
                 num_cell(sil_fmt, style=ACCENT_VIOLET),
                 num_cell(nic_fmt, style=ACCENT_VIOLET),
+                num_cell(impl_fmt, style=FG_0) if impl_fmt != "-" else dash(),
+                cell(str(trigger), style=FG_0) if trigger else dash(),
                 cell(per_source, style=FG_2) if per_source != "-" else dash(),
                 Text(indicator, style=indicator_colour, justify="center"),
             )

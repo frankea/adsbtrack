@@ -247,6 +247,10 @@ def _flight_row_to_json(flight) -> dict[str, Any]:  # type: ignore[no-untyped-de
         "emergency_squawk": flight.emergency_squawk,
         "had_go_around": bool(flight.had_go_around),
         "max_hover_secs": flight.max_hover_secs,
+        "v2_sample_count": flight.v2_sample_count,
+        "integrity_degraded_pct": flight.integrity_degraded_pct,
+        "max_implied_speed_kt": flight.max_implied_speed_kt,
+        "integrity_flagged": bool(flight.integrity_flagged),
     }
 
 
@@ -365,7 +369,8 @@ _INDEX_HTML = """<!doctype html>
         <table class="tbl" id="spoof-table">
           <thead><tr>
             <th>DATE</th><th>ICAO</th><th>CALLSIGN</th><th class="num">V2</th>
-            <th class="num">SIL=0%</th><th class="num">NIC=0%</th><th>REASON</th>
+            <th class="num">SIL=0%</th><th class="num">NIC=0%</th>
+            <th class="num">IMPL KT</th><th>TRIGGER</th><th>REASON</th>
           </tr></thead>
           <tbody></tbody>
         </table>
@@ -789,6 +794,14 @@ function flightFlagsCell(f) {
   if (f.emergency_squawk) children.push(pill('red', `SQK ${f.emergency_squawk}`));
   if (f.had_go_around) children.push(pill('amber', 'GA'));
   if (f.max_hover_secs && f.max_hover_secs >= 300) children.push(pill('amber', 'HOVER'));
+  if (f.integrity_flagged) {
+    // Kept-but-degraded integrity (issue #30): survived the spoof gate but
+    // crossed the lower integrity_flag_* thresholds (jammed-corridor leg).
+    const label = f.integrity_degraded_pct != null
+      ? `INTEG ${Math.round(f.integrity_degraded_pct)}%`
+      : 'INTEG';
+    children.push(pill('violet', label));
+  }
   return el('td', {}, children);
 }
 
@@ -824,6 +837,8 @@ function renderSpoofTable() {
       el('td', { class: 'num', text: fmt(d.v2_samples) }),
       el('td', { class: 'num', text: fmtPct(d.v2_sil0_pct) }),
       el('td', { class: 'num', text: fmtPct(d.v2_nic0_pct) }),
+      el('td', { class: 'num', text: d.max_implied_speed_kt != null ? fmt(Math.round(d.max_implied_speed_kt)) : '-' }),
+      el('td', { text: d.trigger || '-' }),
       el('td', {}, [el('span', { class: 'c-violet', text: r.reason || '-' })]),
     ]);
     tbody.appendChild(tr);

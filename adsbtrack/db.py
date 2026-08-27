@@ -151,6 +151,10 @@ CREATE TABLE IF NOT EXISTS flights (
     primary_squawk TEXT,
     navaid_track TEXT,
     extractor_version INTEGER,
+    v2_sample_count INTEGER,
+    integrity_degraded_pct REAL,
+    max_implied_speed_kt REAL,
+    integrity_flagged INTEGER,
     UNIQUE(icao, takeoff_time)
 );
 
@@ -500,7 +504,13 @@ _SCHEMA_STATEMENTS = [stmt.strip() for stmt in SCHEMA.split(";") if stmt.strip()
 # an existing DB stamped 3 would otherwise never re-enter the migration
 # branch, and any future ALTER against metars would assume this version
 # boundary already passed.
-SCHEMA_VERSION = 4
+# v5: added flights.v2_sample_count / integrity_degraded_pct /
+# max_implied_speed_kt / integrity_flagged (issue #30 integrity surface;
+# see _migrate_add_flight_columns). Renumbered from v4 at merge time: the
+# metars branch landed first with the same number, and both branches'
+# migrations are idempotent, so a DB stamped 4 by either branch re-enters
+# here and converges.
+SCHEMA_VERSION = 5
 
 
 def _needs_source_migration(conn: sqlite3.Connection) -> bool:
@@ -588,7 +598,7 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
     """Add all flight metadata columns. Idempotent - safe to run every
     startup. Every ALTER TABLE ADD COLUMN is wrapped in suppress so the
     "duplicate column name" error is swallowed cheaply. The list below is
-    the full history of column additions through v3."""
+    the full history of column additions through v5."""
     new_columns = [
         # v2 quality scoring
         ("landing_type", "TEXT DEFAULT 'unknown'"),
@@ -694,6 +704,13 @@ def _migrate_add_flight_columns(conn: sqlite3.Connection):
         # this row (Task 13). NULL for rows written before this column
         # existed.
         ("extractor_version", "INTEGER"),
+        # v5: integrity/jamming surface columns (issue #30), persisted from
+        # the same FlightMetrics counters the spoof gate reads. NULL for
+        # rows extracted before this shipped (re-extract to populate).
+        ("v2_sample_count", "INTEGER"),
+        ("integrity_degraded_pct", "REAL"),
+        ("max_implied_speed_kt", "REAL"),
+        ("integrity_flagged", "INTEGER"),
     ]
     for col_name, col_type in new_columns:
         # "column already exists" is expected when re-running the migration.

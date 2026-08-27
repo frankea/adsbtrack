@@ -64,15 +64,26 @@ def _build_sources_body(src: dict[str, Any] | None) -> Text:
     return Text.from_markup("\n".join(lines))
 
 
-def _build_missions_body(missions: list[tuple[str, int]]) -> Text:
+def _build_missions_body(missions: list[tuple[str, int]], *, total_types: int | None = None) -> Text:
+    """Render the MISSION MIX card body.
+
+    ``total_types`` is the number of distinct mission types in the DB
+    (``status_snapshot``'s ``mission_type_count``); when it exceeds the
+    rows shown here, a dim "+N more" line signals the truncation (#31)
+    instead of silently dropping the tail.
+    """
     if not missions:
         return Text.from_markup(f"[{FG_2}](no mission data)[/]")
-    top = max(n for _, n in missions)
+    shown = missions[:6]
+    top = max(n for _, n in shown)
     lines = [f"[{FG_2}]MISSION MIX[/]"]
-    for name, n in missions[:6]:
+    for name, n in shown:
         fill = max(0, min(24, int(round((n / top) * 24)))) if top else 0
         bar = f"[{ACCENT_MAGENTA}]{'█' * fill}[/][{FG_2}]{'░' * (24 - fill)}[/]"
         lines.append(f"[{FG_2}]{(name or '--')[:8].upper():<8}[/]{bar}  [{FG_1}]{n:>5}[/]")
+    hidden = (total_types if total_types is not None else len(missions)) - len(shown)
+    if hidden > 0:
+        lines.append(f"[{FG_2}]+{hidden} more[/]")
     return Text.from_markup("\n".join(lines))
 
 
@@ -316,7 +327,12 @@ class StatusView(Vertical):
         for card in _build_stat_cards(stats):
             self._grid.mount(card)
         self._grid.mount(Card(_build_sources_body(snap.get("sources")), classes="wide"))
-        self._grid.mount(Card(_build_missions_body(snap.get("missions") or []), classes="wide"))
+        self._grid.mount(
+            Card(
+                _build_missions_body(snap.get("missions") or [], total_types=snap.get("mission_type_count")),
+                classes="wide",
+            )
+        )
         self._grid.mount(Card(_build_indicators_body(snap)))
         self._grid.mount(Card(_build_signal_body(snap)))
         self._grid.mount(Card(_build_registry_body(reg), classes="wide"))

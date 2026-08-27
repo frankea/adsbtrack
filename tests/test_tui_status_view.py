@@ -21,6 +21,7 @@ from adsbtrack.tui.views.status import (  # noqa: E402
     _ACTIVITY_GLYPHS,
     _activity_bar_index,
     _activity_spark_markup,
+    _build_missions_body,
     _build_signal_body,
 )
 from adsbtrack.tui.widgets import ACCENT_AMBER, ACCENT_OK  # noqa: E402
@@ -158,3 +159,34 @@ def test_signal_body_no_fake_sine_derived_pattern():
 
 def test_activity_glyphs_ramp_matches_module_constant_length():
     assert re.fullmatch(r"[▁-█]+", _ACTIVITY_GLYPHS)
+
+
+# ---------------------------------------------------------------------------
+# _build_missions_body: MISSION MIX truncation indicator (#31). The card
+# shows at most six mission rows; when the DB holds more distinct types
+# than that, a dim "+N more" line must flag the truncation.
+# ---------------------------------------------------------------------------
+
+
+def test_missions_body_appends_more_row_when_types_hidden():
+    missions = [(f"mission{i}", 10 - i) for i in range(6)]
+    body = _build_missions_body(missions, total_types=8).plain
+    assert body.rstrip().endswith("+2 more")
+
+
+def test_missions_body_no_more_row_when_all_types_shown():
+    missions = [("training", 4), ("transport", 2)]
+    body = _build_missions_body(missions, total_types=2).plain
+    assert "more" not in body
+
+
+def test_missions_body_without_total_types_stays_quiet():
+    """Older snapshot dicts (no mission_type_count key) must not grow a
+    bogus indicator: without the total the card can't know what's hidden."""
+    missions = [(f"mission{i}", 10 - i) for i in range(6)]
+    body = _build_missions_body(missions).plain
+    assert "more" not in body
+
+
+def test_missions_body_empty_still_renders_placeholder():
+    assert "(no mission data)" in _build_missions_body([], total_types=0).plain

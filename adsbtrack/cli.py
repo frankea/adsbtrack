@@ -22,7 +22,8 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database, iter_parsed_trace_days
 from .events import collect_events
-from .fetcher import fetch_traces, fetch_traces_opensky
+from .export import export_bundle, parse_windows
+from .fetcher import fetch_traces, fetch_traces_opensky, opensky_credentials_available
 from .forensics import (
     DEFAULT_FRAGMENT_GAP_SECS,
     callsign_timeline,
@@ -327,18 +328,7 @@ def fetch(
             # sources_to_fetch is computed first, then filtered by source
             # health (below), then per-source start dates.
             sources_to_fetch = list(SOURCE_URLS.keys())
-            opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
-            if not opensky_available:
-                # Check credentials.json fallback
-                creds_path = config.credentials_path
-                if creds_path.exists():
-                    import json
-
-                    try:
-                        creds = json.loads(creds_path.read_text())
-                        opensky_available = bool(creds.get("clientId") and creds.get("clientSecret"))
-                    except Exception:
-                        pass
+            opensky_available = opensky_credentials_available(config)
             if opensky_available:
                 sources_to_fetch.append("opensky")
 
@@ -499,26 +489,33 @@ def fetch(
             ) as shared_progress:
 
                 def _fetch_one(src: str) -> None:
-                    with Database(Path(db_path)) as thread_db:
-                        thread_config = _load_config(db_path)
-                        thread_config.rate_limit = rate
-                        thread_config.fetch_concurrency = concurrency
-                        src_start = per_source_start[src]
-                        if src == "opensky":
-                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
-                        else:
-                            stats = fetch_traces(
-                                thread_db,
-                                thread_config,
-                                hex_code,
-                                src_start,
-                                end,
-                                source=src,
-                                progress=shared_progress,
-                            )
+                    try:
+                        with Database(Path(db_path)) as thread_db:
+                            thread_config = _load_config(db_path)
+                            thread_config.rate_limit = rate
+                            thread_config.fetch_concurrency = concurrency
+                            src_start = per_source_start[src]
+                            if src == "opensky":
+                                stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
+                            else:
+                                stats = fetch_traces(
+                                    thread_db,
+                                    thread_config,
+                                    hex_code,
+                                    src_start,
+                                    end,
+                                    source=src,
+                                    progress=shared_progress,
+                                )
+                            with lock:
+                                per_source_stats[src] = stats
+                                _accumulate(stats)
+                    except RuntimeError as e:
+                        # e.g. an OpenSky token rejection. One broken source
+                        # must not take down the other sources' threads or
+                        # crash the run; report it and let the rest finish.
                         with lock:
-                            per_source_stats[src] = stats
-                            _accumulate(stats)
+                            shared_progress.console.print(f"[red]{src} failed: {e}[/]")
 
                 threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
                 for t in threads:
@@ -538,7 +535,12 @@ def fetch(
             src = sources_to_fetch[0]
             src_start = per_source_start[src]
             if src == "opensky":
-                stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
+                try:
+                    stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
+                except RuntimeError as e:
+                    # Missing credentials / rejected token: a usage problem,
+                    # not a crash - surface it without a traceback.
+                    raise click.ClickException(str(e)) from e
             else:
                 stats = fetch_traces(db, config, hex_code, src_start, end, source=src)
             _accumulate(stats)
@@ -2262,6 +2264,69 @@ def events(hex_code, tail_number, db_path, since_str, severity, output_json):
     console.print(
         f"\n[bold]Summary:[/] [red]{summary['emergency']} emergency[/], [yellow]{summary['unusual']} unusual[/]"
     )
+
+
+# -----------------------------------------------------------------------------
+# export (#25)
+# -----------------------------------------------------------------------------
+
+
+@cli.command("export")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
+@click.option(
+    "--window",
+    "window_specs",
+    multiple=True,
+    help="START:END date or datetime window (repeatable). Adds flights_<window>.csv and trace_<window>.csv.",
+)
+@click.option("--out", "out_dir", default=None, help="Bundle directory (default: <Config.export_dir>/<hex>/)")
+@click.option("--analysis", "include_analysis", is_flag=True, help="Also write an analysis.md identity stub")
+@click.option("--zip", "make_zip", is_flag=True, help="Also write <out-dir>.zip next to the bundle directory")
+@_db_option()
+def export_cmd(hex_code, tail_number, window_specs, out_dir, include_analysis, make_zip, db_path):
+    """Write a per-tail deliverable bundle: SQLite extract, CSVs, README.
+
+    Assembles the package handed to third parties (journalists,
+    researchers): a hex-scoped SQLite extract (flights, trace_days with
+    traces decompressed to plain JSON, fetch_log), flights.csv, per-window
+    flight subsets and fragment-level trace CSVs, a README.md describing
+    every file, and (with --analysis) an identity-stub analysis.md.
+    Read-only over the working database.
+    """
+    try:
+        windows = parse_windows(window_specs)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
+        config = _load_config(db_path)
+        bundle_dir = Path(out_dir) if out_dir else Path(config.export_dir) / hex_code
+        try:
+            result = export_bundle(
+                db,
+                hex_code,
+                bundle_dir,
+                windows,
+                include_analysis=include_analysis,
+                make_zip=make_zip,
+                tool_version=_get_version(),
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    console.print(f"[green]Wrote {len(result.files)} files to {result.out_dir}[/]")
+    console.print(
+        f"  flights: {result.flight_count}  trace days: {result.trace_day_count}  fetch log: {result.fetch_log_count}"
+    )
+    for window in windows:
+        console.print(
+            f"  window {window.spec}: {result.window_flight_counts[window.label]} flights, "
+            f"{result.window_point_counts[window.label]} trace points"
+        )
+    if result.zip_path:
+        console.print(f"  zip: {result.zip_path}")
 
 
 # -----------------------------------------------------------------------------

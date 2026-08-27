@@ -239,8 +239,19 @@ Traces from multiple sources are automatically merged during extraction. `--sour
 | [airplanes.live](https://globe.airplanes.live/) | `--source airplaneslive` | |
 | [adsb.lol](https://adsb.lol/) | `--source adsblol` | |
 | [TheAirTraffic](https://globe.theairtraffic.com/) | `--source theairtraffic` | |
-| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
+| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | OAuth2 API client credentials (see below) |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
+
+### OpenSky credentials
+
+OpenSky retired HTTP Basic auth; the current flow is OAuth2 client-credentials. Create an API client on your [opensky-network.org](https://opensky-network.org/) account page (these are API client credentials, not your website login), then either export them or add them to `credentials.json`:
+
+```
+export OPENSKY_CLIENT_ID=...       # or put "clientId" / "clientSecret" in credentials.json
+export OPENSKY_CLIENT_SECRET=...
+```
+
+The fetcher exchanges these for a Bearer token (~30 minute lifetime, refreshed automatically) and paces requests at `Config.opensky_rate_limit` since the authenticated REST quota is credit-based. `--source all` includes OpenSky automatically whenever credentials exist. OpenSky's REST API is not a readsb archive: flight metadata is available for any date, but detailed track waypoints only for roughly the last 30 days - older days are logged as checked with no trace stored. Synthesized OpenSky traces carry no ground speed, so flights extracted purely from OpenSky data land with lower confidence than readsb-source days.
 
 ## Watching a hex list
 
@@ -269,6 +280,21 @@ Exit code is `3` when any alert fired, `0` otherwise, so a cron entry only needs
 ```
 
 `--webhook <url>` POSTs the run's alerts as JSON to that URL, but only when at least one fired. `--dormancy-days N` overrides the reactivation threshold for one run. `--json` prints a single machine-readable document (`generated_at`, `alerts`, per-hex `hexes` status) instead of the status lines and table; anything the run would otherwise print to the terminal goes to stderr instead, so stdout stays valid JSON.
+
+## Exporting a deliverable bundle
+
+```
+uv run python -m adsbtrack.cli export --hex a54c0c --window 2026-04-18:2026-04-24 --analysis --zip
+```
+
+Writes the package previously assembled by hand for third parties (journalists, researchers) into one directory (default `exports/<hex>/`, override with `--out`):
+
+- `<hex>.sqlite` - SQLite extract with the `flights`, `trace_days`, and `fetch_log` tables scoped to the aircraft; `trace_days.trace_json` is decompressed to plain JSON text so any SQLite browser can read it.
+- `flights.csv` - every extracted flight, all columns of the `flights` table.
+- `flights_<window>.csv` / `trace_<window>.csv` per `--window START:END` (repeatable; dates or datetimes, e.g. `2026-04-21T14:00:2026-04-22`) - the window's flights (overlap semantics) and its raw trace points from every source merged chronologically at native resolution (time, source, lat/lon, altitude, ground flag, ground speed, callsign, squawk).
+- `README.md` describing every file, plus `analysis.md` (with `--analysis`) - an analyst-notes stub carrying the aircraft's registry/crossref/FAA identity.
+
+The command is read-only over the working database. `--zip` also writes `<out-dir>.zip` next to the bundle directory, ready to hand off.
 
 ## Interactive surfaces
 

@@ -307,6 +307,24 @@ class Config:
     # fetch_log.fetched_at at plan time - no separate health table.
     source_health_window: int = 30
     source_health_skip_threshold: int = 20
+    # OpenSky REST source (fetch --source opensky, and part of --source all
+    # whenever credentials are configured). Auth is OAuth2 client-credentials:
+    # POST clientId/clientSecret to opensky_token_url (Keycloak), then send
+    # the returned Bearer token on every API request. Tokens live ~30 min;
+    # a refresh is forced opensky_token_refresh_margin_secs before expiry so
+    # a token never dies between a flights call and its tracks calls.
+    # opensky_rate_limit paces request starts - the authenticated REST quota
+    # is credit-based (~4000 credits/day), so this stays deliberately slower
+    # than the readsb sources. A 429 without a retry-after header waits
+    # opensky_429_default_wait_secs before retrying the window.
+    opensky_api_url: str = "https://opensky-network.org/api"
+    opensky_token_url: str = (
+        "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+    )
+    opensky_rate_limit: float = 1.0
+    opensky_429_default_wait_secs: float = 60.0
+    opensky_token_refresh_margin_secs: float = 60.0
+
     # Observed archive retention per source (days), None = unknown/unlimited.
     # theairtraffic: returned no data for dates ~90 days old that two other
     # networks had dense coverage for (2026-08 observation). Used only to

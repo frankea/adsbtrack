@@ -23,7 +23,7 @@ from .config import SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database, iter_parsed_trace_days
 from .events import collect_events
 from .export import export_bundle, parse_windows
-from .fetcher import fetch_traces, fetch_traces_opensky
+from .fetcher import fetch_traces, fetch_traces_opensky, opensky_credentials_available
 from .forensics import (
     DEFAULT_FRAGMENT_GAP_SECS,
     callsign_timeline,
@@ -328,18 +328,7 @@ def fetch(
             # sources_to_fetch is computed first, then filtered by source
             # health (below), then per-source start dates.
             sources_to_fetch = list(SOURCE_URLS.keys())
-            opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
-            if not opensky_available:
-                # Check credentials.json fallback
-                creds_path = config.credentials_path
-                if creds_path.exists():
-                    import json
-
-                    try:
-                        creds = json.loads(creds_path.read_text())
-                        opensky_available = bool(creds.get("clientId") and creds.get("clientSecret"))
-                    except Exception:
-                        pass
+            opensky_available = opensky_credentials_available(config)
             if opensky_available:
                 sources_to_fetch.append("opensky")
 
@@ -500,26 +489,33 @@ def fetch(
             ) as shared_progress:
 
                 def _fetch_one(src: str) -> None:
-                    with Database(Path(db_path)) as thread_db:
-                        thread_config = _load_config(db_path)
-                        thread_config.rate_limit = rate
-                        thread_config.fetch_concurrency = concurrency
-                        src_start = per_source_start[src]
-                        if src == "opensky":
-                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
-                        else:
-                            stats = fetch_traces(
-                                thread_db,
-                                thread_config,
-                                hex_code,
-                                src_start,
-                                end,
-                                source=src,
-                                progress=shared_progress,
-                            )
+                    try:
+                        with Database(Path(db_path)) as thread_db:
+                            thread_config = _load_config(db_path)
+                            thread_config.rate_limit = rate
+                            thread_config.fetch_concurrency = concurrency
+                            src_start = per_source_start[src]
+                            if src == "opensky":
+                                stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
+                            else:
+                                stats = fetch_traces(
+                                    thread_db,
+                                    thread_config,
+                                    hex_code,
+                                    src_start,
+                                    end,
+                                    source=src,
+                                    progress=shared_progress,
+                                )
+                            with lock:
+                                per_source_stats[src] = stats
+                                _accumulate(stats)
+                    except RuntimeError as e:
+                        # e.g. an OpenSky token rejection. One broken source
+                        # must not take down the other sources' threads or
+                        # crash the run; report it and let the rest finish.
                         with lock:
-                            per_source_stats[src] = stats
-                            _accumulate(stats)
+                            shared_progress.console.print(f"[red]{src} failed: {e}[/]")
 
                 threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
                 for t in threads:
@@ -539,7 +535,12 @@ def fetch(
             src = sources_to_fetch[0]
             src_start = per_source_start[src]
             if src == "opensky":
-                stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
+                try:
+                    stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
+                except RuntimeError as e:
+                    # Missing credentials / rejected token: a usage problem,
+                    # not a crash - surface it without a traceback.
+                    raise click.ClickException(str(e)) from e
             else:
                 stats = fetch_traces(db, config, hex_code, src_start, end, source=src)
             _accumulate(stats)

@@ -22,6 +22,7 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database, iter_parsed_trace_days
 from .events import collect_events
+from .export import export_bundle, parse_windows
 from .fetcher import fetch_traces, fetch_traces_opensky, opensky_credentials_available
 from .forensics import (
     DEFAULT_FRAGMENT_GAP_SECS,
@@ -2107,6 +2108,69 @@ def events(hex_code, tail_number, db_path, since_str, severity, output_json):
     console.print(
         f"\n[bold]Summary:[/] [red]{summary['emergency']} emergency[/], [yellow]{summary['unusual']} unusual[/]"
     )
+
+
+# -----------------------------------------------------------------------------
+# export (#25)
+# -----------------------------------------------------------------------------
+
+
+@cli.command("export")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
+@click.option(
+    "--window",
+    "window_specs",
+    multiple=True,
+    help="START:END date or datetime window (repeatable). Adds flights_<window>.csv and trace_<window>.csv.",
+)
+@click.option("--out", "out_dir", default=None, help="Bundle directory (default: <Config.export_dir>/<hex>/)")
+@click.option("--analysis", "include_analysis", is_flag=True, help="Also write an analysis.md identity stub")
+@click.option("--zip", "make_zip", is_flag=True, help="Also write <out-dir>.zip next to the bundle directory")
+@_db_option()
+def export_cmd(hex_code, tail_number, window_specs, out_dir, include_analysis, make_zip, db_path):
+    """Write a per-tail deliverable bundle: SQLite extract, CSVs, README.
+
+    Assembles the package handed to third parties (journalists,
+    researchers): a hex-scoped SQLite extract (flights, trace_days with
+    traces decompressed to plain JSON, fetch_log), flights.csv, per-window
+    flight subsets and fragment-level trace CSVs, a README.md describing
+    every file, and (with --analysis) an identity-stub analysis.md.
+    Read-only over the working database.
+    """
+    try:
+        windows = parse_windows(window_specs)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
+        config = _load_config(db_path)
+        bundle_dir = Path(out_dir) if out_dir else Path(config.export_dir) / hex_code
+        try:
+            result = export_bundle(
+                db,
+                hex_code,
+                bundle_dir,
+                windows,
+                include_analysis=include_analysis,
+                make_zip=make_zip,
+                tool_version=_get_version(),
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    console.print(f"[green]Wrote {len(result.files)} files to {result.out_dir}[/]")
+    console.print(
+        f"  flights: {result.flight_count}  trace days: {result.trace_day_count}  fetch log: {result.fetch_log_count}"
+    )
+    for window in windows:
+        console.print(
+            f"  window {window.spec}: {result.window_flight_counts[window.label]} flights, "
+            f"{result.window_point_counts[window.label]} trace points"
+        )
+    if result.zip_path:
+        console.print(f"  zip: {result.zip_path}")
 
 
 # -----------------------------------------------------------------------------

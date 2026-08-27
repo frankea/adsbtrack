@@ -416,6 +416,11 @@ class Config:
     # cron-driven watch run.
     watch_webhook_timeout_secs: float = 10.0
 
+    # export: default parent directory for deliverable bundles. `adsbtrack
+    # export --hex X` without --out writes to <export_dir>/<hex>/; --out
+    # names the bundle directory directly and ignores this.
+    export_dir: Path = Path("exports")
+
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km

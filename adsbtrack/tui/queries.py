@@ -22,6 +22,7 @@ from typing import Any
 from ..config import Config
 from ..db import Database, decode_trace_json
 from ..events import bulk_detect_spoof_events, collect_events
+from ..metar import stored_metars_near
 
 # ---------------------------------------------------------------------------
 # Aircraft list
@@ -254,6 +255,10 @@ class FlightRow:
     # bare dash for flights the extractor still resolved to a nearby field.
     nearest_origin_icao: str | None
     probable_destination_icao: str | None
+    # Landing timestamp (ISO, +00:00 suffix) for the flight-detail modal's
+    # destination METAR window (issue #26). Defaulted (and therefore last)
+    # so pre-existing keyword construction sites keep working.
+    landing_time: str | None = None
 
 
 def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRow]:
@@ -263,7 +268,7 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
     renders so the TUI and CLI agree on what a "flight" looks like.
     """
     sql = """
-        SELECT takeoff_time, takeoff_date,
+        SELECT takeoff_time, takeoff_date, landing_time,
                origin_icao, destination_icao,
                duration_minutes, callsign,
                mission_type, max_altitude, cruise_gs_kt,
@@ -279,6 +284,7 @@ def list_flights(db: Database, icao: str, *, limit: int = 2000) -> list[FlightRo
         FlightRow(
             takeoff_time=r["takeoff_time"],
             takeoff_date=r["takeoff_date"],
+            landing_time=r["landing_time"],
             origin_icao=r["origin_icao"],
             destination_icao=r["destination_icao"],
             duration_minutes=r["duration_minutes"],
@@ -331,6 +337,59 @@ def _display_destination(row: FlightRow) -> str | None:
     if row.landing_type == "signal_lost":
         return "sig lost"
     return None
+
+
+# ---------------------------------------------------------------------------
+# Flight-endpoint weather (delegates to metar.stored_metars_near)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MetarRow:
+    station: str
+    obs_time: str
+    metar_type: str | None
+    flight_category: str | None
+    raw_text: str
+
+
+def flight_wx(
+    db: Database,
+    row: FlightRow,
+    *,
+    window_hours: float | None = None,
+    config: Config | None = None,
+) -> dict[str, list[MetarRow]]:
+    """Stored METARs near one flight's endpoints, keyed origin / destination.
+
+    Local metars-table reads only -- the TUI never hits the network. The
+    window matches what `trips --verbose` shows (config.metar_window_hours
+    centered on takeoff / landing) so the two surfaces agree. Endpoints
+    without a matched airport, a timestamp, or any stored observations are
+    simply absent from the result.
+    """
+    if window_hours is None:
+        window_hours = (config or Config()).metar_window_hours
+    out: dict[str, list[MetarRow]] = {}
+    for label, station, event_iso in (
+        ("origin", row.origin_icao, row.takeoff_time),
+        ("destination", row.destination_icao, row.landing_time),
+    ):
+        if not station or not event_iso:
+            continue
+        rows = stored_metars_near(db, station, event_iso, window_hours=window_hours)
+        if rows:
+            out[label] = [
+                MetarRow(
+                    station=r["station"],
+                    obs_time=r["obs_time"],
+                    metar_type=r["metar_type"],
+                    flight_category=r["flight_category"],
+                    raw_text=r["raw_text"],
+                )
+                for r in rows
+            ]
+    return out
 
 
 # ---------------------------------------------------------------------------

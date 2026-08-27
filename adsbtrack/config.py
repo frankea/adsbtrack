@@ -398,6 +398,25 @@ class Config:
     # cron-driven watch run.
     watch_webhook_timeout_secs: float = 10.0
 
+    # METAR history (issue #26). metar_window_hours is the window centered
+    # on a flight's takeoff/landing that `trips --fetch-wx` fetches and
+    # `trips --verbose` / the TUI flight detail display. The API
+    # (aviationweather.gov data API, free, no auth) serves at most
+    # metar_history_max_days back -- older events are skipped client-side
+    # with a warning instead of burning a doomed request. An endpoint whose
+    # window already holds >= metar_min_cached_obs stored observations is
+    # not re-fetched (METAR history is immutable, so the cache never goes
+    # stale). metar_rate_limit_secs is a courtesy pause between successive
+    # requests within one command. wx_default_hours is the `adsbtrack wx`
+    # lookback when --hours is not given.
+    metar_api_url: str = "https://aviationweather.gov/api/data/metar"
+    metar_window_hours: float = 3.0
+    metar_history_max_days: int = 30
+    metar_min_cached_obs: int = 2
+    metar_rate_limit_secs: float = 1.0
+    metar_timeout_secs: float = 30.0
+    wx_default_hours: float = 6.0
+
     # on-field threshold: origin_icao / destination_icao only get
     # populated when the takeoff/landing fix is within this distance of
     # the matched airport. Farther hits (still within the existing 10 km

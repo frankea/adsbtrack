@@ -813,3 +813,84 @@ def test_daily_activity_scoped_to_icao(tmp_path):
         rows = daily_activity(db, "ooo555", days=52, today=today)
     by_date = {r.date: r.flight_count for r in rows}
     assert by_date["2026-06-30"] == 1
+
+
+# ---------------------------------------------------------------------------
+# flight_wx (issue #26)
+# ---------------------------------------------------------------------------
+
+
+def _seed_endpoint_metars(db: Database) -> None:
+    db.upsert_metars(
+        [
+            {
+                "station": "KEWR",
+                "obs_time": "2026-03-01T11:51:00+00:00",
+                "metar_type": "METAR",
+                "raw_text": "METAR KEWR 011151Z 31015KT CAVOK 10/02",
+                "flight_category": "VFR",
+            },
+            {
+                "station": "KBOS",
+                "obs_time": "2026-03-01T13:54:00+00:00",
+                "metar_type": "SPECI",
+                "raw_text": "SPECI KBOS 011354Z 04022G31KT 1SM SN",
+                "flight_category": "IFR",
+            },
+            {
+                "station": "KBOS",
+                "obs_time": "2026-03-01T20:54:00+00:00",  # outside the landing window
+                "metar_type": "METAR",
+                "raw_text": "METAR KBOS 012054Z 00000KT CAVOK",
+            },
+        ]
+    )
+
+
+def test_flight_wx_returns_windowed_metars_per_endpoint(seeded_db):
+    from adsbtrack.tui.queries import flight_wx
+
+    with Database(seeded_db) as db:
+        _seed_endpoint_metars(db)
+        db.commit()
+        row = list_flights(db, "aaa111")[0]
+        assert row.landing_time == "2026-03-01T14:00:00+00:00"
+        wx = flight_wx(db, row, window_hours=3.0)
+    assert set(wx) == {"origin", "destination"}
+    assert [m.station for m in wx["origin"]] == ["KEWR"]
+    assert wx["origin"][0].flight_category == "VFR"
+    assert [m.raw_text for m in wx["destination"]] == ["SPECI KBOS 011354Z 04022G31KT 1SM SN"]
+    assert wx["destination"][0].metar_type == "SPECI"
+
+
+def test_flight_wx_empty_when_no_stored_metars(seeded_db):
+    from adsbtrack.tui.queries import flight_wx
+
+    with Database(seeded_db) as db:
+        row = list_flights(db, "aaa111")[0]
+        assert flight_wx(db, row, window_hours=3.0) == {}
+
+
+def test_flight_wx_skips_unmatched_endpoints(tmp_path):
+    from adsbtrack.tui.queries import flight_wx
+
+    db_path = tmp_path / "wx_endpoints.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="cc33dd",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+                origin_icao=None,  # off-airport departure
+                destination_icao="KBOS",
+                landing_time=datetime(2026, 3, 1, 14, 0, tzinfo=UTC),
+                landing_type="confirmed",
+            )
+        )
+        _seed_endpoint_metars(db)
+        db.commit()
+        row = list_flights(db, "cc33dd")[0]
+        wx = flight_wx(db, row, window_hours=3.0)
+    assert set(wx) == {"destination"}

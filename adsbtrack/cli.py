@@ -31,6 +31,7 @@ from .forensics import (
     summarize_fragments,
 )
 from .gaps import detect_gaps
+from .metar import MetarError, fetch_flight_endpoint_metars, fetch_metars, stored_metars_near
 from .models import LandingType
 from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
@@ -718,13 +719,72 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     default=False,
     help="Show the primary squawk code held by each flight.",
 )
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help=(
+        "Show stored METAR/SPECI history around each flight's endpoints "
+        "(reads the local metars table only; populate it with --fetch-wx or the wx command)."
+    ),
+)
+@click.option(
+    "--fetch-wx",
+    "fetch_wx",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fetch missing endpoint METARs from aviationweather.gov into the metars table before "
+        "rendering (network; the API serves ~30 days of history, older flights are skipped)."
+    ),
+)
 @_json_option()
 @_db_option()
-def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, show_squawk, output_json, db_path):
+def trips(
+    hex_code,
+    tail_number,
+    from_date,
+    to_date,
+    airport,
+    show_alignment,
+    show_squawk,
+    verbose,
+    fetch_wx,
+    output_json,
+    db_path,
+):
     """Show flight history."""
+    config = _load_config(db_path)
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         flights = db.get_flights(hex_code, from_date, to_date, airport)
+
+        if fetch_wx:
+            wx_stored = 0
+            for f in flights:
+                stored, warnings = fetch_flight_endpoint_metars(db, config, f)
+                wx_stored += stored
+                for warning in warnings:
+                    click.echo(f"wx: {warning}", err=True)
+            db.commit()
+            click.echo(f"wx: stored {wx_stored} observations", err=True)
+
+        def _flight_wx(f):
+            """Stored METARs near this flight's endpoints, keyed origin /
+            destination. Shared by the --json and table --verbose paths so
+            the two never diverge. Local-table reads only -- no network."""
+            wx = {}
+            for label, station, event_iso in (
+                ("origin", f["origin_icao"], f["takeoff_time"]),
+                ("destination", f["destination_icao"], f["landing_time"]),
+            ):
+                if not station or not event_iso:
+                    continue
+                rows = stored_metars_near(db, station, event_iso, window_hours=config.metar_window_hours)
+                if rows:
+                    wx[label] = rows
+            return wx
 
         if not flights:
             if output_json:
@@ -805,6 +865,20 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                     row["aligned_seconds"] = _col(f, "aligned_seconds")
                 if show_squawk_col:
                     row["primary_squawk"] = _col(f, "primary_squawk")
+                if verbose:
+                    row["wx"] = {
+                        label: [
+                            {
+                                "station": m["station"],
+                                "obs_time": m["obs_time"],
+                                "metar_type": m["metar_type"],
+                                "flight_category": m["flight_category"],
+                                "raw_text": m["raw_text"],
+                            }
+                            for m in metars
+                        ]
+                        for label, metars in _flight_wx(f).items()
+                    }
                 rows.append(row)
             click.echo(json.dumps(rows, indent=2))
             return
@@ -929,6 +1003,101 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
 
         console.print(table)
         console.print(f"\nTotal: {len(flights)} flights")
+
+        if verbose:
+            half = config.metar_window_hours / 2
+            printed_header = False
+            for f in flights:
+                wx = _flight_wx(f)
+                if not wx:
+                    continue
+                if not printed_header:
+                    console.print(f"\n[bold]Weather[/] (stored METARs within {half:g}h of each endpoint)")
+                    printed_header = True
+                date_str = f["takeoff_time"][:10] if f["takeoff_time"] else "?"
+                console.print(f"\n[cyan]{date_str}[/] {f['origin_icao'] or '?'} -> {f['destination_icao'] or '?'}")
+                for label in ("origin", "destination"):
+                    metars = wx.get(label)
+                    if not metars:
+                        continue
+                    console.print(f"  [dim]{label} {metars[0]['station']}[/]")
+                    for m in metars:
+                        console.print(f"    [dim]{m['obs_time'][11:16]}Z[/] {escape(m['raw_text'])}")
+            if not printed_header:
+                console.print(
+                    "\n[yellow]No stored METARs near these flights - populate with "
+                    "`trips --fetch-wx` or `adsbtrack wx <station>`[/]"
+                )
+
+
+@cli.command()
+@click.argument("stations", nargs=-1, required=True)
+@click.option(
+    "--hours",
+    type=float,
+    default=None,
+    help="Lookback hours (default: wx_default_hours from config, 6).",
+)
+@click.option(
+    "--date",
+    "date_str",
+    default=None,
+    help=(
+        "Anchor time (ISO 8601 UTC, e.g. 2026-08-10T12:00Z); history is fetched looking back "
+        "--hours from it. Defaults to now. The API serves ~30 days of history."
+    ),
+)
+@_json_option()
+@_db_option()
+def wx(stations, hours, date_str, output_json, db_path):
+    """Fetch METAR/SPECI history for one or more stations (e.g. OMAA KTYS).
+
+    Live passthrough to the aviationweather.gov data API. Every
+    observation is also stored in the metars table (deduped by station +
+    observation time) so `trips --verbose` and the TUI flight detail can
+    surface it later, long after the API's ~30-day window has closed.
+    """
+    config = _load_config(db_path)
+    if hours is None:
+        hours = config.wx_default_hours
+    anchor = None
+    if date_str:
+        try:
+            anchor = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except ValueError:
+            raise click.BadParameter("expected ISO 8601, e.g. 2026-08-10T12:00Z", param_hint="--date") from None
+
+    try:
+        metars = fetch_metars(list(stations), hours=hours, date=anchor, config=config)
+    except MetarError as exc:
+        console.print(f"[red]{exc}[/]")
+        sys.exit(1)
+
+    with Database(Path(db_path)) as db:
+        stored = db.upsert_metars(dataclasses.asdict(m) for m in metars)
+
+    if output_json:
+        click.echo(json.dumps([dataclasses.asdict(m) for m in metars], indent=2))
+        return
+
+    if not metars:
+        console.print("[yellow]No observations returned[/]")
+        return
+
+    table = Table(title="METAR history")
+    table.add_column("Station", style="cyan")
+    table.add_column("Time", style="dim")
+    table.add_column("Type", style="dim")
+    table.add_column("Cat")
+    table.add_column("Raw")
+    for m in sorted(metars, key=lambda m: (m.station, m.obs_time), reverse=True):
+        cat = m.flight_category or ""
+        cat_cell = {"VFR": f"[green]{cat}[/]", "MVFR": f"[blue]{cat}[/]", "IFR": f"[red]{cat}[/]"}.get(
+            cat, f"[magenta]{cat}[/]" if cat else "[dim]--[/]"
+        )
+        table.add_row(m.station, f"{m.obs_time[:10]} {m.obs_time[11:16]}Z", m.metar_type or "?", cat_cell, m.raw_text)
+    console.print(table)
+    console.print(f"\n{len(metars)} observations ({stored} stored in metars table)")
 
 
 @cli.command()

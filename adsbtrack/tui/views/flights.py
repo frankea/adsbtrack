@@ -9,12 +9,14 @@ from dataclasses import dataclass
 from rich.text import Text
 from textual import work
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import DataTable, Input
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Input, Static
 from textual.worker import Worker, WorkerState
 
 from ...db import Database
-from ..queries import FlightRow, _display_destination, _display_origin, list_flights
+from ..queries import FlightRow, MetarRow, _display_destination, _display_origin, flight_wx, list_flights
 from ..widgets import (
     ACCENT_AMBER,
     ACCENT_CYAN,
@@ -128,6 +130,111 @@ def _flight_matches(row: FlightRow, needle_low: str) -> bool:
     )
 
 
+def build_flight_detail_text(row: FlightRow, wx: dict[str, list[MetarRow]] | None) -> Text:
+    """Render the flight-detail body as a rich Text.
+
+    Pure function of the row + fetched weather so tests can check the
+    rendering without a running app. Raw METAR strings go through
+    ``Text.append`` (never markup parsing) -- observation text is external
+    data and must not be interpretable as Rich tags.
+    """
+    text = Text()
+    text.append("FLIGHT DETAIL\n\n", style=f"bold {FG_0}")
+
+    def line(label: str, value: str, *, style: str = FG_0) -> None:
+        text.append(f"{label:<10}", style=FG_2)
+        text.append(f"{value}\n", style=style)
+
+    line("takeoff", _fmt_time(row.takeoff_time))
+    line("landing", _fmt_time(row.landing_time) if row.landing_time else "-")
+    line("route", f"{_display_origin(row) or '?'} -> {_display_destination(row) or '?'}")
+    line("duration", f"{row.duration_minutes:.0f} min" if row.duration_minutes is not None else "-")
+    line("callsign", row.callsign or "-", style=ACCENT_CYAN if row.callsign else FG_2)
+    line("mission", (row.mission_type or "-").upper())
+    line("alt / gs", f"{row.max_altitude or '-'} ft / {row.cruise_gs_kt or '-'} kt")
+    outcome = row.landing_type
+    if row.landing_confidence is not None:
+        outcome += f" ({int(row.landing_confidence * 100)}%)"
+    line("outcome", outcome)
+
+    text.append("\n")
+    if wx is None:
+        text.append("loading weather...\n", style=FG_2)
+    elif not wx:
+        text.append("no stored METARs near the endpoints\n", style=FG_2)
+        text.append("(populate with `adsbtrack wx <station>` or `trips --fetch-wx`)\n", style=FG_2)
+    else:
+        for label in ("origin", "destination"):
+            metars = wx.get(label)
+            if not metars:
+                continue
+            text.append(f"WX {label.upper()} {metars[0].station}\n", style=f"bold {ACCENT_CYAN}")
+            for m in metars:
+                text.append(f"  {m.obs_time[11:16]}Z ", style=FG_2)
+                text.append(m.raw_text, style=FG_1)
+                text.append("\n")
+    text.append("\npress esc to close", style=FG_2)
+    return text
+
+
+class FlightDetailScreen(ModalScreen[None]):
+    """Modal detail card for one flight: endpoints, outcome, and the METAR
+    history stored near the takeoff / landing windows (issue #26).
+
+    Weather comes from ``queries.flight_wx`` on a worker connection -- the
+    same local-table query `trips --verbose` uses, never the network.
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss(None)", "Close"),
+        Binding("enter", "dismiss(None)", show=False),
+        Binding("q", "dismiss(None)", show=False),
+    ]
+
+    DEFAULT_CSS = """
+    FlightDetailScreen {
+        align: center middle;
+    }
+    #flight-detail-dialog {
+        width: 90;
+        max-height: 80%;
+        padding: 1 2;
+        background: $surface;
+        border: round $primary;
+        overflow-y: auto;
+    }
+    """
+
+    def __init__(self, row: FlightRow) -> None:
+        super().__init__()
+        self._row = row
+        self._body = Static(build_flight_detail_text(row, None), id="flight-detail-body")
+
+    def compose(self) -> ComposeResult:
+        yield Vertical(self._body, id="flight-detail-dialog")
+
+    def on_mount(self) -> None:
+        self._fetch_wx()
+
+    @work(thread=True, exclusive=True, group="flight-detail", exit_on_error=False)
+    def _fetch_wx(self) -> dict[str, list[MetarRow]]:
+        """Query stored METARs on a worker's own connection (the app's
+        main-thread connection must never be touched off the loop)."""
+        db = self.app.db_factory()  # type: ignore[attr-defined]
+        try:
+            return flight_wx(db, self._row, config=getattr(self.app, "config", None))
+        finally:
+            db.close()
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "_fetch_wx":
+            return
+        if event.state == WorkerState.SUCCESS:
+            self._body.update(build_flight_detail_text(self._row, event.worker.result or {}))
+        elif event.state == WorkerState.ERROR:
+            self._body.update(build_flight_detail_text(self._row, {}))
+
+
 @dataclass(frozen=True)
 class _FlightsResult:
     """Everything the worker fetched, applied to the UI on the event loop."""
@@ -144,6 +251,10 @@ class FlightsView(Vertical):
         super().__init__(id="view-flights")
         self._icao: str | None = None
         self._rows: list[FlightRow] = []
+        # Rows currently rendered in the table, in table order, so a
+        # RowSelected cursor index maps back to its FlightRow for the
+        # detail modal. Rewritten by every _apply_filter pass.
+        self._filtered: list[FlightRow] = []
         self._header = PageHeader(
             "flights",
             crumb="select an aircraft first",
@@ -247,6 +358,7 @@ class FlightsView(Vertical):
 
     def _apply_filter(self, needle: str) -> None:
         rows = filter_flights(self._rows, needle)
+        self._filtered = rows
         self._table.clear()
         for r in rows:
             self._table.add_row(
@@ -267,6 +379,14 @@ class FlightsView(Vertical):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input is self._filter.input_widget:
             self._apply_filter(event.value or "")
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Enter on a flight row opens the detail modal (issue #26)."""
+        if event.data_table is not self._table:
+            return
+        idx = event.cursor_row
+        if idx is not None and 0 <= idx < len(self._filtered):
+            self.app.push_screen(FlightDetailScreen(self._filtered[idx]))
 
     def focus_filter(self) -> None:
         self._filter.input_widget.focus()

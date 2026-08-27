@@ -12,10 +12,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from adsbtrack.events import Event
-from adsbtrack.tui.queries import AircraftRow, FlightRow, JumpMatch
+from adsbtrack.tui.queries import AircraftRow, FlightRow, JumpMatch, MetarRow
 from adsbtrack.tui.views.aircraft import _fmt_flags, filter_aircraft
 from adsbtrack.tui.views.events import filter_events
-from adsbtrack.tui.views.flights import _airport_cell, filter_flights
+from adsbtrack.tui.views.flights import _airport_cell, build_flight_detail_text, filter_flights
 from adsbtrack.tui.views.jump import filter_jump_matches
 from adsbtrack.tui.widgets import ACCENT_AMBER, ACCENT_RED
 
@@ -327,3 +327,65 @@ def test_filter_jump_matches_skips_none_fields():
 def test_filter_jump_matches_no_match_returns_empty():
     rows = [_jump_match()]
     assert filter_jump_matches(rows, "zzzzzz") == []
+
+
+# ---------------------------------------------------------------------------
+# flight detail rendering (issue #26)
+# ---------------------------------------------------------------------------
+
+
+def test_flight_detail_text_renders_flight_and_wx():
+    row = _flight(landing_time="2026-03-01T14:00:00+00:00")
+    wx = {
+        "origin": [
+            MetarRow(
+                station="KEWR",
+                obs_time="2026-03-01T11:51:00+00:00",
+                metar_type="METAR",
+                flight_category="VFR",
+                raw_text="METAR KEWR 011151Z 31015KT CAVOK 10/02",
+            )
+        ],
+        "destination": [
+            MetarRow(
+                station="KBOS",
+                obs_time="2026-03-01T13:54:00+00:00",
+                metar_type="SPECI",
+                flight_category="IFR",
+                raw_text="SPECI KBOS 011354Z 04022G31KT 1SM SN",
+            )
+        ],
+    }
+    plain = build_flight_detail_text(row, wx).plain
+    assert "KEWR -> KBOS" in plain
+    assert "UAL1" in plain
+    assert "WX ORIGIN KEWR" in plain
+    assert "11:51Z METAR KEWR 011151Z" in plain
+    assert "WX DESTINATION KBOS" in plain
+    assert "SPECI KBOS 011354Z" in plain
+
+
+def test_flight_detail_text_loading_and_empty_states():
+    row = _flight()
+    assert "loading weather" in build_flight_detail_text(row, None).plain
+    empty = build_flight_detail_text(row, {}).plain
+    assert "no stored METARs" in empty
+    assert "trips --fetch-wx" in empty
+
+
+def test_flight_detail_text_raw_metar_not_parsed_as_markup():
+    """METAR text is external data; square brackets in it must render
+    literally instead of being eaten as Rich markup."""
+    row = _flight()
+    wx = {
+        "origin": [
+            MetarRow(
+                station="KEWR",
+                obs_time="2026-03-01T11:51:00+00:00",
+                metar_type="METAR",
+                flight_category=None,
+                raw_text="METAR KEWR 011151Z RMK [red]NOT MARKUP[/red]",
+            )
+        ]
+    }
+    assert "[red]NOT MARKUP[/red]" in build_flight_detail_text(row, wx).plain

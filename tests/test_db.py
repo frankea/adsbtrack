@@ -2199,3 +2199,87 @@ def test_flight_insert_round_trip_without_callsign_count(tmp_path):
         # Derive the count that was formerly stored in callsign_count
         assert len(json.loads(row["callsigns"])) == 2
         assert row["callsign_changes"] == 1
+
+
+# ---------------------------------------------------------------------------
+# metars table (issue #26)
+# ---------------------------------------------------------------------------
+
+
+def test_metars_table_round_trip_and_dedupe(tmp_path):
+    """upsert_metars keyed by (station, obs_time): re-inserting the same
+    observation replaces rather than duplicates, and get_metars returns
+    window-bounded rows oldest first."""
+    with Database(tmp_path / "wx.db") as db:
+        rows = [
+            {
+                "station": "omaa",  # stored uppercased
+                "obs_time": "2026-08-10T12:00:00+00:00",
+                "metar_type": "METAR",
+                "raw_text": "METAR OMAA 101200Z 31015KT CAVOK 44/13 Q0997 NOSIG",
+                "temp_c": 44.0,
+                "wind_dir_deg": 310,
+                "wind_speed_kt": 15,
+                "flight_category": "VFR",
+            },
+            {
+                "station": "OMAA",
+                "obs_time": "2026-08-10T11:30:00+00:00",
+                "metar_type": "METAR",
+                "raw_text": "METAR OMAA 101130Z 31013KT CAVOK 45/15 Q0998 NOSIG",
+            },
+        ]
+        assert db.upsert_metars(rows) == 2
+        assert db.upsert_metars(rows) == 2  # replace, not duplicate
+        assert db.conn.execute("SELECT COUNT(*) AS n FROM metars").fetchone()["n"] == 2
+
+        got = db.get_metars("OMAA", "2026-08-10T11:00:00+00:00", "2026-08-10T12:30:00+00:00")
+        assert [r["obs_time"] for r in got] == ["2026-08-10T11:30:00+00:00", "2026-08-10T12:00:00+00:00"]
+        assert got[1]["temp_c"] == 44.0
+        assert got[1]["station"] == "OMAA"
+
+        # window bounds exclude observations outside them
+        narrow = db.get_metars("OMAA", "2026-08-10T11:45:00+00:00", "2026-08-10T12:30:00+00:00")
+        assert [r["obs_time"] for r in narrow] == ["2026-08-10T12:00:00+00:00"]
+
+
+def test_reopen_recreates_missing_metars_table(db_path):
+    """Legacy-fixture round trip for the v4 metars table: a DB from before
+    the table existed (simulated by dropping it and resetting PRAGMA
+    user_version to 0) must, on reopen via Database, get the table created
+    and be restamped to SCHEMA_VERSION. A new table needs no ALTER
+    migration -- CREATE TABLE IF NOT EXISTS in _SCHEMA_STATEMENTS runs on
+    every open -- but the version stamp must still advance so future
+    metars ALTERs can assume this boundary passed."""
+    import sqlite3
+
+    from adsbtrack.db import SCHEMA_VERSION
+
+    with Database(db_path) as db:
+        stored = db.upsert_metars(
+            [
+                {
+                    "station": "KTYS",
+                    "obs_time": "2026-08-21T22:53:00+00:00",
+                    "metar_type": "METAR",
+                    "raw_text": "METAR KTYS 212253Z 25004KT 10SM SCT095 27/22 A2996",
+                }
+            ]
+        )
+        assert stored == 1
+
+    raw = sqlite3.connect(db_path)
+    raw.execute("DROP TABLE metars")
+    raw.execute("PRAGMA user_version = 0")
+    raw.commit()
+    raw.close()
+
+    with Database(db_path) as db:
+        row = db.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='metars'").fetchone()
+        assert row is not None
+        assert db.conn.execute("SELECT COUNT(*) AS n FROM metars").fetchone()["n"] == 0
+
+    raw = sqlite3.connect(db_path)
+    version = raw.execute("PRAGMA user_version").fetchone()[0]
+    raw.close()
+    assert version == SCHEMA_VERSION

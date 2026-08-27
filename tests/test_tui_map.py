@@ -45,10 +45,13 @@ from adsbtrack.tui.views.map import (  # noqa: E402
     MapView,
     _alt_range_str,
     _build_ctx,
+    _compose,
     _draw_endpoint,
+    _draw_panel,
     _footer_legend,
     _Grid,
     _layers_panel,
+    _project_to_dots,
     _rasterise_trace,
     _scale_deg_per_cell,
     _usable_dot_span,
@@ -168,6 +171,83 @@ def test_draw_endpoint_out_of_bounds_row_is_noop():
     grid = _Grid(rows=1, cols=10)
     _draw_endpoint(grid, (0, 100, "adsb_icao"), "x", "#ffffff")  # row way off-grid
     assert all(ch == " " for row in grid.chars for ch in row)
+
+
+# ---------------------------------------------------------------------------
+# #31: endpoint labels must not overwrite the overlay panels' text.
+# Labels still paint after the panels, but dodge their reserved rects.
+# ---------------------------------------------------------------------------
+
+# A small stand-in panel occupying rows 0..3, cols 20..37 of a 6x40 grid
+# (top=0, left=20, width=18, two content rows -> height 4).
+_TEST_PANEL_RECT = (0, 20, 3, 37)
+
+
+def _grid_with_panel() -> _Grid:
+    grid = _Grid(rows=6, cols=40)
+    _draw_panel(
+        grid,
+        top=0,
+        left=20,
+        width=18,
+        rows=[[("#4fb8e0", "TRACE")], [("#e4ecf3", "pts   123")]],
+    )
+    return grid
+
+
+def test_draw_endpoint_marker_inside_reserved_panel_is_skipped():
+    """A marker landing inside a panel must not punch a hole through it:
+    the panel already painted over the trace at that cell."""
+    grid = _grid_with_panel()
+    before = ["".join(row) for row in grid.chars]
+    # dot (50, 4) -> cell (row 1, col 25): inside the panel interior.
+    _draw_endpoint(grid, (50, 4, "adsb_icao"), "end KSFO", "#4fb8e0", reserved=[_TEST_PANEL_RECT])
+    assert ["".join(row) for row in grid.chars] == before
+
+
+def test_draw_endpoint_flips_label_left_when_right_side_hits_panel():
+    """The label fits to the right width-wise, but that span runs into the
+    panel; it must flip to the clear left side instead of overwriting."""
+    grid = _grid_with_panel()
+    # dot (30, 4) -> cell (row 1, col 15); right span would be cols 17..24.
+    _draw_endpoint(grid, (30, 4, "adsb_icao"), "end KSFO", "#4fb8e0", reserved=[_TEST_PANEL_RECT])
+    assert grid.chars[1][15] == "●"
+    assert "".join(grid.chars[1][6:14]) == "end KSFO"
+    # The panel's pts row is exactly what the issue saw corrupted.
+    assert "pts   123" in "".join(grid.chars[2])
+
+
+def test_draw_endpoint_drops_label_when_both_sides_hit_panels():
+    grid = _Grid(rows=6, cols=40)
+    flanking = [(0, 0, 3, 8), (0, 14, 3, 39)]
+    # dot (22, 4) -> cell (row 1, col 11): between the two rects.
+    _draw_endpoint(grid, (22, 4, "adsb_icao"), "end KSFO", "#4fb8e0", reserved=flanking)
+    assert grid.chars[1][11] == "●", "marker survives even when the label has nowhere to go"
+    flat = "".join("".join(row) for row in grid.chars)
+    assert "end" not in flat and "KSFO" not in flat
+
+
+def test_compose_endpoint_never_corrupts_trace_panel_pts_row():
+    """End-to-end through _compose: a trace whose end point projects into
+    the TRACE panel area must leave the panel's date/pts rows intact."""
+    ts = datetime(2026, 3, 1, 12, 0, tzinfo=UTC).timestamp()
+    # 80x20 pane -> 160x80 dots, inset (16, 8), usable 127x63. The last
+    # point sits at lon_max and lat 59/63 of the range, projecting to dot
+    # (143, 12) -> cell (row 3, col 71): inside the TRACE panel (rows 0..7,
+    # cols 47..78), on its pts row.
+    points = [
+        TracePoint(ts=ts, lat=0.0, lon=0.0, alt_ft=1000, source="adsb_icao"),
+        TracePoint(ts=ts + 60, lat=1.0, lon=0.5, alt_ft=2000, source="adsb_icao"),
+        TracePoint(ts=ts + 120, lat=59 / 63, lon=1.0, alt_ft=1500, source="adsb_icao"),
+    ]
+    ctx = _build_ctx(points, "2026-03-01", "KSTART", "KEND", gap_secs=3600.0)
+    projected = _project_to_dots(points, ctx.lat_min, ctx.lat_max, ctx.lon_min, ctx.lon_max, 160, 80)
+    end_row, end_col = projected[-1][1] // 4, projected[-1][0] // 2
+    assert 0 <= end_row <= 7 and 47 <= end_col <= 78, "precondition: end marker must land inside the TRACE panel"
+    lines = _compose(ctx, cols=80, rows=20).plain.split("\n")
+    assert "date  2026-03-01" in lines[2], "date row must survive the endpoint collision"
+    assert "pts   3" in lines[3], "pts row must survive the endpoint collision"
+    assert "end KEND" not in "".join(lines[:8]), "no endpoint label may be painted across the panel rows"
 
 
 # ---------------------------------------------------------------------------

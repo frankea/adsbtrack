@@ -675,6 +675,32 @@ def test_status_snapshot_missions_filters_nulls_and_limits_to_six(tmp_path):
     assert snap["missions"][0] == ("training", 2), "ORDER BY n DESC head not pinned"
 
 
+def test_status_snapshot_mission_type_count_sees_past_the_limit(tmp_path):
+    """#31: the status card wants a "+N more" indicator when the LIMIT 6
+    missions head hides types, so the snapshot carries the full distinct
+    count (null/empty excluded, matching the missions list's filter)."""
+    db_path = tmp_path / "missions_count.db"
+    with Database(db_path) as db:
+        icao = "fff777"
+        db.insert_flight(_flight(icao, hour=1, mission_type=None))
+        db.insert_flight(_flight(icao, hour=2, mission_type="training"))
+        for hour, name in enumerate(
+            ["training", "transport", "cargo", "medical", "survey", "patrol", "sightseeing"], start=3
+        ):
+            db.insert_flight(_flight(icao, hour=hour, mission_type=name))
+        db.refresh_aircraft_stats(icao)
+        db.commit()
+        snap = status_snapshot(db, icao)
+    assert len(snap["missions"]) == 6
+    assert snap["mission_type_count"] == 7, "distinct non-null mission types, not capped by the list's LIMIT"
+
+
+def test_status_snapshot_mission_type_count_zero_for_unknown_icao(seeded_db):
+    with Database(seeded_db) as db:
+        snap = status_snapshot(db, "ffffff")
+    assert snap["mission_type_count"] == 0
+
+
 def test_status_snapshot_sources_returns_none_when_all_points_zero(tmp_path):
     db_path = tmp_path / "zero_points.db"
     with Database(db_path) as db:

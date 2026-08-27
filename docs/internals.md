@@ -99,6 +99,12 @@ uv run python -m adsbtrack.bench \
   --source ${SRC} --concurrency 4 --rate 0.5 --db bench-sigint.db
 ```
 
+## OpenSky fetcher
+
+`fetch_traces_opensky` is deliberately serial (the async machinery above is for readsb archives; OpenSky's quota is credit-based, so concurrency buys nothing). Auth is OAuth2 client-credentials against OpenSky's Keycloak token endpoint (`Config.opensky_token_url`): `_OpenSkyAuth` posts the clientId/clientSecret, caches the Bearer token (~30 min lifetime observed), refreshes it `Config.opensky_token_refresh_margin_secs` before expiry, and retries once on 401 in case the token was revoked early. Credentials come from `OPENSKY_CLIENT_ID`/`OPENSKY_CLIENT_SECRET` env vars or `credentials.json` (`clientId`/`clientSecret`); `opensky_credentials_available` is the single source of truth the CLI uses to decide whether `--source all` includes OpenSky.
+
+The REST API is not a per-day trace archive, so day coverage is synthesized: `/flights/aircraft` is queried in UTC-midnight-aligned 2-day windows (the API 400s on any span touching more than 2 day partitions), and each returned flight's `/tracks/all` waypoints (available only ~30 days back) are converted to a readsb-compatible trace inserted under the flight's `firstSeen` date. Tracks carry no ground speed, so purely-OpenSky flights extract with lower confidence. Failure handling: a 403 (insufficient historical access) and a 429 that persists after one waited retry (daily credits exhausted) both log the remaining days with their status and stop the run instead of raising - both statuses are retryable in `fetch_log` terms, so those days stay eligible for the next run, and under `--source all` the other sources' threads are unaffected.
+
 ## Trace merging
 
 When multiple data sources are fetched for the same aircraft, traces are merged by absolute timestamp and deduplicated (points within 1 second and 0.001 degrees of each other are collapsed). Different receiver networks catch different points for the same flight, so combining them improves coverage.
@@ -207,6 +213,26 @@ Each import validates the file's header line against a required-columns list bef
 3. **hexdb.io REST API** -- live fallback, per-minute throttled, treats both HTTP 404 and 200-with-`{status: "404"}` bodies as misses.
 
 Conflicts (differing registrations or type codes between sources) are reported in the return value but don't block the write. An independent check against `mil_hex_ranges` runs on every hex and stamps `is_military` / `mil_country` / `mil_branch` regardless of which civilian source supplied the row, so e.g. a hex with a Mictronics registration can still be flagged as military when it sits in a DoD allocation block.
+
+## Export bundles
+
+`adsbtrack export` (`adsbtrack/export.py`) assembles the per-tail deliverable bundle handed to third parties: a hex-scoped SQLite extract (`flights`, `trace_days`, `fetch_log`), `flights.csv`, per-`--window` flight subsets and fragment-level trace CSVs, a `README.md` describing every file, and an optional `analysis.md` identity stub built from `aircraft_registry` / `hex_crossref` / `faa_registry`. It is strictly read-only over the working database.
+
+Three design points worth knowing:
+
+- The extract's table DDL is copied from the source database's `sqlite_master` at export time, so the extract schema tracks the working schema with no second copy to maintain. `trace_days.trace_json` is rewritten as plain JSON text (decoded through the same `db.decode_trace_json` path the parser and forensics use, so legacy TEXT rows and compressed BLOB rows both export) - recipients read traces in any SQLite browser with no zlib step.
+- `--window START:END` accepts dates or datetimes. The separator colon is found by shape, not position (END always starts with `YYYY-MM-DD`), so datetime windows like `2026-04-21T14:00:2026-04-22` parse unambiguously. A bare date covers its whole UTC day; flight subsets use overlap semantics (any part of the flight inside the window); trace CSVs filter point-by-point on absolute timestamp, scanning from one day before the window start to catch a trace day spilling past its own midnight.
+- Trace CSV rows are native resolution: every source's points merged chronologically, no dedup, no forward-fill - a blank callsign means "not broadcast on this sample". Cross-source near-duplicates are kept deliberately as evidence of independent reception.
+
+## Universal lookup
+
+`adsbtrack lookup <hex|registration>` (`adsbtrack/lookup.py`) reuses the same merge for ad-hoc queries. A hex query answers from the `hex_crossref` cache when a row with actual identity exists, runs the FAA -> Mictronics -> hexdb.io merge on a miss, then falls back to adsbdb (`api.adsbdb.com/v0/aircraft/{query}`) - which covers many foreign civil and military registrations hexdb.io misses. A registration query resolves to a hex via algorithmic FAA N-number conversion, the local `hex_crossref` / `aircraft_registry` tables, hexdb.io's plain-text `reg-hex` converter, then adsbdb (whose aircraft payload doubles as the identity, avoiding a second fetch). Online answers are cached into `hex_crossref` with their source tag, and the `mil_hex_ranges` annotation (country / branch / notes) is reported even when no identity source resolves the hex - so a US DoD-pool address still gets a useful answer. The adsbdb client self-throttles per `Config.adsbdb_rate_limit_per_min` and treats both HTTP 404 and `{"response": "unknown aircraft"}` bodies as misses.
+
+## Live callsign resolution
+
+`adsbtrack resolve <callsign>` (`adsbtrack/resolve.py`) is the callsign -> hex bridge: everything else in the tool is hex-keyed, so casework that starts from a flight number needs this first. It queries the open readsb-style `/v2/callsign/{CS}` endpoints on adsb.lol and adsb.fi (in `Config.resolve_source_urls` order) and reports every currently-broadcasting airframe whose padded `flight` field matches the callsign after stripping. Matches are deduplicated by hex across networks - the first network wins per field, later ones fill gaps (adsb.fi often carries `desc`/`ownOp` that adsb.lol omits) - and TIS-B/MLAT synthetic addresses (`~`-prefixed) are dropped. One network failing records an error but doesn't sink the other's answer.
+
+Matches carrying a registration or type are cached into `hex_crossref` with a `<network>_live` source tag, but never over an existing identity row: live-feed fields come from spoofable broadcasts and must not clobber FAA / Mictronics / hexdb data. Live-only by design - historical callsign search is out of scope - and airplanes.live is deliberately not queried because its API requires a key granted on application.
 
 ## Interactive surfaces (TUI + GUI)
 

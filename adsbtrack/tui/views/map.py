@@ -463,11 +463,24 @@ def _info_panel(ctx: _MapCtx) -> list[list[tuple[str, str]]]:
     ]
 
 
+def _span_hits_reserved(
+    reserved: list[tuple[int, int, int, int]],
+    row: int,
+    col_start: int,
+    col_end: int,
+) -> bool:
+    """True when the 1-row cell span ``[col_start, col_end]`` intersects any
+    ``(top, left, bottom, right)`` reserved rect (inclusive bounds)."""
+    return any(top <= row <= bottom and col_end >= left and col_start <= right for top, left, bottom, right in reserved)
+
+
 def _draw_endpoint(
     grid: _Grid,
     projected_pt: tuple[int, int, str],
     label: str,
     colour: str,
+    *,
+    reserved: list[tuple[int, int, int, int]] | None = None,
 ) -> None:
     """Paint a coloured endpoint marker with a ``label`` next to it.
 
@@ -477,16 +490,26 @@ def _draw_endpoint(
     truncates the label to fit that gap rather than clamping its start
     position back across the marker cell (F4) -- a label that doesn't
     fit on the left gets shortened, never repositioned onto the marker.
+
+    ``reserved`` holds the overlay panels' cell rects (#31): a label used
+    to punch straight through the LAYERS / TRACE panel text when they
+    collided. A placement that would overlap a reserved rect flips to
+    the other side; if both sides collide the label is dropped and only
+    the marker is drawn. A marker that itself lands inside a panel is
+    skipped entirely -- the panel already painted over the trace there.
     """
     x, y, _ = projected_pt
     row = y // 4
     col = x // 2
     if row < 0 or row >= grid.rows or col < 0 or col >= grid.cols:
         return
+    rects = reserved or []
+    if _span_hits_reserved(rects, row, col, col):
+        return
     grid.set(row, col, "●", colour)
     right_start = col + 2
     available_right = grid.cols - right_start
-    if available_right >= len(label):
+    if available_right >= len(label) and not _span_hits_reserved(rects, row, right_start, right_start + len(label) - 1):
         _place_text(grid, row, right_start, label, colour)
         return
     available_left = col - 1  # columns [0, col-2], leaving a 1-cell gap
@@ -494,6 +517,8 @@ def _draw_endpoint(
         return
     text = label[:available_left]
     left_start = col - 1 - len(text)
+    if _span_hits_reserved(rects, row, left_start, col - 2):
+        return
     _place_text(grid, row, left_start, text, colour)
 
 
@@ -534,29 +559,37 @@ def _compose(ctx: _MapCtx, cols: int, rows: int) -> Text:
     _draw_grid_backdrop(grid, occupied)
 
     # Pass 3: overlay panels. Only draw them if the pane is wide/tall
-    # enough; otherwise the map gets buried under chrome.
+    # enough; otherwise the map gets buried under chrome. Their cell
+    # rects are remembered so pass 4 keeps endpoint labels out of the
+    # panel text (#31).
+    reserved: list[tuple[int, int, int, int]] = []
     if cols >= _MIN_PANEL_COLS and rows >= 9:
+        layers_rows = _layers_panel(ctx.source_counts, len(ctx.points))
         _draw_panel(
             grid,
             top=0,
             left=_PANEL_MARGIN,
             width=_LAYERS_PANEL_WIDTH,
-            rows=_layers_panel(ctx.source_counts, len(ctx.points)),
+            rows=layers_rows,
         )
+        reserved.append((0, _PANEL_MARGIN, len(layers_rows) + 1, _PANEL_MARGIN + _LAYERS_PANEL_WIDTH - 1))
         info_rows = _info_panel(ctx)
+        info_left = max(_PANEL_MARGIN, cols - _INFO_PANEL_WIDTH - _PANEL_MARGIN)
         _draw_panel(
             grid,
             top=0,
-            left=max(_PANEL_MARGIN, cols - _INFO_PANEL_WIDTH - _PANEL_MARGIN),
+            left=info_left,
             width=_INFO_PANEL_WIDTH,
             rows=info_rows,
         )
+        reserved.append((0, info_left, len(info_rows) + 1, info_left + _INFO_PANEL_WIDTH - 1))
 
-    # Pass 4: endpoint markers + labels, placed after panels so labels
-    # stay visible even where they overlap a panel region.
+    # Pass 4: endpoint markers + labels. They still paint after the
+    # panels, but dodge the reserved panel rects instead of overwriting
+    # their text (#31).
     if projected:
-        _draw_endpoint(grid, projected[0], f"start {ctx.start_label}", ACCENT_OK)
-        _draw_endpoint(grid, projected[-1], f"end {ctx.end_label}", ACCENT_CYAN)
+        _draw_endpoint(grid, projected[0], f"start {ctx.start_label}", ACCENT_OK, reserved=reserved)
+        _draw_endpoint(grid, projected[-1], f"end {ctx.end_label}", ACCENT_CYAN, reserved=reserved)
 
     return grid.to_text()
 

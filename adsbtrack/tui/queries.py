@@ -525,6 +525,15 @@ def status_snapshot(db: Database, icao: str) -> dict[str, Any]:
         (icao,),
     ).fetchall()
 
+    # Total distinct (non-null, non-empty, matching the missions filter
+    # below) mission types, so the status card can say "+N more" when the
+    # LIMIT 6 head above hides some (#31).
+    mission_types_row = db.conn.execute(
+        """SELECT COUNT(DISTINCT mission_type) AS n FROM flights
+            WHERE icao = ? AND mission_type IS NOT NULL AND mission_type != ''""",
+        (icao,),
+    ).fetchone()
+
     spoof_count_row = db.conn.execute("SELECT COUNT(*) AS n FROM spoofed_broadcasts WHERE icao = ?", (icao,)).fetchone()
 
     indicators_row = db.conn.execute(
@@ -578,6 +587,7 @@ def status_snapshot(db: Database, icao: str) -> dict[str, Any]:
         if source_row and source_row["total_points"]
         else None,
         "missions": [(r["mission_type"], r["n"]) for r in missions if r["mission_type"]],
+        "mission_type_count": mission_types_row["n"] if mission_types_row else 0,
         "spoof_count": spoof_count_row["n"] if spoof_count_row else 0,
     }
 

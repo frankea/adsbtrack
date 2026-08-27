@@ -284,6 +284,24 @@ class Config:
     mictronics_cache_dir: Path = Path(".cache/mictronics")
     hexdb_base_url: str = "https://hexdb.io"
     hexdb_rate_limit_per_min: int = 60
+    # adsbdb final-fallback identity lookup (issue #27, `lookup` command).
+    # Free community API with no published hard limit; the self-throttle
+    # keeps adsbtrack a polite consumer.
+    adsbdb_base_url: str = "https://api.adsbdb.com"
+    adsbdb_rate_limit_per_min: int = 30
+    # Live callsign -> hex resolution networks (issue #29, `resolve`
+    # command), queried in dict order. adsb.lol and adsb.fi expose open
+    # readsb-style /v2/callsign endpoints; adsb.fi asks for at most one
+    # request per second, which the shared per-minute throttle stays well
+    # under. airplanes.live is deliberately absent: its API requires a key
+    # granted on application.
+    resolve_source_urls: dict[str, str] = field(
+        default_factory=lambda: {
+            "adsblol": "https://api.adsb.lol",
+            "adsbfi": "https://opendata.adsb.fi/api",
+        }
+    )
+    resolve_rate_limit_per_min: int = 30
     rate_limit: float = 0.5  # seconds between requests
     rate_limit_max: float = 30.0  # max backoff after 429s
     rate_limit_recovery: int = 10  # successes before reducing delay
@@ -307,6 +325,24 @@ class Config:
     # fetch_log.fetched_at at plan time - no separate health table.
     source_health_window: int = 30
     source_health_skip_threshold: int = 20
+    # OpenSky REST source (fetch --source opensky, and part of --source all
+    # whenever credentials are configured). Auth is OAuth2 client-credentials:
+    # POST clientId/clientSecret to opensky_token_url (Keycloak), then send
+    # the returned Bearer token on every API request. Tokens live ~30 min;
+    # a refresh is forced opensky_token_refresh_margin_secs before expiry so
+    # a token never dies between a flights call and its tracks calls.
+    # opensky_rate_limit paces request starts - the authenticated REST quota
+    # is credit-based (~4000 credits/day), so this stays deliberately slower
+    # than the readsb sources. A 429 without a retry-after header waits
+    # opensky_429_default_wait_secs before retrying the window.
+    opensky_api_url: str = "https://opensky-network.org/api"
+    opensky_token_url: str = (
+        "https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token"
+    )
+    opensky_rate_limit: float = 1.0
+    opensky_429_default_wait_secs: float = 60.0
+    opensky_token_refresh_margin_secs: float = 60.0
+
     # Observed archive retention per source (days), None = unknown/unlimited.
     # theairtraffic: returned no data for dates ~90 days old that two other
     # networks had dense coverage for (2026-08 observation). Used only to
@@ -397,6 +433,11 @@ class Config:
     # watch --webhook: POST timeout. A hung alert receiver must not wedge a
     # cron-driven watch run.
     watch_webhook_timeout_secs: float = 10.0
+
+    # export: default parent directory for deliverable bundles. `adsbtrack
+    # export --hex X` without --out writes to <export_dir>/<hex>/; --out
+    # names the bundle directory directly and ignores this.
+    export_dir: Path = Path("exports")
 
     # METAR history (issue #26). metar_window_hours is the window centered
     # on a flight's takeoff/landing that `trips --fetch-wx` fetches and

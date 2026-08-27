@@ -6,6 +6,7 @@ import json
 import os
 import tarfile
 import time
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
@@ -628,7 +629,7 @@ def fetch_traces_adsblol(db: Database, config: Config, hex_code: str, start_date
 
 
 def _load_opensky_credentials(config: Config) -> tuple[str, str]:
-    """Load OpenSky credentials from env vars or JSON file. Returns (username, password)."""
+    """Load OpenSky credentials from env vars or JSON file. Returns (client_id, client_secret)."""
     # Prefer environment variables
     client_id = os.environ.get("OPENSKY_CLIENT_ID")
     client_secret = os.environ.get("OPENSKY_CLIENT_SECRET")
@@ -646,6 +647,77 @@ def _load_opensky_credentials(config: Config) -> tuple[str, str]:
     with open(config.credentials_path) as f:
         creds = json.load(f)
     return creds["clientId"], creds["clientSecret"]
+
+
+def opensky_credentials_available(config: Config) -> bool:
+    """True when usable OpenSky credentials exist (env vars or credentials file).
+
+    Single source of truth for the CLI's "OpenSky skipped: no credentials"
+    decision, so availability and actual loading can never disagree.
+    """
+    try:
+        client_id, client_secret = _load_opensky_credentials(config)
+    except (RuntimeError, KeyError, ValueError, OSError):
+        return False
+    return bool(client_id and client_secret)
+
+
+class _OpenSkyAuth(httpx.Auth):
+    """OAuth2 client-credentials auth for the OpenSky REST API.
+
+    OpenSky retired HTTP Basic auth; the current flow is a Keycloak
+    client-credentials grant: POST clientId/clientSecret to the token
+    endpoint, then send the returned Bearer token on API requests. Tokens
+    live ~30 minutes (expires_in=1800 observed live), so the token is
+    cached and refreshed refresh_margin_secs before expiry, plus one
+    reactive refresh if the API still answers 401 (token revoked early).
+    Sync-only: fetch_traces_opensky is a serial fetcher.
+    """
+
+    requires_response_body = True
+
+    def __init__(self, client_id: str, client_secret: str, token_url: str, refresh_margin_secs: float):
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._token_url = token_url
+        self._refresh_margin_secs = refresh_margin_secs
+        self._token: str | None = None
+        self._expires_at: float = 0.0  # time.monotonic() deadline
+
+    def _token_request(self) -> httpx.Request:
+        return httpx.Request(
+            "POST",
+            self._token_url,
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self._client_id,
+                "client_secret": self._client_secret,
+            },
+        )
+
+    def _accept_token(self, response: httpx.Response) -> None:
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"OpenSky token request failed with HTTP {response.status_code}: "
+                f"{response.text.strip()[:200]}. Check clientId/clientSecret - API client "
+                "credentials come from the opensky-network.org account page, not the "
+                "website username/password."
+            )
+        payload = response.json()
+        self._token = payload["access_token"]
+        self._expires_at = time.monotonic() + float(payload.get("expires_in", 1800)) - self._refresh_margin_secs
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        if self._token is None or time.monotonic() >= self._expires_at:
+            token_response = yield self._token_request()
+            self._accept_token(token_response)
+        request.headers["Authorization"] = f"Bearer {self._token}"
+        response = yield request
+        if response.status_code == 401:
+            token_response = yield self._token_request()
+            self._accept_token(token_response)
+            request.headers["Authorization"] = f"Bearer {self._token}"
+            yield request
 
 
 def _opensky_path_to_readsb(path: list, callsign: str | None, start_time: int) -> dict:
@@ -667,15 +739,28 @@ def _opensky_path_to_readsb(path: list, callsign: str | None, start_time: int) -
     }
 
 
-def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date: date, end_date: date) -> dict:
+def fetch_traces_opensky(
+    db: Database,
+    config: Config,
+    hex_code: str,
+    start_date: date,
+    end_date: date,
+    transport: httpx.BaseTransport | None = None,
+) -> dict:
     """Fetch flight data from OpenSky Network API.
 
-    Uses /flights/aircraft for historical flight metadata (no 30-day limit),
-    then /tracks/all for detailed waypoints (last 30 days only).
+    Authenticates via OAuth2 client-credentials (see _OpenSkyAuth). Uses
+    /flights/aircraft for historical flight metadata (no 30-day limit),
+    then /tracks/all for detailed waypoints (last 30 days only). The
+    2-day request windows are UTC-midnight aligned because the API rejects
+    any span touching more than 2 day partitions (HTTP 400, verified live).
+
+    ``transport`` lets tests inject an httpx.MockTransport; production
+    callers leave it None.
     """
     source = "opensky"
     already_fetched = db.get_fetched_dates(hex_code, source=source)
-    username, password = _load_opensky_credentials(config)
+    client_id, client_secret = _load_opensky_credentials(config)
 
     all_days = date_range(start_date, end_date)
     to_fetch = [d for d in all_days if d.isoformat() not in already_fetched]
@@ -695,11 +780,12 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
         windows.append((window_start, window_end, window_days))
         i += len(window_days)
 
-    base_url = "https://opensky-network.org/api"
+    base_url = config.opensky_api_url
     thirty_days_ago = date.today() - timedelta(days=30)
+    auth = _OpenSkyAuth(client_id, client_secret, config.opensky_token_url, config.opensky_token_refresh_margin_secs)
 
     with (
-        httpx.Client(auth=(username, password), timeout=30) as client,
+        httpx.Client(auth=auth, timeout=30, transport=transport) as client,
         Progress(
             TextColumn("[bold blue]{task.description}"),
             BarColumn(),
@@ -709,7 +795,7 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
     ):
         task = progress.add_task(f"Fetching {hex_code} (opensky)", total=len(to_fetch))
 
-        for window_start, window_end, window_days in windows:
+        for window_index, (window_start, window_end, window_days) in enumerate(windows):
             begin_ts = int(datetime(window_start.year, window_start.month, window_start.day, tzinfo=UTC).timestamp())
             end_ts = int(
                 datetime(window_end.year, window_end.month, window_end.day, 23, 59, 59, tzinfo=UTC).timestamp()
@@ -721,12 +807,53 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
                     f"{base_url}/flights/aircraft", params={"icao24": hex_code, "begin": begin_ts, "end": end_ts}
                 )
 
-                if resp.status_code == 403:
-                    progress.stop()
-                    raise RuntimeError(
-                        f"OpenSky access denied: {resp.text.strip()}. "
-                        "Historical data requires upgraded access at opensky-network.org"
+                if resp.status_code == 429:
+                    # Wait out the throttle once, then retry the same window.
+                    # (The old for-loop `continue` here skipped the window
+                    # instead of retrying it, leaving its days unlogged.)
+                    default_wait = str(int(config.opensky_429_default_wait_secs))
+                    retry_after = resp.headers.get("x-rate-limit-retry-after-seconds", default_wait)
+                    wait = int(retry_after) if retry_after.isdigit() else int(config.opensky_429_default_wait_secs)
+                    progress.console.print(f"  [yellow]OpenSky rate limit hit, waiting {wait}s[/]")
+                    time.sleep(wait)
+                    resp = client.get(
+                        f"{base_url}/flights/aircraft", params={"icao24": hex_code, "begin": begin_ts, "end": end_ts}
                     )
+
+                if resp.status_code == 429:
+                    # Still throttled after waiting: the daily credit quota is
+                    # likely exhausted, so more requests this run are wasted.
+                    # 429 is a retryable status - these days stay eligible.
+                    progress.console.print(
+                        "  [yellow]OpenSky still rate-limited after waiting (daily credits likely "
+                        "exhausted); remaining OpenSky days will retry on the next run.[/]"
+                    )
+                    for _, _, days in windows[window_index:]:
+                        for day in days:
+                            db.insert_fetch_log(hex_code, day.isoformat(), 429, source=source)
+                            stats["errors"] += 1
+                            stats["fetched"] += 1
+                            progress.advance(task)
+                    break
+
+                if resp.status_code == 403:
+                    # Insufficient privileges for this history depth. Log the
+                    # remaining days as 403 (a retryable status, so they stay
+                    # eligible for future runs) instead of raising - under
+                    # --source all this runs in a thread and an exception
+                    # would take down the whole opensky task, not just today's.
+                    progress.console.print(
+                        f"  [red]OpenSky access denied (HTTP 403): {resp.text.strip()[:200]}. "
+                        "Historical data may require upgraded access at opensky-network.org; "
+                        "skipping the remaining OpenSky days this run.[/]"
+                    )
+                    for _, _, days in windows[window_index:]:
+                        for day in days:
+                            db.insert_fetch_log(hex_code, day.isoformat(), 403, source=source)
+                            stats["errors"] += 1
+                            stats["fetched"] += 1
+                            progress.advance(task)
+                    break
 
                 if resp.status_code == 200:
                     flights = resp.json()
@@ -735,7 +862,7 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
                             db.insert_fetch_log(hex_code, day.isoformat(), 204, source=source)
                             stats["fetched"] += 1
                             progress.advance(task)
-                        time.sleep(1)
+                        time.sleep(config.opensky_rate_limit)
                         continue
 
                     # For each flight, try to get the track if within 30 days
@@ -748,7 +875,7 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
 
                         if flight_date >= thirty_days_ago:
                             # Can get detailed track
-                            time.sleep(1)
+                            time.sleep(config.opensky_rate_limit)
                             track_resp = client.get(
                                 f"{base_url}/tracks/all", params={"icao24": hex_code, "time": first_seen}
                             )
@@ -762,6 +889,12 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
                                     db.insert_fetch_log(hex_code, flight_day_str, 200, source=source)
                                     stats["with_data"] += 1
                                     continue
+                            elif track_resp.status_code == 429:
+                                # Quota ran out mid-window: keep the day
+                                # retryable instead of burying it as "checked,
+                                # no data" (204 would never be retried).
+                                db.insert_fetch_log(hex_code, flight_day_str, 429, source=source)
+                                continue
 
                         # No detailed track available, log that we checked
                         db.insert_fetch_log(hex_code, flight_day_str, 204, source=source)
@@ -775,13 +908,6 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
                         db.insert_fetch_log(hex_code, day.isoformat(), 404, source=source)
                         stats["fetched"] += 1
                         progress.advance(task)
-
-                elif resp.status_code == 429:
-                    retry_after = resp.headers.get("x-rate-limit-retry-after-seconds", "60")
-                    wait = int(retry_after) if retry_after.isdigit() else 60
-                    progress.console.print(f"  [yellow]OpenSky rate limit hit, waiting {wait}s[/]")
-                    time.sleep(wait)
-                    continue  # retry this window
 
                 else:
                     for day in window_days:
@@ -797,7 +923,7 @@ def fetch_traces_opensky(db: Database, config: Config, hex_code: str, start_date
                     stats["fetched"] += 1
                     progress.advance(task)
 
-            time.sleep(1)  # be gentle with OpenSky
+            time.sleep(config.opensky_rate_limit)  # be gentle with OpenSky (credit-based quota)
 
         db.commit()
 

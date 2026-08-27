@@ -368,7 +368,7 @@ Merged hex -> identity lookup from FAA + Mictronics + hexdb.io. `enrich all` / `
 | type_code | TEXT | ICAO type designator |
 | type_description | TEXT | Type description |
 | operator | TEXT | Registered owner / operator |
-| source | TEXT | Which provider supplied the row (faa / mictronics / hexdb / mil_range) |
+| source | TEXT | Which provider supplied the row (faa / mictronics / hexdb / adsbdb / mil_range, or adsblol_live / adsbfi_live from `resolve`) |
 | is_military | INTEGER | 1 when the hex falls in a `mil_hex_ranges` block |
 | mil_country | TEXT | Country attribution from `mil_hex_ranges` |
 | mil_branch | TEXT | Branch attribution from `mil_hex_ranges` |

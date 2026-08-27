@@ -60,6 +60,48 @@ def test_indicator_column_present_and_collapsed_by_default():
     asyncio.run(scenario())
 
 
+def test_flight_scoped_gate_fields_render_as_columns():
+    """Issue #30: trigger and max_implied_speed_kt used to live only in the
+    raw reason_detail JSON pane; they must render as proper IMPL KT /
+    TRIGGER columns. Legacy day-scoped rows (no such keys) render dashes."""
+
+    async def scenario() -> None:
+        app = _Harness()
+        async with app.run_test():
+            flight_scoped = _row("aaa111", "2026-01-01")
+            flight_scoped = SpoofedBroadcast(
+                icao=flight_scoped.icao,
+                takeoff_time=flight_scoped.takeoff_time,
+                takeoff_date=flight_scoped.takeoff_date,
+                callsign=flight_scoped.callsign,
+                max_altitude=flight_scoped.max_altitude,
+                reason=flight_scoped.reason,
+                reason_detail={
+                    **flight_scoped.reason_detail,
+                    "max_implied_speed_kt": 1684.3,
+                    "trigger": "sil0_plus_teleport",
+                },
+                detected_at=flight_scoped.detected_at,
+            )
+            legacy_day_scoped = _row("bbb222", "2026-01-02")
+            app.view._rows = [flight_scoped, legacy_day_scoped]
+            app.view._rerender("")
+            table = app.view.query_one(DataTable)
+
+            labels = [col.label.plain for col in table.ordered_columns]
+            assert "IMPL KT" in labels
+            assert "TRIGGER" in labels
+            impl_idx = labels.index("IMPL KT")
+            trigger_idx = labels.index("TRIGGER")
+
+            assert table.get_row_at(0)[impl_idx].plain == "1,684"
+            assert table.get_row_at(0)[trigger_idx].plain == "sil0_plus_teleport"
+            assert table.get_row_at(1)[impl_idx].plain == "--"  # widgets.dash() placeholder
+            assert table.get_row_at(1)[trigger_idx].plain == "--"
+
+    asyncio.run(scenario())
+
+
 def test_toggle_detail_expands_shows_minus_and_detail_pane():
     async def scenario() -> None:
         app = _Harness()

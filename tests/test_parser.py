@@ -171,7 +171,9 @@ def test_extracted_flight_carries_extractor_version():
 
     assert count == 1
     flight = db.insert_flight.call_args[0][0]
-    assert flight.extractor_version == EXTRACTOR_VERSION == 1
+    # The literal pin forces a conscious bump: == 2 since the issue #30
+    # integrity surface columns changed what extraction derives.
+    assert flight.extractor_version == EXTRACTOR_VERSION == 2
 
 
 def test_airborne_at_start():
@@ -1713,6 +1715,139 @@ def test_crude_ek_callsign_gate_still_fires():
     assert db.insert_spoofed_broadcast.call_count == 1
     kwargs = db.insert_spoofed_broadcast.call_args[1]
     assert kwargs["reason"] == "crude_heuristic"
+
+
+# ---------------------------------------------------------------------------
+# Integrity/jamming surface columns (#30)
+# ---------------------------------------------------------------------------
+
+
+def _extract_single_flight(trace):
+    """Run extract_flights over one synthetic trace day and return the one
+    inserted Flight."""
+    config = _make_config()
+    rows = [_make_trace_row("2024-06-15", _ts("2024-06-15"), trace)]
+    db = _make_db_mock(rows)
+    with patch("adsbtrack.parser.find_nearest_airport", return_value=None):
+        extract_flights(db, config, "aaaaaa", reprocess=True)
+    assert db.insert_flight.call_count == 1
+    assert db.insert_spoofed_broadcast.call_count == 0
+    return db.insert_flight.call_args[0][0]
+
+
+def test_integrity_columns_populated_on_clean_flight():
+    """A clean flight persists its own v2 counters: full sample count, a
+    0.0 degraded share, a physical implied-speed peak, and flag 0."""
+    t = 0.0
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+    lat = 40.0
+    for _ in range(40):
+        lat += 0.01  # ~36 kt implied between fixes
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=8, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    flight = _extract_single_flight(trace)
+    assert flight.v2_sample_count == 40
+    assert flight.integrity_degraded_pct == 0.0
+    assert flight.max_implied_speed_kt is not None
+    assert flight.max_implied_speed_kt < 100
+    assert flight.integrity_flagged == 0
+
+
+def test_integrity_flag_marks_kept_degraded_flight():
+    """The jammed-but-real corridor profile (moderate sil0, physical
+    speeds) survives the spoof gate but must carry integrity_flagged = 1:
+    its 25% sil0 share crosses the lower integrity_flag_degraded_pct
+    threshold even though the gate's tier 2 lacks teleport corroboration."""
+    t = 0.0
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+    lat = 40.0
+    for i in range(40):
+        lat += 0.13  # ~469 kt implied, physically plausible
+        sil = 0 if i < 10 else 8
+        trace.append(_v2_point(t, lat, -74.0, 35_000, 480, sil=sil, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    flight = _extract_single_flight(trace)
+    assert flight.v2_sample_count == 40
+    assert flight.integrity_degraded_pct == 25.0
+    assert flight.max_implied_speed_kt is not None
+    assert 400 < flight.max_implied_speed_kt < 550
+    assert flight.integrity_flagged == 1
+
+
+def test_integrity_flag_fires_on_corroborated_subquarantine_teleport():
+    """A flight with mild sil0 degradation (2.5%, below the 5% flag floor)
+    plus one implied jump between the 800 kt flag threshold and the 900 kt
+    quarantine threshold stays in flights (quarantine tier 2 needs a >= 10%
+    sil0 share) but is flagged via the corroborated teleport trigger."""
+    t = 0.0
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+    lat = 40.0
+    for i in range(40):
+        # One ~849 kt inter-fix jump (0.236 deg over 60 s) at index 20;
+        # everything else a modest ~36 kt spacing. 1/40 samples sil=0.
+        lat += 0.236 if i == 20 else 0.01
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=0 if i == 0 else 8, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    flight = _extract_single_flight(trace)
+    assert flight.integrity_degraded_pct == 2.5
+    assert flight.max_implied_speed_kt is not None
+    assert 800 < flight.max_implied_speed_kt < 900
+    assert flight.integrity_flagged == 1
+
+
+def test_integrity_flag_ignores_uncorroborated_teleport():
+    """A clean-integrity flight with the same sub-quarantine implied jump
+    must NOT be flagged: standalone teleports are dominated by position-
+    decode garbage in historical traces (2026-08 calibration measured an
+    18.5% false-flag rate on the clean-corridor baseline, implied jumps up
+    to ~468,000 kt on flights with pristine integrity fields), so the
+    teleport trigger requires corroborating sil0 degradation."""
+    t = 0.0
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+    lat = 40.0
+    for i in range(40):
+        lat += 0.236 if i == 20 else 0.01
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=8, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    flight = _extract_single_flight(trace)
+    assert flight.integrity_degraded_pct == 0.0
+    assert flight.max_implied_speed_kt is not None
+    assert 800 < flight.max_implied_speed_kt < 900
+    assert flight.integrity_flagged == 0
+
+
+def test_integrity_pct_below_min_samples_populates_but_does_not_flag():
+    """A flight with fewer than spoof_min_v2_samples v2 samples records its
+    degraded share for the audit trail, but the flag stays 0 -- below the
+    floor the ratio is variance-dominated, the same reasoning the spoof
+    gate applies."""
+    t = 0.0
+    trace = [_make_trace_point(t, 40.0, -74.0, "ground", gs=0)]
+    t += 30.0
+    lat = 40.0
+    for i in range(10):
+        lat += 0.01
+        sil = 0 if i < 5 else 8
+        trace.append(_v2_point(t, lat, -74.0, 10_000, 250, sil=sil, nic=8))
+        t += 60.0
+    trace.append(_make_trace_point(t, lat, -74.0, "ground", gs=5))
+
+    flight = _extract_single_flight(trace)
+    assert flight.v2_sample_count == 10
+    assert flight.integrity_degraded_pct == 50.0
+    assert flight.integrity_flagged == 0
 
 
 def test_extract_flights_skips_corrupt_trace_json_row_with_warning(capsys):

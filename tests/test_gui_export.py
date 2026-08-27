@@ -191,6 +191,48 @@ def test_app_js_flights_table_renders_endpoint_fallbacks(exported_bundle):
     assert "probable_destination_icao" in text
 
 
+def test_flights_by_icao_carries_integrity_fields(tmp_path):
+    """Issue #30: the exported flight JSON carries the integrity surface
+    columns so app.js can render the INTEG pill, and app.js/index.html
+    surface the spoof table's implied-speed and trigger fields."""
+    db_path = tmp_path / "integ_gui.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="896483",
+                takeoff_time=datetime(2026, 5, 19, 10, 0, tzinfo=UTC),
+                takeoff_lat=25.25,
+                takeoff_lon=55.36,
+                takeoff_date="2026-05-19",
+                landing_time=datetime(2026, 5, 19, 16, 0, tzinfo=UTC),
+                landing_type="confirmed",
+                duration_minutes=360.0,
+                v2_sample_count=412,
+                integrity_degraded_pct=21.27,
+                max_implied_speed_kt=612.4,
+                integrity_flagged=1,
+            )
+        )
+        db.refresh_aircraft_stats("896483")
+        db.commit()
+
+    out_dir = tmp_path / "gui_integ"
+    export_gui(db_path, out_dir, focus_hex="896483")
+    data = _load_snapshot(out_dir)
+    flight = data["flights_by_icao"]["896483"][0]
+    assert flight["v2_sample_count"] == 412
+    assert flight["integrity_degraded_pct"] == 21.27
+    assert flight["max_implied_speed_kt"] == 612.4
+    assert flight["integrity_flagged"] is True
+
+    app_js = (out_dir / "app.js").read_text()
+    assert "integrity_flagged" in app_js
+    assert "max_implied_speed_kt" in app_js
+    index_html = (out_dir / "index.html").read_text()
+    assert "IMPL KT" in index_html
+    assert "TRIGGER" in index_html
+
+
 def test_events_status_spoofs_keyed_per_aircraft(exported_bundle):
     out_dir, _ = exported_bundle
     data = _load_snapshot(out_dir)

@@ -2124,6 +2124,61 @@ def test_reopen_migrates_legacy_flight_missing_extractor_version(db_path):
     assert version == SCHEMA_VERSION
 
 
+def test_flights_integrity_columns_present_on_new_db(tmp_path):
+    """A brand-new DB carries the four issue #30 integrity surface columns."""
+    from adsbtrack.db import Database
+
+    with Database(tmp_path / "integ.db") as db:
+        cols = {r[1] for r in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+    assert {"v2_sample_count", "integrity_degraded_pct", "max_implied_speed_kt", "integrity_flagged"} <= cols
+
+
+def test_reopen_migrates_legacy_flight_missing_integrity_columns(db_path):
+    """A flights row written before the issue #30 integrity columns existed
+    must survive the ALTER TABLE ADD COLUMN migration with NULL in all four
+    -- only extract_flights populates real values (see test_parser.py's
+    integrity-columns tests)."""
+    import sqlite3
+
+    from adsbtrack.db import SCHEMA_VERSION
+
+    integrity_cols = ("v2_sample_count", "integrity_degraded_pct", "max_implied_speed_kt", "integrity_flagged")
+
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="leg003",
+                takeoff_time=datetime(2026, 3, 27, 12, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-80.0,
+                takeoff_date="2026-03-27",
+            )
+        )
+
+    raw = sqlite3.connect(db_path)
+    for col in integrity_cols:
+        raw.execute(f"ALTER TABLE flights DROP COLUMN {col}")
+    raw.execute("PRAGMA user_version = 0")
+    raw.commit()
+    raw.close()
+
+    with Database(db_path) as db:
+        cols = {r["name"] for r in db.conn.execute("PRAGMA table_info(flights)").fetchall()}
+        assert set(integrity_cols) <= cols
+        row = db.conn.execute(
+            "SELECT v2_sample_count, integrity_degraded_pct, max_implied_speed_kt, integrity_flagged"
+            " FROM flights WHERE icao = ?",
+            ("leg003",),
+        ).fetchone()
+        for col in integrity_cols:
+            assert row[col] is None
+
+    raw = sqlite3.connect(db_path)
+    version = raw.execute("PRAGMA user_version").fetchone()[0]
+    raw.close()
+    assert version == SCHEMA_VERSION
+
+
 def test_reopen_migrates_trace_days_missing_v2_stat_columns(db_path):
     """A trace_days table literally lacking the four v2_* stat columns
     (the schema state before v2 -- PRAGMA user_version = 1 -- introduced

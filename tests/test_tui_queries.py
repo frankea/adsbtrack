@@ -118,6 +118,10 @@ def _flight_row(**overrides) -> FlightRow:
         max_hover_secs=None,
         nearest_origin_icao=None,
         probable_destination_icao=None,
+        v2_sample_count=None,
+        integrity_degraded_pct=None,
+        max_implied_speed_kt=None,
+        integrity_flagged=None,
     )
     fields.update(overrides)
     return FlightRow(**fields)

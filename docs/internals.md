@@ -208,6 +208,16 @@ Each import validates the file's header line against a required-columns list bef
 
 Conflicts (differing registrations or type codes between sources) are reported in the return value but don't block the write. An independent check against `mil_hex_ranges` runs on every hex and stamps `is_military` / `mil_country` / `mil_branch` regardless of which civilian source supplied the row, so e.g. a hex with a Mictronics registration can still be flagged as military when it sits in a DoD allocation block.
 
+## Export bundles
+
+`adsbtrack export` (`adsbtrack/export.py`) assembles the per-tail deliverable bundle handed to third parties: a hex-scoped SQLite extract (`flights`, `trace_days`, `fetch_log`), `flights.csv`, per-`--window` flight subsets and fragment-level trace CSVs, a `README.md` describing every file, and an optional `analysis.md` identity stub built from `aircraft_registry` / `hex_crossref` / `faa_registry`. It is strictly read-only over the working database.
+
+Three design points worth knowing:
+
+- The extract's table DDL is copied from the source database's `sqlite_master` at export time, so the extract schema tracks the working schema with no second copy to maintain. `trace_days.trace_json` is rewritten as plain JSON text (decoded through the same `db.decode_trace_json` path the parser and forensics use, so legacy TEXT rows and compressed BLOB rows both export) - recipients read traces in any SQLite browser with no zlib step.
+- `--window START:END` accepts dates or datetimes. The separator colon is found by shape, not position (END always starts with `YYYY-MM-DD`), so datetime windows like `2026-04-21T14:00:2026-04-22` parse unambiguously. A bare date covers its whole UTC day; flight subsets use overlap semantics (any part of the flight inside the window); trace CSVs filter point-by-point on absolute timestamp, scanning from one day before the window start to catch a trace day spilling past its own midnight.
+- Trace CSV rows are native resolution: every source's points merged chronologically, no dedup, no forward-fill - a blank callsign means "not broadcast on this sample". Cross-source near-duplicates are kept deliberately as evidence of independent reception.
+
 ## Interactive surfaces (TUI + GUI)
 
 Two read-only surfaces sit on top of the same `adsbtrack.db`. Neither introduces a

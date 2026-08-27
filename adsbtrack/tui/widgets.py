@@ -188,6 +188,14 @@ class StatusStrip(Label):
         txt = Text.from_markup(left)
         right = Text.from_markup(sep.join(right_parts))
         total_width = max(1, _widget_width(self) - 2)
+        # The PR #15 chrome rework floored the gap at 1 cell, so on a
+        # narrow terminal the composed line overflowed the strip and the
+        # Label clipped its right end: the live parts (job, UTC clock)
+        # vanished while the static left half stayed. Shrink the left
+        # half with an ellipsis instead so the right side always fits.
+        avail_left = total_width - right.cell_len - 1
+        if txt.cell_len > avail_left:
+            txt.truncate(max(1, avail_left), overflow="ellipsis")
         gap = max(1, total_width - txt.cell_len - right.cell_len)
         txt.append(" " * gap)
         txt.append(right)
@@ -352,12 +360,16 @@ _VIEWS: list[tuple[str, str, str]] = [
     ("status", "Status dashboard", "6"),
 ]
 
+# Every OPERATIONS row opens the same ops view, but only the first row
+# (the "f" entry point) carries the "ops" view id: keying them all "ops"
+# made set_active("ops") highlight the whole group at once. The other
+# rows use distinct never-active ids so exactly one row lights up.
 _OPS: list[tuple[str, str, str]] = [
     ("ops", "fetch", "f"),
-    ("ops", "extract", ""),
-    ("ops", "enrich", ""),
-    ("ops", "acars", ""),
-    ("ops", "registry", ""),
+    ("ops-extract", "extract", ""),
+    ("ops-enrich", "enrich", ""),
+    ("ops-acars", "acars", ""),
+    ("ops-registry", "registry", ""),
 ]
 
 _SESSION: list[tuple[str, str, str]] = [

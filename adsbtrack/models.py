@@ -267,7 +267,7 @@ class Flight:
     # before this column existed.
     extractor_version: int | None = None
 
-    # --- v4: integrity/jamming surface (issue #30) ---
+    # --- v5: integrity/jamming surface (issue #30) ---
     # Flight-scoped DO-260B v2 integrity stats, surfaced from the same
     # FlightMetrics counters the spoof gate reads (parser._flight_is_spoofed)
     # so the columns and the gate can never disagree. All four are NULL on

@@ -679,6 +679,32 @@ def test_status_snapshot_missions_filters_nulls_and_limits_to_six(tmp_path):
     assert snap["missions"][0] == ("training", 2), "ORDER BY n DESC head not pinned"
 
 
+def test_status_snapshot_mission_type_count_sees_past_the_limit(tmp_path):
+    """#31: the status card wants a "+N more" indicator when the LIMIT 6
+    missions head hides types, so the snapshot carries the full distinct
+    count (null/empty excluded, matching the missions list's filter)."""
+    db_path = tmp_path / "missions_count.db"
+    with Database(db_path) as db:
+        icao = "fff777"
+        db.insert_flight(_flight(icao, hour=1, mission_type=None))
+        db.insert_flight(_flight(icao, hour=2, mission_type="training"))
+        for hour, name in enumerate(
+            ["training", "transport", "cargo", "medical", "survey", "patrol", "sightseeing"], start=3
+        ):
+            db.insert_flight(_flight(icao, hour=hour, mission_type=name))
+        db.refresh_aircraft_stats(icao)
+        db.commit()
+        snap = status_snapshot(db, icao)
+    assert len(snap["missions"]) == 6
+    assert snap["mission_type_count"] == 7, "distinct non-null mission types, not capped by the list's LIMIT"
+
+
+def test_status_snapshot_mission_type_count_zero_for_unknown_icao(seeded_db):
+    with Database(seeded_db) as db:
+        snap = status_snapshot(db, "ffffff")
+    assert snap["mission_type_count"] == 0
+
+
 def test_status_snapshot_sources_returns_none_when_all_points_zero(tmp_path):
     db_path = tmp_path / "zero_points.db"
     with Database(db_path) as db:
@@ -817,3 +843,84 @@ def test_daily_activity_scoped_to_icao(tmp_path):
         rows = daily_activity(db, "ooo555", days=52, today=today)
     by_date = {r.date: r.flight_count for r in rows}
     assert by_date["2026-06-30"] == 1
+
+
+# ---------------------------------------------------------------------------
+# flight_wx (issue #26)
+# ---------------------------------------------------------------------------
+
+
+def _seed_endpoint_metars(db: Database) -> None:
+    db.upsert_metars(
+        [
+            {
+                "station": "KEWR",
+                "obs_time": "2026-03-01T11:51:00+00:00",
+                "metar_type": "METAR",
+                "raw_text": "METAR KEWR 011151Z 31015KT CAVOK 10/02",
+                "flight_category": "VFR",
+            },
+            {
+                "station": "KBOS",
+                "obs_time": "2026-03-01T13:54:00+00:00",
+                "metar_type": "SPECI",
+                "raw_text": "SPECI KBOS 011354Z 04022G31KT 1SM SN",
+                "flight_category": "IFR",
+            },
+            {
+                "station": "KBOS",
+                "obs_time": "2026-03-01T20:54:00+00:00",  # outside the landing window
+                "metar_type": "METAR",
+                "raw_text": "METAR KBOS 012054Z 00000KT CAVOK",
+            },
+        ]
+    )
+
+
+def test_flight_wx_returns_windowed_metars_per_endpoint(seeded_db):
+    from adsbtrack.tui.queries import flight_wx
+
+    with Database(seeded_db) as db:
+        _seed_endpoint_metars(db)
+        db.commit()
+        row = list_flights(db, "aaa111")[0]
+        assert row.landing_time == "2026-03-01T14:00:00+00:00"
+        wx = flight_wx(db, row, window_hours=3.0)
+    assert set(wx) == {"origin", "destination"}
+    assert [m.station for m in wx["origin"]] == ["KEWR"]
+    assert wx["origin"][0].flight_category == "VFR"
+    assert [m.raw_text for m in wx["destination"]] == ["SPECI KBOS 011354Z 04022G31KT 1SM SN"]
+    assert wx["destination"][0].metar_type == "SPECI"
+
+
+def test_flight_wx_empty_when_no_stored_metars(seeded_db):
+    from adsbtrack.tui.queries import flight_wx
+
+    with Database(seeded_db) as db:
+        row = list_flights(db, "aaa111")[0]
+        assert flight_wx(db, row, window_hours=3.0) == {}
+
+
+def test_flight_wx_skips_unmatched_endpoints(tmp_path):
+    from adsbtrack.tui.queries import flight_wx
+
+    db_path = tmp_path / "wx_endpoints.db"
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="cc33dd",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.0,
+                takeoff_lon=-74.0,
+                takeoff_date="2026-03-01",
+                origin_icao=None,  # off-airport departure
+                destination_icao="KBOS",
+                landing_time=datetime(2026, 3, 1, 14, 0, tzinfo=UTC),
+                landing_type="confirmed",
+            )
+        )
+        _seed_endpoint_metars(db)
+        db.commit()
+        row = list_flights(db, "cc33dd")[0]
+        wx = flight_wx(db, row, window_hours=3.0)
+    assert set(wx) == {"destination"}

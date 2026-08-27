@@ -19,6 +19,7 @@ on any hex that falls into a known military allocation block.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -204,14 +205,14 @@ class HexdbClient:
             self._sleep(self._min_interval - elapsed)
         self._last_call = time.monotonic()
 
-    def get_aircraft(self, hex_code: str) -> dict | None:
-        """GET /api/v1/aircraft/{HEX}. Returns the parsed JSON on 200,
-        or None on 404 (including 404s returned as JSON bodies)."""
-        url = f"{self.base_url}/api/v1/aircraft/{hex_code.upper()}"
+    def _get(self, url: str, params: dict | None = None) -> httpx.Response | None:
+        """Shared throttle + retry loop for hexdb.io GETs. Returns the 200
+        response, or None on 404. Retries network errors and 5xx with
+        exponential backoff and honors Retry-After on 429."""
         for attempt in range(self.MAX_RETRIES + 1):
             self._throttle()
             try:
-                response = self._client.get(url)
+                response = self._client.get(url, params=params)
             except httpx.RequestError as exc:
                 if attempt >= self.MAX_RETRIES:
                     raise HexCrossrefError(f"hexdb.io network error after {attempt} retries: {exc}") from exc
@@ -219,12 +220,7 @@ class HexdbClient:
                 continue
 
             if response.status_code == 200:
-                payload = response.json()
-                # hexdb.io sometimes returns 200 with a {"status":"404"}
-                # body for unknown hexes. Normalize that to None.
-                if isinstance(payload, dict) and str(payload.get("status", "")) == "404":
-                    return None
-                return payload
+                return response
 
             if response.status_code == 404:
                 return None
@@ -242,9 +238,36 @@ class HexdbClient:
                 self._sleep(2**attempt)
                 continue
 
-            raise HexCrossrefError(f"hexdb.io HTTP {response.status_code} for {hex_code}: {response.text[:200]}")
+            raise HexCrossrefError(f"hexdb.io HTTP {response.status_code} for {url}: {response.text[:200]}")
 
-        raise HexCrossrefError(f"hexdb.io retries exhausted for {hex_code}")
+        raise HexCrossrefError(f"hexdb.io retries exhausted for {url}")
+
+    def get_aircraft(self, hex_code: str) -> dict | None:
+        """GET /api/v1/aircraft/{HEX}. Returns the parsed JSON on 200,
+        or None on 404 (including 404s returned as JSON bodies)."""
+        response = self._get(f"{self.base_url}/api/v1/aircraft/{hex_code.upper()}")
+        if response is None:
+            return None
+        payload = response.json()
+        # hexdb.io sometimes returns 200 with a {"status":"404"}
+        # body for unknown hexes. Normalize that to None.
+        if isinstance(payload, dict) and str(payload.get("status", "")) == "404":
+            return None
+        return payload
+
+    def get_registration_hex(self, registration: str) -> str | None:
+        """GET /reg-hex?reg={REG}: hexdb.io's registration -> Mode-S
+        converter (plain-text response). Returns a lowercase 6-char hex,
+        or None when hexdb doesn't know the registration (HTTP 404 with
+        an "n/a" body). Covers non-FAA registrations the algorithmic
+        N-number converter can't handle (issue #27)."""
+        response = self._get(f"{self.base_url}/reg-hex", params={"reg": registration.strip().upper()})
+        if response is None:
+            return None
+        text = response.text.strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{6}", text):
+            return None
+        return text
 
 
 def _hexdb_payload_to_crossref(hex_code: str, payload: dict) -> dict:

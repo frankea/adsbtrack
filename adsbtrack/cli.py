@@ -22,7 +22,8 @@ from .airports import download_airports, enrich_helipad_names
 from .config import SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database, iter_parsed_trace_days
 from .events import collect_events
-from .fetcher import fetch_traces, fetch_traces_opensky
+from .export import export_bundle, parse_windows
+from .fetcher import fetch_traces, fetch_traces_opensky, opensky_credentials_available
 from .forensics import (
     DEFAULT_FRAGMENT_GAP_SECS,
     callsign_timeline,
@@ -31,6 +32,7 @@ from .forensics import (
     summarize_fragments,
 )
 from .gaps import detect_gaps
+from .metar import MetarError, fetch_flight_endpoint_metars, fetch_metars, stored_metars_near
 from .models import LandingType
 from .navaids import refresh_navaids as _refresh_navaids
 from .nnumber import nnumber_to_icao
@@ -327,18 +329,7 @@ def fetch(
             # sources_to_fetch is computed first, then filtered by source
             # health (below), then per-source start dates.
             sources_to_fetch = list(SOURCE_URLS.keys())
-            opensky_available = bool(os.environ.get("OPENSKY_CLIENT_ID") and os.environ.get("OPENSKY_CLIENT_SECRET"))
-            if not opensky_available:
-                # Check credentials.json fallback
-                creds_path = config.credentials_path
-                if creds_path.exists():
-                    import json
-
-                    try:
-                        creds = json.loads(creds_path.read_text())
-                        opensky_available = bool(creds.get("clientId") and creds.get("clientSecret"))
-                    except Exception:
-                        pass
+            opensky_available = opensky_credentials_available(config)
             if opensky_available:
                 sources_to_fetch.append("opensky")
 
@@ -499,26 +490,33 @@ def fetch(
             ) as shared_progress:
 
                 def _fetch_one(src: str) -> None:
-                    with Database(Path(db_path)) as thread_db:
-                        thread_config = _load_config(db_path)
-                        thread_config.rate_limit = rate
-                        thread_config.fetch_concurrency = concurrency
-                        src_start = per_source_start[src]
-                        if src == "opensky":
-                            stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
-                        else:
-                            stats = fetch_traces(
-                                thread_db,
-                                thread_config,
-                                hex_code,
-                                src_start,
-                                end,
-                                source=src,
-                                progress=shared_progress,
-                            )
+                    try:
+                        with Database(Path(db_path)) as thread_db:
+                            thread_config = _load_config(db_path)
+                            thread_config.rate_limit = rate
+                            thread_config.fetch_concurrency = concurrency
+                            src_start = per_source_start[src]
+                            if src == "opensky":
+                                stats = fetch_traces_opensky(thread_db, thread_config, hex_code, src_start, end)
+                            else:
+                                stats = fetch_traces(
+                                    thread_db,
+                                    thread_config,
+                                    hex_code,
+                                    src_start,
+                                    end,
+                                    source=src,
+                                    progress=shared_progress,
+                                )
+                            with lock:
+                                per_source_stats[src] = stats
+                                _accumulate(stats)
+                    except RuntimeError as e:
+                        # e.g. an OpenSky token rejection. One broken source
+                        # must not take down the other sources' threads or
+                        # crash the run; report it and let the rest finish.
                         with lock:
-                            per_source_stats[src] = stats
-                            _accumulate(stats)
+                            shared_progress.console.print(f"[red]{src} failed: {e}[/]")
 
                 threads = [threading.Thread(target=_fetch_one, args=(src,)) for src in sources_to_fetch]
                 for t in threads:
@@ -538,7 +536,12 @@ def fetch(
             src = sources_to_fetch[0]
             src_start = per_source_start[src]
             if src == "opensky":
-                stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
+                try:
+                    stats = fetch_traces_opensky(db, config, hex_code, src_start, end)
+                except RuntimeError as e:
+                    # Missing credentials / rejected token: a usage problem,
+                    # not a crash - surface it without a traceback.
+                    raise click.ClickException(str(e)) from e
             else:
                 stats = fetch_traces(db, config, hex_code, src_start, end, source=src)
             _accumulate(stats)
@@ -718,13 +721,72 @@ def acars(hex_code, tail_number, start_date, end_date, db_path):
     default=False,
     help="Show the primary squawk code held by each flight.",
 )
+@click.option(
+    "--verbose",
+    "-v",
+    is_flag=True,
+    default=False,
+    help=(
+        "Show stored METAR/SPECI history around each flight's endpoints "
+        "(reads the local metars table only; populate it with --fetch-wx or the wx command)."
+    ),
+)
+@click.option(
+    "--fetch-wx",
+    "fetch_wx",
+    is_flag=True,
+    default=False,
+    help=(
+        "Fetch missing endpoint METARs from aviationweather.gov into the metars table before "
+        "rendering (network; the API serves ~30 days of history, older flights are skipped)."
+    ),
+)
 @_json_option()
 @_db_option()
-def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, show_squawk, output_json, db_path):
+def trips(
+    hex_code,
+    tail_number,
+    from_date,
+    to_date,
+    airport,
+    show_alignment,
+    show_squawk,
+    verbose,
+    fetch_wx,
+    output_json,
+    db_path,
+):
     """Show flight history."""
+    config = _load_config(db_path)
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
         flights = db.get_flights(hex_code, from_date, to_date, airport)
+
+        if fetch_wx:
+            wx_stored = 0
+            for f in flights:
+                stored, warnings = fetch_flight_endpoint_metars(db, config, f)
+                wx_stored += stored
+                for warning in warnings:
+                    click.echo(f"wx: {warning}", err=True)
+            db.commit()
+            click.echo(f"wx: stored {wx_stored} observations", err=True)
+
+        def _flight_wx(f):
+            """Stored METARs near this flight's endpoints, keyed origin /
+            destination. Shared by the --json and table --verbose paths so
+            the two never diverge. Local-table reads only -- no network."""
+            wx = {}
+            for label, station, event_iso in (
+                ("origin", f["origin_icao"], f["takeoff_time"]),
+                ("destination", f["destination_icao"], f["landing_time"]),
+            ):
+                if not station or not event_iso:
+                    continue
+                rows = stored_metars_near(db, station, event_iso, window_hours=config.metar_window_hours)
+                if rows:
+                    wx[label] = rows
+            return wx
 
         if not flights:
             if output_json:
@@ -805,6 +867,20 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
                     row["aligned_seconds"] = _col(f, "aligned_seconds")
                 if show_squawk_col:
                     row["primary_squawk"] = _col(f, "primary_squawk")
+                if verbose:
+                    row["wx"] = {
+                        label: [
+                            {
+                                "station": m["station"],
+                                "obs_time": m["obs_time"],
+                                "metar_type": m["metar_type"],
+                                "flight_category": m["flight_category"],
+                                "raw_text": m["raw_text"],
+                            }
+                            for m in metars
+                        ]
+                        for label, metars in _flight_wx(f).items()
+                    }
                 rows.append(row)
             click.echo(json.dumps(rows, indent=2))
             return
@@ -929,6 +1005,101 @@ def trips(hex_code, tail_number, from_date, to_date, airport, show_alignment, sh
 
         console.print(table)
         console.print(f"\nTotal: {len(flights)} flights")
+
+        if verbose:
+            half = config.metar_window_hours / 2
+            printed_header = False
+            for f in flights:
+                wx = _flight_wx(f)
+                if not wx:
+                    continue
+                if not printed_header:
+                    console.print(f"\n[bold]Weather[/] (stored METARs within {half:g}h of each endpoint)")
+                    printed_header = True
+                date_str = f["takeoff_time"][:10] if f["takeoff_time"] else "?"
+                console.print(f"\n[cyan]{date_str}[/] {f['origin_icao'] or '?'} -> {f['destination_icao'] or '?'}")
+                for label in ("origin", "destination"):
+                    metars = wx.get(label)
+                    if not metars:
+                        continue
+                    console.print(f"  [dim]{label} {metars[0]['station']}[/]")
+                    for m in metars:
+                        console.print(f"    [dim]{m['obs_time'][11:16]}Z[/] {escape(m['raw_text'])}")
+            if not printed_header:
+                console.print(
+                    "\n[yellow]No stored METARs near these flights - populate with "
+                    "`trips --fetch-wx` or `adsbtrack wx <station>`[/]"
+                )
+
+
+@cli.command()
+@click.argument("stations", nargs=-1, required=True)
+@click.option(
+    "--hours",
+    type=float,
+    default=None,
+    help="Lookback hours (default: wx_default_hours from config, 6).",
+)
+@click.option(
+    "--date",
+    "date_str",
+    default=None,
+    help=(
+        "Anchor time (ISO 8601 UTC, e.g. 2026-08-10T12:00Z); history is fetched looking back "
+        "--hours from it. Defaults to now. The API serves ~30 days of history."
+    ),
+)
+@_json_option()
+@_db_option()
+def wx(stations, hours, date_str, output_json, db_path):
+    """Fetch METAR/SPECI history for one or more stations (e.g. OMAA KTYS).
+
+    Live passthrough to the aviationweather.gov data API. Every
+    observation is also stored in the metars table (deduped by station +
+    observation time) so `trips --verbose` and the TUI flight detail can
+    surface it later, long after the API's ~30-day window has closed.
+    """
+    config = _load_config(db_path)
+    if hours is None:
+        hours = config.wx_default_hours
+    anchor = None
+    if date_str:
+        try:
+            anchor = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+        except ValueError:
+            raise click.BadParameter("expected ISO 8601, e.g. 2026-08-10T12:00Z", param_hint="--date") from None
+
+    try:
+        metars = fetch_metars(list(stations), hours=hours, date=anchor, config=config)
+    except MetarError as exc:
+        console.print(f"[red]{exc}[/]")
+        sys.exit(1)
+
+    with Database(Path(db_path)) as db:
+        stored = db.upsert_metars(dataclasses.asdict(m) for m in metars)
+
+    if output_json:
+        click.echo(json.dumps([dataclasses.asdict(m) for m in metars], indent=2))
+        return
+
+    if not metars:
+        console.print("[yellow]No observations returned[/]")
+        return
+
+    table = Table(title="METAR history")
+    table.add_column("Station", style="cyan")
+    table.add_column("Time", style="dim")
+    table.add_column("Type", style="dim")
+    table.add_column("Cat")
+    table.add_column("Raw")
+    for m in sorted(metars, key=lambda m: (m.station, m.obs_time), reverse=True):
+        cat = m.flight_category or ""
+        cat_cell = {"VFR": f"[green]{cat}[/]", "MVFR": f"[blue]{cat}[/]", "IFR": f"[red]{cat}[/]"}.get(
+            cat, f"[magenta]{cat}[/]" if cat else "[dim]--[/]"
+        )
+        table.add_row(m.station, f"{m.obs_time[:10]} {m.obs_time[11:16]}Z", m.metar_type or "?", cat_cell, m.raw_text)
+    console.print(table)
+    console.print(f"\n{len(metars)} observations ({stored} stored in metars table)")
 
 
 @cli.command()
@@ -1275,14 +1446,170 @@ def status(hex_code, tail_number, output_json, db_path):
 
 
 @cli.command()
-@click.option("--tail", "tail_number", required=True, help="FAA N-number (e.g. N512WB)")
-def lookup(tail_number):
-    """Convert an FAA N-number to an ICAO hex code."""
+@click.argument("query", required=False)
+@click.option("--tail", "tail_number", default=None, help="Deprecated alias for QUERY (kept for old scripts).")
+@click.option("--offline", is_flag=True, help="Local sources only: skip the hexdb.io and adsbdb fallbacks.")
+@click.option(
+    "--mictronics-dir",
+    type=click.Path(path_type=Path, file_okay=False),
+    default=None,
+    help="Directory holding Mictronics JSON files (defaults to config path).",
+)
+@_json_option()
+@_db_option()
+def lookup(query, tail_number, offline, mictronics_dir, output_json, db_path):
+    """Resolve an aircraft identity from an ICAO hex or a registration.
+
+    QUERY is either a 6-digit ICAO hex (e.g. 896483) or a registration in
+    any country's format (A6-EUY, ZK019, N512WB). Local sources are
+    consulted first (hex_crossref cache, FAA registry, Mictronics); the
+    online fallback tries hexdb.io then adsbdb and caches what it finds
+    into hex_crossref. A hex inside a known military allocation block is
+    annotated even when no identity source resolves it. Exit code is 1
+    when the query produced no answer at all.
+    """
+    from .hex_crossref import HexdbClient, _load_mictronics_files
+    from .lookup import AdsbdbClient, lookup_aircraft
+
+    if query and tail_number:
+        raise click.UsageError("Provide QUERY or --tail, not both.")
+    query = query or tail_number
+    if not query:
+        raise click.UsageError("Provide a hex or registration to look up.")
+
+    cfg = _load_config(db_path)
+    resolved_mictronics = mictronics_dir or cfg.mictronics_cache_dir
+    mictronics_cache = None
+    if (resolved_mictronics / "aircrafts.json").exists():
+        aircrafts, types, operators, _ = _load_mictronics_files(resolved_mictronics)
+        mictronics_cache = (aircrafts, types, operators)
+
+    hexdb_client: HexdbClient | None = None
+    adsbdb_client: AdsbdbClient | None = None
+    if not offline:
+        hexdb_client = HexdbClient(base_url=cfg.hexdb_base_url, rate_limit_per_min=cfg.hexdb_rate_limit_per_min)
+        adsbdb_client = AdsbdbClient(base_url=cfg.adsbdb_base_url, rate_limit_per_min=cfg.adsbdb_rate_limit_per_min)
+
     try:
-        hex_code = nnumber_to_icao(tail_number)
-    except ValueError as e:
-        raise click.BadParameter(str(e), param_hint="--tail") from e
-    console.print(hex_code)
+        with Database(cfg.db_path) as db:
+            result = lookup_aircraft(
+                db,
+                query,
+                hexdb_client=hexdb_client,
+                adsbdb_client=adsbdb_client,
+                mictronics_cache=mictronics_cache,
+            )
+    finally:
+        for client in (hexdb_client, adsbdb_client):
+            if client is not None:
+                client.close()
+
+    if output_json:
+        click.echo(json.dumps(dataclasses.asdict(result), indent=2))
+        if not result.resolved:
+            sys.exit(1)
+        return
+
+    if result.hex_code is None:
+        console.print(f"[yellow]Could not resolve {result.query!r} to an ICAO hex.[/]")
+        for note in result.notes:
+            console.print(f"  [dim]{note}[/]")
+        sys.exit(1)
+
+    if result.record is not None:
+        _print_hex_crossref_row(result.record)
+        if result.country:
+            console.print(f"  Country:         {result.country}")
+    else:
+        if result.kind == "registration":
+            console.print(f"  ICAO hex:        [bold]{result.hex_code}[/]")
+        console.print(f"[yellow]No identity record found for hex {result.hex_code}.[/]")
+    if result.derived_registration:
+        console.print(f"  Derived tail:    {result.derived_registration} [dim](algorithmic N-number, unverified)[/]")
+    if result.mil_range:
+        mil = result.mil_range
+        console.print(f"\n[bold red]Military allocation:[/] {mil['country']} {mil['branch']}")
+        console.print(f"  Range:  {mil['range_start']}-{mil['range_end']}")
+        if mil["notes"]:
+            console.print(f"  Notes:  {mil['notes']}")
+    if result.conflicts:
+        console.print("\n[bold yellow]Source conflicts:[/]")
+        for note in result.conflicts:
+            console.print(f"  - {note}")
+    if not result.resolved:
+        sys.exit(1)
+
+
+@cli.command()
+@click.argument("callsign")
+@click.option("--no-cache", is_flag=True, help="Do not cache matches into hex_crossref.")
+@_json_option()
+@_db_option()
+def resolve(callsign, no_cache, output_json, db_path):
+    """Resolve a live callsign to airframe hex + registration.
+
+    Queries the open live-traffic APIs (adsb.lol, then adsb.fi) for
+    currently-airborne aircraft broadcasting CALLSIGN and prints hex,
+    registration, and type for each match. Live-only: an aircraft that is
+    not broadcasting right now will not be found - historical callsign
+    search is out of scope. Matches are cached into hex_crossref so
+    follow-on fetch/extract runs can resolve the tail offline. Exit code
+    is 1 when nothing matched, 2 when every network errored.
+    """
+    from .resolve import LiveNetworkClient, resolve_callsign
+
+    normalized = callsign.strip().upper()
+    if not normalized:
+        raise click.UsageError("Provide a non-empty callsign.")
+
+    cfg = _load_config(db_path)
+    clients = [
+        LiveNetworkClient(name, url, rate_limit_per_min=cfg.resolve_rate_limit_per_min)
+        for name, url in cfg.resolve_source_urls.items()
+    ]
+    try:
+        with Database(cfg.db_path) as db:
+            matches, errors = resolve_callsign(db, normalized, clients=clients, cache=not no_cache)
+    finally:
+        for client in clients:
+            client.close()
+
+    if output_json:
+        payload = {
+            "callsign": normalized,
+            "matches": [dataclasses.asdict(m) for m in matches],
+            "errors": errors,
+        }
+        click.echo(json.dumps(payload, indent=2))
+    else:
+        for name, err in errors.items():
+            console.print(f"[yellow]{name}: {escape(err)}[/]")
+        if matches:
+            table = Table(title=f"Live matches for {normalized}")
+            table.add_column("Hex")
+            table.add_column("Registration")
+            table.add_column("Type")
+            table.add_column("Altitude")
+            table.add_column("GS kt")
+            table.add_column("Seen by")
+            for m in matches:
+                alt = str(m.alt_baro) if m.alt_baro is not None else "-"
+                gs = f"{m.ground_speed:.0f}" if m.ground_speed is not None else "-"
+                type_display = m.type_code or "-"
+                if m.type_description:
+                    type_display = f"{type_display} ({m.type_description})"
+                table.add_row(m.hex_code, m.registration or "-", type_display, alt, gs, ", ".join(m.networks))
+            console.print(table)
+            if not no_cache:
+                console.print("[dim]Matches cached into hex_crossref; fetch/extract can now use --hex or --tail.[/]")
+        else:
+            queried = [c.name for c in clients if c.name not in errors]
+            where = ", ".join(queried) if queried else "any network"
+            console.print(f"[yellow]No currently-airborne aircraft broadcasting {normalized!r} on {where}.[/]")
+            console.print("[dim]resolve is live-only; try again while the flight is in the air.[/]")
+
+    if not matches:
+        sys.exit(2 if len(errors) == len(clients) else 1)
 
 
 @cli.command()
@@ -2106,6 +2433,69 @@ def events(hex_code, tail_number, db_path, since_str, severity, output_json):
     console.print(
         f"\n[bold]Summary:[/] [red]{summary['emergency']} emergency[/], [yellow]{summary['unusual']} unusual[/]"
     )
+
+
+# -----------------------------------------------------------------------------
+# export (#25)
+# -----------------------------------------------------------------------------
+
+
+@cli.command("export")
+@click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
+@click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
+@click.option(
+    "--window",
+    "window_specs",
+    multiple=True,
+    help="START:END date or datetime window (repeatable). Adds flights_<window>.csv and trace_<window>.csv.",
+)
+@click.option("--out", "out_dir", default=None, help="Bundle directory (default: <Config.export_dir>/<hex>/)")
+@click.option("--analysis", "include_analysis", is_flag=True, help="Also write an analysis.md identity stub")
+@click.option("--zip", "make_zip", is_flag=True, help="Also write <out-dir>.zip next to the bundle directory")
+@_db_option()
+def export_cmd(hex_code, tail_number, window_specs, out_dir, include_analysis, make_zip, db_path):
+    """Write a per-tail deliverable bundle: SQLite extract, CSVs, README.
+
+    Assembles the package handed to third parties (journalists,
+    researchers): a hex-scoped SQLite extract (flights, trace_days with
+    traces decompressed to plain JSON, fetch_log), flights.csv, per-window
+    flight subsets and fragment-level trace CSVs, a README.md describing
+    every file, and (with --analysis) an identity-stub analysis.md.
+    Read-only over the working database.
+    """
+    try:
+        windows = parse_windows(window_specs)
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+
+    with Database(Path(db_path)) as db:
+        hex_code = _resolve_hex_db(db, hex_code, tail_number)
+        config = _load_config(db_path)
+        bundle_dir = Path(out_dir) if out_dir else Path(config.export_dir) / hex_code
+        try:
+            result = export_bundle(
+                db,
+                hex_code,
+                bundle_dir,
+                windows,
+                include_analysis=include_analysis,
+                make_zip=make_zip,
+                tool_version=_get_version(),
+            )
+        except ValueError as exc:
+            raise click.UsageError(str(exc)) from exc
+
+    console.print(f"[green]Wrote {len(result.files)} files to {result.out_dir}[/]")
+    console.print(
+        f"  flights: {result.flight_count}  trace days: {result.trace_day_count}  fetch log: {result.fetch_log_count}"
+    )
+    for window in windows:
+        console.print(
+            f"  window {window.spec}: {result.window_flight_counts[window.label]} flights, "
+            f"{result.window_point_counts[window.label]} trace points"
+        )
+    if result.zip_path:
+        console.print(f"  zip: {result.zip_path}")
 
 
 # -----------------------------------------------------------------------------

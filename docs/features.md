@@ -158,6 +158,10 @@ Matched timestamps are anchored to the flight's calendar day (+/-1 day) via clos
 
 Every hex is also checked against `mil_hex_ranges` independently of the civilian identity sources: a hex can carry a Mictronics registration AND be flagged `is_military=1` with country / branch attribution, which surfaces government-operated aircraft sitting in known military allocation blocks (e.g. Bell 407s in the US DoD AE-prefix range).
 
+`lookup <hex|registration>` runs the same merge for a single ad-hoc query - any country's registration format, not just FAA N-numbers - and adds a final adsbdb fallback for foreign airframes hexdb.io misses, caching whatever it finds into `hex_crossref`. An unresolvable hex inside a military allocation block still gets the range annotation (country, branch, notes) as its answer.
+
+`resolve <callsign>` covers the remaining entry point: casework that starts from a flight number. It asks the open live-traffic APIs (adsb.lol, then adsb.fi) which airframes are broadcasting that callsign right now and returns hex + registration + type per match, caching identities into `hex_crossref` under a `<network>_live` tag (never overwriting an existing identity row). Live-only: historical callsign search is out of scope.
+
 ## Navaid alignment
 
 **Column:** `navaid_track` (JSON string or NULL).

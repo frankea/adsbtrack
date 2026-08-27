@@ -3172,3 +3172,203 @@ def test_watch_continues_after_one_hex_fails(tmp_path, monkeypatch):
     assert "bb77cc" in result.output
     assert "baselined" in result.output
     assert "failed" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# wx command + trips --verbose METAR surfacing (issue #26)
+# ---------------------------------------------------------------------------
+
+
+def _wx_sample_metars():
+    from adsbtrack.metar import Metar
+
+    return [
+        Metar(
+            station="KTYS",
+            obs_time="2026-08-21T23:53:00+00:00",
+            metar_type="METAR",
+            raw_text="METAR KTYS 212353Z 34004KT 10SM 27/22 A2996",
+            flight_category="VFR",
+        ),
+        Metar(
+            station="KTYS",
+            obs_time="2026-08-21T22:48:00+00:00",
+            metar_type="SPECI",
+            raw_text="SPECI KTYS 212248Z VRB03G41KT 2SM +TSRA",
+            flight_category="IFR",
+        ),
+    ]
+
+
+def test_wx_fetches_stores_and_prints(tmp_path, monkeypatch):
+    from adsbtrack import cli as cli_module
+
+    calls = {}
+
+    def fake_fetch_metars(stations, *, hours, date=None, config=None, client=None):
+        calls["stations"] = list(stations)
+        calls["hours"] = hours
+        calls["date"] = date
+        return _wx_sample_metars()
+
+    monkeypatch.setattr(cli_module, "fetch_metars", fake_fetch_metars)
+    db_path = tmp_path / "wx.db"
+    result = CliRunner().invoke(cli, ["wx", "ktys", "--hours", "3", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert calls["stations"] == ["ktys"]
+    assert calls["hours"] == 3.0
+    assert calls["date"] is None
+    assert "212353Z" in result.output
+    assert "SPECI" in result.output
+    assert "2 observations (2 stored" in result.output
+    with Database(db_path) as db:
+        rows = db.get_metars("KTYS", "2026-08-21T00:00:00+00:00", "2026-08-22T00:00:00+00:00")
+    assert len(rows) == 2
+
+
+def test_wx_hours_defaults_from_config_and_date_parses(tmp_path, monkeypatch):
+    from adsbtrack import cli as cli_module
+
+    calls = {}
+
+    def fake_fetch_metars(stations, *, hours, date=None, config=None, client=None):
+        calls["hours"] = hours
+        calls["date"] = date
+        return []
+
+    monkeypatch.setattr(cli_module, "fetch_metars", fake_fetch_metars)
+    result = CliRunner().invoke(cli, ["wx", "OMAA", "--date", "2026-08-10T12:00Z", "--db", str(tmp_path / "wx.db")])
+    assert result.exit_code == 0, result.output
+    assert calls["hours"] == 6.0  # Config.wx_default_hours
+    assert calls["date"] == datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+    assert "No observations" in result.output
+
+
+def test_wx_bad_date_rejected(tmp_path):
+    result = CliRunner().invoke(cli, ["wx", "OMAA", "--date", "yesterday", "--db", str(tmp_path / "wx.db")])
+    assert result.exit_code != 0
+    assert "ISO 8601" in result.output
+
+
+def test_wx_api_error_exits_nonzero(tmp_path, monkeypatch):
+    from adsbtrack import cli as cli_module
+    from adsbtrack.metar import MetarError
+
+    def fake_fetch_metars(*args, **kwargs):
+        raise MetarError("aviationweather.gov: Data is available for up to 30 days for date")
+
+    monkeypatch.setattr(cli_module, "fetch_metars", fake_fetch_metars)
+    result = CliRunner().invoke(cli, ["wx", "OMAA", "--db", str(tmp_path / "wx.db")])
+    assert result.exit_code == 1
+    assert "30 days" in result.output
+
+
+def test_wx_json_emits_observations(tmp_path, monkeypatch):
+    from adsbtrack import cli as cli_module
+
+    monkeypatch.setattr(cli_module, "fetch_metars", lambda *a, **k: _wx_sample_metars())
+    result = CliRunner().invoke(cli, ["wx", "KTYS", "--json", "--db", str(tmp_path / "wx.db")])
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert len(payload) == 2
+    assert payload[0]["station"] == "KTYS"
+    assert payload[0]["raw_text"].startswith("METAR KTYS")
+
+
+def _seed_wx_flight(db_path: Path) -> None:
+    """One confirmed KEWR -> KBOS flight plus stored METARs inside each
+    endpoint's default 3-hour window (and one decoy outside it)."""
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="ab12cd",
+                takeoff_time=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+                takeoff_lat=40.69,
+                takeoff_lon=-74.17,
+                takeoff_date="2026-03-01",
+                landing_time=datetime(2026, 3, 1, 14, 0, tzinfo=UTC),
+                landing_lat=42.36,
+                landing_lon=-71.01,
+                origin_icao="KEWR",
+                origin_name="Newark",
+                destination_icao="KBOS",
+                destination_name="Boston Logan",
+                landing_type="confirmed",
+                duration_minutes=120.0,
+            )
+        )
+        db.upsert_metars(
+            [
+                {
+                    "station": "KEWR",
+                    "obs_time": "2026-03-01T11:51:00+00:00",
+                    "metar_type": "METAR",
+                    "raw_text": "METAR KEWR 011151Z 31015KT CAVOK 10/02",
+                },
+                {
+                    "station": "KBOS",
+                    "obs_time": "2026-03-01T13:54:00+00:00",
+                    "metar_type": "METAR",
+                    "raw_text": "METAR KBOS 011354Z 04022G31KT 1SM SN",
+                },
+                {
+                    "station": "KBOS",
+                    "obs_time": "2026-03-01T20:54:00+00:00",  # outside the landing window
+                    "metar_type": "METAR",
+                    "raw_text": "METAR KBOS 012054Z 00000KT CAVOK",
+                },
+            ]
+        )
+        db.commit()
+
+
+def test_trips_verbose_shows_stored_metars(tmp_path):
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_wx_flight(db_path)
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ab12cd", "--verbose", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Weather" in result.output
+    assert "011151Z" in result.output  # origin METAR
+    assert "011354Z" in result.output  # destination METAR
+    assert "012054Z" not in result.output  # outside the window
+
+
+def test_trips_without_verbose_hides_weather(tmp_path):
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_wx_flight(db_path)
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ab12cd", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert "Weather" not in result.output
+    assert "011151Z" not in result.output
+
+
+def test_trips_json_verbose_includes_wx(tmp_path):
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_wx_flight(db_path)
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ab12cd", "--verbose", "--json", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    rows = json.loads(result.output)
+    assert len(rows) == 1
+    wx = rows[0]["wx"]
+    assert [m["station"] for m in wx["origin"]] == ["KEWR"]
+    assert [m["station"] for m in wx["destination"]] == ["KBOS"]
+    assert wx["destination"][0]["raw_text"].startswith("METAR KBOS 011354Z")
+
+
+def test_trips_fetch_wx_invokes_helper_per_flight(tmp_path, monkeypatch):
+    from adsbtrack import cli as cli_module
+
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_wx_flight(db_path)
+    calls = []
+
+    def fake_fetch_flight_endpoint_metars(db, config, flight, **kwargs):
+        calls.append((flight["origin_icao"], flight["destination_icao"]))
+        return 3, ["destination KBOS 2026-03-01T14:00:00+00:00: outside the aviationweather.gov 30-day history window"]
+
+    monkeypatch.setattr(cli_module, "fetch_flight_endpoint_metars", fake_fetch_flight_endpoint_metars)
+    result = CliRunner().invoke(cli, ["trips", "--hex", "ab12cd", "--fetch-wx", "--db", str(db_path)])
+    assert result.exit_code == 0, result.output
+    assert calls == [("KEWR", "KBOS")]
+    assert "stored 3 observations" in result.output
+    assert "30-day history window" in result.output

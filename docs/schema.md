@@ -372,7 +372,7 @@ Merged hex -> identity lookup from FAA + Mictronics + hexdb.io. `enrich all` / `
 | type_code | TEXT | ICAO type designator |
 | type_description | TEXT | Type description |
 | operator | TEXT | Registered owner / operator |
-| source | TEXT | Which provider supplied the row (faa / mictronics / hexdb / mil_range) |
+| source | TEXT | Which provider supplied the row (faa / mictronics / hexdb / adsbdb / mil_range, or adsblol_live / adsbfi_live from `resolve`) |
 | is_military | INTEGER | 1 when the hex falls in a `mil_hex_ranges` block |
 | mil_country | TEXT | Country attribution from `mil_hex_ranges` |
 | mil_branch | TEXT | Branch attribution from `mil_hex_ranges` |
@@ -389,3 +389,23 @@ Static military ICAO allocation ranges. Seeded with 25 well-documented blocks (U
 | country | TEXT | Attributing country |
 | branch | TEXT | Service branch (Military (DoD), RAF, Luftwaffe, ...) |
 | notes | TEXT | Source / caveats |
+
+## metars
+
+METAR/SPECI observation history from the aviationweather.gov data API (issue #26). Fed by `adsbtrack wx` and `trips --fetch-wx`; read by `trips --verbose` and the TUI flight detail. Keyed by station + observation time so repeated fetches over overlapping windows dedupe. The API only serves ~30 days of history, so this table is the permanent archive of whatever was captured while the window was open. `raw_text` is the forensic authority; the parsed columns exist for SQL filtering.
+
+| Column | Type | Description |
+|--------|------|-------------|
+| station | TEXT | Reporting station ICAO ident (e.g. OMAA); primary key with obs_time |
+| obs_time | TEXT | Observation time, ISO 8601 UTC (`+00:00` suffix, same convention as `flights.takeoff_time` so lexicographic BETWEEN works) |
+| metar_type | TEXT | METAR or SPECI |
+| raw_text | TEXT | Full raw observation text |
+| temp_c | REAL | Temperature, deg C |
+| dewpoint_c | REAL | Dewpoint, deg C |
+| wind_dir_deg | INTEGER | Wind direction, deg true (NULL for VRB / missing; raw_text keeps it) |
+| wind_speed_kt | INTEGER | Wind speed, kt |
+| wind_gust_kt | INTEGER | Gust, kt (NULL when not gusting) |
+| visibility_mi | REAL | Visibility, statute miles (the API's "10+" style caps parse to the number) |
+| altim_hpa | REAL | Altimeter setting, hPa |
+| flight_category | TEXT | VFR / MVFR / IFR / LIFR |
+| fetched_at | TEXT | When this row was fetched |

@@ -107,6 +107,18 @@ uv run python -m adsbtrack.cli inspect --hex a66ad3 --date 2026-03-27
 
 Deep-dive on one aircraft-day: splits each source's raw trace into fragments on inter-point gaps (`--gap-secs`, default 300), and reports per-fragment point count, position, altitude/speed range, DO-260B v2/sil0/nic0 integrity counts, and the callsigns/squawks seen. Also prints the squawk and callsign change-point timeline across every source merged into one chronological stream. Pass `--airport <ident>` to add a closest-approach line (distance, time, altitude) against a known airport. `--source` limits to one source; `--json` emits a single JSON document instead of the tables.
 
+### Destination weather (METAR)
+
+```
+uv run python -m adsbtrack.cli wx OMAA --hours 6
+uv run python -m adsbtrack.cli wx KTYS --date 2026-08-10T12:00Z --hours 3
+uv run python -m adsbtrack.cli trips --hex a66ad3 --fetch-wx --verbose
+```
+
+`wx` is a live passthrough to the free [aviationweather.gov data API](https://aviationweather.gov/data/api/): METAR/SPECI history for one or more stations, `--hours` back from now (or from `--date`). Every observation is also stored in the `metars` table, deduped by station + observation time. `trips --fetch-wx` does the same per flight - a `metar_window_hours` (default 3 h) window centered on each takeoff and landing, for the matched origin/destination airports - and `trips --verbose` renders whatever the table holds near each flight's endpoints. The TUI flight detail (Enter on a flight row) shows the same data.
+
+The API serves roughly 30 days of history, so the `metars` table is the permanent archive: capture the weather while the window is open (a cron'd `wx` for airports you care about composes well with `watch`) and diversion/go-around forensics keep their destination weather forever. Flights older than the window are skipped with a warning, not errors.
+
 ### Re-extract flights
 
 ```
@@ -182,17 +194,30 @@ Merge order is FAA (preferred) -> Mictronics -> hexdb.io; the enricher flags con
 
 ## Finding hex codes
 
-Convert US N-numbers directly:
+`lookup` resolves an ICAO hex or a registration (any country, not just FAA) to a full identity - hex <-> registration <-> type <-> operator:
 
 ```
-uv run python -m adsbtrack.cli lookup --tail N512WB
+uv run python -m adsbtrack.cli lookup 896483     # hex -> A6-EUY, Airbus A380 842, Emirates Airline
+uv run python -m adsbtrack.cli lookup A6-API     # registration -> hex 89649d
+uv run python -m adsbtrack.cli lookup N512WB     # FAA N-numbers convert algorithmically, no network needed
+uv run python -m adsbtrack.cli lookup ae9c7c     # unresolvable DoD-pool hex -> military-range annotation
 ```
+
+Local sources answer first (the `hex_crossref` cache, FAA registry, Mictronics); the online fallback tries hexdb.io then adsbdb, and everything found online is cached into `hex_crossref` so the next lookup stays local. Pass `--offline` to skip the network entirely. A hex inside a known military allocation block is annotated even when no identity source resolves it, and the exit code is 1 when the query produced no answer at all (handy in scripts).
 
 Or use `--tail` instead of `--hex` on any command:
 
 ```
 uv run python -m adsbtrack.cli fetch --tail N512WB --start 2020-01-01
 ```
+
+Starting from a callsign / flight number instead? `resolve` asks the open live-traffic APIs (adsb.lol, then adsb.fi) which airframes are broadcasting it right now:
+
+```
+uv run python -m adsbtrack.cli resolve UAE201
+```
+
+Each match prints hex, registration, and type, and is cached into `hex_crossref` so follow-on `fetch` / `extract` runs can use `--hex` or `--tail` offline. Live-only by design: an aircraft that is not currently broadcasting will not be found (exit code 1), and historical callsign search is out of scope. airplanes.live is not queried - its API requires a key granted on application.
 
 External lookup sites: [aircraftdata.org](https://aircraftdata.org), [FAA Aircraft Registry](https://registry.faa.gov/aircraftinquiry), [ADS-B Exchange](https://globe.adsbexchange.com/)
 
@@ -226,8 +251,19 @@ Traces from multiple sources are automatically merged during extraction. `--sour
 | [airplanes.live](https://globe.airplanes.live/) | `--source airplaneslive` | |
 | [adsb.lol](https://adsb.lol/) | `--source adsblol` | |
 | [TheAirTraffic](https://globe.theairtraffic.com/) | `--source theairtraffic` | |
-| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | Requires `OPENSKY_CLIENT_ID` + `OPENSKY_CLIENT_SECRET` env vars |
+| [OpenSky Network](https://opensky-network.org/) | `--source opensky` | OAuth2 API client credentials (see below) |
 | Custom | `--url <base_url>` | Any readsb globe_history instance |
+
+### OpenSky credentials
+
+OpenSky retired HTTP Basic auth; the current flow is OAuth2 client-credentials. Create an API client on your [opensky-network.org](https://opensky-network.org/) account page (these are API client credentials, not your website login), then either export them or add them to `credentials.json`:
+
+```
+export OPENSKY_CLIENT_ID=...       # or put "clientId" / "clientSecret" in credentials.json
+export OPENSKY_CLIENT_SECRET=...
+```
+
+The fetcher exchanges these for a Bearer token (~30 minute lifetime, refreshed automatically) and paces requests at `Config.opensky_rate_limit` since the authenticated REST quota is credit-based. `--source all` includes OpenSky automatically whenever credentials exist. OpenSky's REST API is not a readsb archive: flight metadata is available for any date, but detailed track waypoints only for roughly the last 30 days - older days are logged as checked with no trace stored. Synthesized OpenSky traces carry no ground speed, so flights extracted purely from OpenSky data land with lower confidence than readsb-source days.
 
 ## Watching a hex list
 
@@ -256,6 +292,21 @@ Exit code is `3` when any alert fired, `0` otherwise, so a cron entry only needs
 ```
 
 `--webhook <url>` POSTs the run's alerts as JSON to that URL, but only when at least one fired. `--dormancy-days N` overrides the reactivation threshold for one run. `--json` prints a single machine-readable document (`generated_at`, `alerts`, per-hex `hexes` status) instead of the status lines and table; anything the run would otherwise print to the terminal goes to stderr instead, so stdout stays valid JSON.
+
+## Exporting a deliverable bundle
+
+```
+uv run python -m adsbtrack.cli export --hex a54c0c --window 2026-04-18:2026-04-24 --analysis --zip
+```
+
+Writes the package previously assembled by hand for third parties (journalists, researchers) into one directory (default `exports/<hex>/`, override with `--out`):
+
+- `<hex>.sqlite` - SQLite extract with the `flights`, `trace_days`, and `fetch_log` tables scoped to the aircraft; `trace_days.trace_json` is decompressed to plain JSON text so any SQLite browser can read it.
+- `flights.csv` - every extracted flight, all columns of the `flights` table.
+- `flights_<window>.csv` / `trace_<window>.csv` per `--window START:END` (repeatable; dates or datetimes, e.g. `2026-04-21T14:00:2026-04-22`) - the window's flights (overlap semantics) and its raw trace points from every source merged chronologically at native resolution (time, source, lat/lon, altitude, ground flag, ground speed, callsign, squawk).
+- `README.md` describing every file, plus `analysis.md` (with `--analysis`) - an analyst-notes stub carrying the aircraft's registry/crossref/FAA identity.
+
+The command is read-only over the working database. `--zip` also writes `<out-dir>.zip` next to the bundle directory, ready to hand off.
 
 ## Interactive surfaces
 

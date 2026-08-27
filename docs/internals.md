@@ -224,6 +224,16 @@ Three design points worth knowing:
 - `--window START:END` accepts dates or datetimes. The separator colon is found by shape, not position (END always starts with `YYYY-MM-DD`), so datetime windows like `2026-04-21T14:00:2026-04-22` parse unambiguously. A bare date covers its whole UTC day; flight subsets use overlap semantics (any part of the flight inside the window); trace CSVs filter point-by-point on absolute timestamp, scanning from one day before the window start to catch a trace day spilling past its own midnight.
 - Trace CSV rows are native resolution: every source's points merged chronologically, no dedup, no forward-fill - a blank callsign means "not broadcast on this sample". Cross-source near-duplicates are kept deliberately as evidence of independent reception.
 
+## Universal lookup
+
+`adsbtrack lookup <hex|registration>` (`adsbtrack/lookup.py`) reuses the same merge for ad-hoc queries. A hex query answers from the `hex_crossref` cache when a row with actual identity exists, runs the FAA -> Mictronics -> hexdb.io merge on a miss, then falls back to adsbdb (`api.adsbdb.com/v0/aircraft/{query}`) - which covers many foreign civil and military registrations hexdb.io misses. A registration query resolves to a hex via algorithmic FAA N-number conversion, the local `hex_crossref` / `aircraft_registry` tables, hexdb.io's plain-text `reg-hex` converter, then adsbdb (whose aircraft payload doubles as the identity, avoiding a second fetch). Online answers are cached into `hex_crossref` with their source tag, and the `mil_hex_ranges` annotation (country / branch / notes) is reported even when no identity source resolves the hex - so a US DoD-pool address still gets a useful answer. The adsbdb client self-throttles per `Config.adsbdb_rate_limit_per_min` and treats both HTTP 404 and `{"response": "unknown aircraft"}` bodies as misses.
+
+## Live callsign resolution
+
+`adsbtrack resolve <callsign>` (`adsbtrack/resolve.py`) is the callsign -> hex bridge: everything else in the tool is hex-keyed, so casework that starts from a flight number needs this first. It queries the open readsb-style `/v2/callsign/{CS}` endpoints on adsb.lol and adsb.fi (in `Config.resolve_source_urls` order) and reports every currently-broadcasting airframe whose padded `flight` field matches the callsign after stripping. Matches are deduplicated by hex across networks - the first network wins per field, later ones fill gaps (adsb.fi often carries `desc`/`ownOp` that adsb.lol omits) - and TIS-B/MLAT synthetic addresses (`~`-prefixed) are dropped. One network failing records an error but doesn't sink the other's answer.
+
+Matches carrying a registration or type are cached into `hex_crossref` with a `<network>_live` source tag, but never over an existing identity row: live-feed fields come from spoofable broadcasts and must not clobber FAA / Mictronics / hexdb data. Live-only by design - historical callsign search is out of scope - and airplanes.live is deliberately not queried because its API requires a key granted on application.
+
 ## Interactive surfaces (TUI + GUI)
 
 Two read-only surfaces sit on top of the same `adsbtrack.db`. Neither introduces a

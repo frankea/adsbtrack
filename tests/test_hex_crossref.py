@@ -185,6 +185,45 @@ def test_hexdb_raises_on_other_4xx():
         client.get_aircraft("abc123")
 
 
+def test_hexdb_get_registration_hex_returns_lowercase_hex():
+    def responder(request):
+        assert "/reg-hex" in str(request.url)
+        assert "reg=ZK019" in str(request.url)
+        return httpx.Response(200, text="43C556")
+
+    client = HexdbClient(
+        client=httpx.Client(transport=_FakeTransport(responder)),
+        rate_limit_per_min=0,
+    )
+    assert client.get_registration_hex("zk019") == "43c556"
+
+
+def test_hexdb_get_registration_hex_miss_returns_none():
+    """hexdb answers unknown registrations with HTTP 404 and an "n/a" body."""
+
+    def responder(request):
+        return httpx.Response(404, text="n/a")
+
+    client = HexdbClient(
+        client=httpx.Client(transport=_FakeTransport(responder)),
+        rate_limit_per_min=0,
+    )
+    assert client.get_registration_hex("ZZ-NOPE") is None
+
+
+def test_hexdb_get_registration_hex_rejects_non_hex_body():
+    """A 200 whose body isn't a 6-char hex (error page, "n/a") is a miss."""
+
+    def responder(request):
+        return httpx.Response(200, text="n/a")
+
+    client = HexdbClient(
+        client=httpx.Client(transport=_FakeTransport(responder)),
+        rate_limit_per_min=0,
+    )
+    assert client.get_registration_hex("ZZ-NOPE") is None
+
+
 def test_hexdb_payload_mapping():
     payload = {
         "Registration": "N512WB",

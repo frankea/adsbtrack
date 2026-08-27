@@ -182,17 +182,30 @@ Merge order is FAA (preferred) -> Mictronics -> hexdb.io; the enricher flags con
 
 ## Finding hex codes
 
-Convert US N-numbers directly:
+`lookup` resolves an ICAO hex or a registration (any country, not just FAA) to a full identity - hex <-> registration <-> type <-> operator:
 
 ```
-uv run python -m adsbtrack.cli lookup --tail N512WB
+uv run python -m adsbtrack.cli lookup 896483     # hex -> A6-EUY, Airbus A380 842, Emirates Airline
+uv run python -m adsbtrack.cli lookup A6-API     # registration -> hex 89649d
+uv run python -m adsbtrack.cli lookup N512WB     # FAA N-numbers convert algorithmically, no network needed
+uv run python -m adsbtrack.cli lookup ae9c7c     # unresolvable DoD-pool hex -> military-range annotation
 ```
+
+Local sources answer first (the `hex_crossref` cache, FAA registry, Mictronics); the online fallback tries hexdb.io then adsbdb, and everything found online is cached into `hex_crossref` so the next lookup stays local. Pass `--offline` to skip the network entirely. A hex inside a known military allocation block is annotated even when no identity source resolves it, and the exit code is 1 when the query produced no answer at all (handy in scripts).
 
 Or use `--tail` instead of `--hex` on any command:
 
 ```
 uv run python -m adsbtrack.cli fetch --tail N512WB --start 2020-01-01
 ```
+
+Starting from a callsign / flight number instead? `resolve` asks the open live-traffic APIs (adsb.lol, then adsb.fi) which airframes are broadcasting it right now:
+
+```
+uv run python -m adsbtrack.cli resolve UAE201
+```
+
+Each match prints hex, registration, and type, and is cached into `hex_crossref` so follow-on `fetch` / `extract` runs can use `--hex` or `--tail` offline. Live-only by design: an aircraft that is not currently broadcasting will not be found (exit code 1), and historical callsign search is out of scope. airplanes.live is not queried - its API requires a key granted on application.
 
 External lookup sites: [aircraftdata.org](https://aircraftdata.org), [FAA Aircraft Registry](https://registry.faa.gov/aircraftinquiry), [ADS-B Exchange](https://globe.adsbexchange.com/)
 

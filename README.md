@@ -234,6 +234,17 @@ uv run python -m adsbtrack.cli links --hex a66ad3
 
 Pass `--urls-only` for one raw URL per line (no prefix or markup), suitable for piping into shell loops.
 
+Pass `--days` to link every day with stored trace data instead of every extracted flight. This covers targets that never produce a flight - ground stations, taxi-only days, fragments too short to classify:
+
+```
+uv run python -m adsbtrack.cli links --hex adfa87 --days
+```
+
+```
+2026-08-28 10 pts (adsbx)  https://globe.adsbexchange.com/?icao=adfa87&showTrace=2026-08-28
+2026-08-29 4 pts (adsbx)  https://globe.adsbexchange.com/?icao=adfa87&showTrace=2026-08-29
+```
+
 ## Multiple data sources
 
 Fetch from different networks for better coverage:

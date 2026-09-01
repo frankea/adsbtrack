@@ -1617,6 +1617,17 @@ def resolve(callsign, no_cache, output_json, db_path):
 @click.option("--tail", "tail_number", default=None, help="FAA N-number")
 @_db_option()
 @click.option(
+    "--days",
+    "days_mode",
+    is_flag=True,
+    default=False,
+    help=(
+        "Link every day with stored trace data instead of every extracted "
+        "flight. Covers targets that never fly (ground stations) and days "
+        "whose data produced no flight."
+    ),
+)
+@click.option(
     "--urls-only",
     is_flag=True,
     default=False,
@@ -1625,15 +1636,34 @@ def resolve(callsign, no_cache, output_json, db_path):
         "and no markup. Suitable for piping into shell loops."
     ),
 )
-def links(hex_code, tail_number, db_path, urls_only):
-    """Generate ADS-B Exchange trace URLs for each flight."""
+def links(hex_code, tail_number, db_path, days_mode, urls_only):
+    """Generate ADS-B Exchange trace URLs for each flight (or, with --days,
+    for each day with trace data)."""
     with Database(Path(db_path)) as db:
         hex_code = _resolve_hex_db(db, hex_code, tail_number)
+
+        if days_mode:
+            day_rows = db.get_trace_day_summaries(hex_code)
+            if not day_rows:
+                if not urls_only:
+                    console.print("[yellow]No trace data found[/]")
+                return
+            for row in day_rows:
+                url = f"https://globe.adsbexchange.com/?icao={hex_code}&showTrace={row['date']}"
+                if urls_only:
+                    click.echo(url)
+                    continue
+                console.print(f"[cyan]{row['date']}[/] {row['point_count']} pts ({row['sources']})  [dim]{url}[/]")
+            return
+
         flights = db.get_flights(hex_code)
 
         if not flights:
             if not urls_only:
                 console.print("[yellow]No flights found[/]")
+                day_count = db.get_days_with_data(hex_code)
+                if day_count:
+                    console.print(f"[dim]{day_count} day(s) have trace data; rerun with --days to link them.[/]")
             return
 
         for f in flights:

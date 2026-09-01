@@ -1147,6 +1147,24 @@ class Database:
             (icao, day),
         ).fetchall()
 
+    def get_trace_day_summaries(self, icao: str) -> list[sqlite3.Row]:
+        """One row per date holding stored trace data: the date, the best
+        single-source point count, and the sources that carry the day.
+
+        Reads trace_days rather than flights so days that never produced a
+        flight (ground stations, taxi-only days) are still listable. MAX
+        rather than SUM across sources because they overlap on the same
+        physical broadcasts; summing would double-count.
+        """
+        return self.conn.execute(
+            """SELECT date,
+                      MAX(point_count) AS point_count,
+                      GROUP_CONCAT(DISTINCT source) AS sources
+               FROM trace_days WHERE icao = ?
+               GROUP BY date ORDER BY date""",
+            (icao,),
+        ).fetchall()
+
     def get_earliest_trace_date_since(self, icao: str, fetched_since: str) -> str | None:
         """Earliest trace day this ICAO gained (or had replaced) since the ISO
         timestamp ``fetched_since``. Returns None when the run stored nothing.

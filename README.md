@@ -232,7 +232,7 @@ uv run python -m adsbtrack.cli links --hex a66ad3
 2026-03-27 KSPG -> KHKY  https://globe.adsbexchange.com/?icao=a66ad3&showTrace=2026-03-27
 ```
 
-Pass `--urls-only` for one raw URL per line (no prefix or markup), suitable for piping into shell loops.
+Pass `--urls-only` for one raw URL per line (no prefix or markup), suitable for piping into shell loops. It composes with `--days` below.
 
 Pass `--days` to link every day with stored trace data instead of every extracted flight. This covers targets that never produce a flight - ground stations, taxi-only days, fragments too short to classify:
 
@@ -244,6 +244,8 @@ uv run python -m adsbtrack.cli links --hex adfa87 --days
 2026-08-28 10 pts (adsbx)  https://globe.adsbexchange.com/?icao=adfa87&showTrace=2026-08-28
 2026-08-29 4 pts (adsbx)  https://globe.adsbexchange.com/?icao=adfa87&showTrace=2026-08-29
 ```
+
+A day held by several sources collapses to one link pointing at the globe UI of the source with the most points for that day (adsbx preferred on ties), shown as e.g. `10 pts (adsbx +adsbfi)`; the point count is the linked source's own.
 
 ## Multiple data sources
 

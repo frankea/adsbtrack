@@ -1148,20 +1148,22 @@ class Database:
         ).fetchall()
 
     def get_trace_day_summaries(self, icao: str) -> list[sqlite3.Row]:
-        """One row per date holding stored trace data: the date, the best
-        single-source point count, and the sources that carry the day.
+        """Per-source (date, source, point_count) rows for every stored trace
+        day, ordered so each date's first row is the one worth linking: most
+        points first (sources overlap on the same physical broadcasts, so
+        counts compare but must never be summed), adsbx preferred on ties,
+        then source name for determinism.
 
         Reads trace_days rather than flights so days that never produced a
-        flight (ground stations, taxi-only days) are still listable. MAX
-        rather than SUM across sources because they overlap on the same
-        physical broadcasts; summing would double-count.
+        flight (ground stations, taxi-only days) are still listable.
         """
         return self.conn.execute(
-            """SELECT date,
-                      MAX(point_count) AS point_count,
-                      GROUP_CONCAT(DISTINCT source) AS sources
+            """SELECT date, source, point_count
                FROM trace_days WHERE icao = ?
-               GROUP BY date ORDER BY date""",
+               ORDER BY date,
+                        point_count DESC,
+                        source = 'adsbx' DESC,
+                        source""",
             (icao,),
         ).fetchall()
 

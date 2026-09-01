@@ -7,6 +7,7 @@ import sys
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from importlib.metadata import version as pkg_version
+from itertools import groupby
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -19,7 +20,7 @@ from rich.table import Table
 from .acars import fetch_acars
 from .airframes import AirframesClient
 from .airports import download_airports, enrich_helipad_names
-from .config import SOURCE_URLS, Config, is_retryable_fetch_status
+from .config import GLOBE_UI_URLS, SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database, iter_parsed_trace_days
 from .events import collect_events
 from .export import export_bundle, parse_windows
@@ -173,7 +174,7 @@ def _validate_hex_multi(ctx: click.Context, param: click.Parameter, value: tuple
     return tuple(_validate_hex(ctx, param, v) for v in value)
 
 
-def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None) -> str:
+def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None, quiet: bool = False) -> str:
     """Resolve an ICAO hex code from --hex or --tail options.
 
     Exactly one of hex_code or tail_number must be provided. --tail first
@@ -187,6 +188,10 @@ def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None)
     reassigned across aircraft over time), pick the row with the
     newest `last_updated` and warn. Analysts who want a specific
     aircraft can pass --hex explicitly.
+
+    ``quiet`` keeps stdout free of resolution chatter for callers whose
+    stdout is a machine-readable stream (links --urls-only); the
+    multi-match warning is too important to drop and goes to stderr.
     """
     if hex_code and tail_number:
         raise click.UsageError("Provide either --hex or --tail, not both.")
@@ -199,7 +204,8 @@ def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None)
     # valid N-number regardless of DB state.
     try:
         resolved = nnumber_to_icao(tail_number)
-        console.print(f"[dim]Converted {tail_number} to hex {resolved}[/]")
+        if not quiet:
+            console.print(f"[dim]Converted {tail_number} to hex {resolved}[/]")
         return resolved.lower()
     except ValueError:
         pass  # not an N-number; try DB lookups
@@ -228,13 +234,18 @@ def _resolve_hex_db(db: Database, hex_code: str | None, tail_number: str | None)
 
     distinct_icaos = sorted({row["icao"] for row in rows})
     if len(distinct_icaos) > 1:
-        console.print(
-            f"[yellow]Tail {tail_number!r} resolved to multiple hexes: "
+        warning = (
+            f"Tail {tail_number!r} resolved to multiple hexes: "
             f"{distinct_icaos}. Using newest ({rows[0]['icao']}). "
-            f"Pass --hex to disambiguate.[/]"
+            f"Pass --hex to disambiguate."
         )
+        if quiet:
+            click.echo(warning, err=True)
+        else:
+            console.print(f"[yellow]{warning}[/]")
     chosen = rows[0]["icao"]
-    console.print(f"[dim]Resolved {tail_number} to hex {chosen}[/]")
+    if not quiet:
+        console.print(f"[dim]Resolved {tail_number} to hex {chosen}[/]")
     return chosen.lower()
 
 
@@ -1612,7 +1623,14 @@ def resolve(callsign, no_cache, output_json, db_path):
         sys.exit(2 if len(errors) == len(clients) else 1)
 
 
-@cli.command()
+def _globe_trace_url(source: str, hex_code: str, date_str: str) -> str:
+    """Trace-replay URL on the source's own tar1090 globe UI. Sources
+    without one (e.g. opensky) fall back to adsbx."""
+    base = GLOBE_UI_URLS.get(source, GLOBE_UI_URLS["adsbx"])
+    return f"{base}?icao={hex_code}&showTrace={date_str}"
+
+
+@cli.command(short_help="Generate ADS-B Exchange trace URLs per flight or per trace day")
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help="FAA N-number")
 @_db_option()
@@ -1624,7 +1642,8 @@ def resolve(callsign, no_cache, output_json, db_path):
     help=(
         "Link every day with stored trace data instead of every extracted "
         "flight. Covers targets that never fly (ground stations) and days "
-        "whose data produced no flight."
+        "whose data produced no flight. Each day links the globe UI of the "
+        "source with the most points for that day."
     ),
 )
 @click.option(
@@ -1632,15 +1651,15 @@ def resolve(callsign, no_cache, output_json, db_path):
     is_flag=True,
     default=False,
     help=(
-        "Print only one URL per line with no date/origin/destination prefix "
-        "and no markup. Suitable for piping into shell loops."
+        "Print only one URL per line with no prefix and no markup. "
+        "Composes with --days. Suitable for piping into shell loops."
     ),
 )
 def links(hex_code, tail_number, db_path, days_mode, urls_only):
     """Generate ADS-B Exchange trace URLs for each flight (or, with --days,
     for each day with trace data)."""
     with Database(Path(db_path)) as db:
-        hex_code = _resolve_hex_db(db, hex_code, tail_number)
+        hex_code = _resolve_hex_db(db, hex_code, tail_number, quiet=urls_only)
 
         if days_mode:
             day_rows = db.get_trace_day_summaries(hex_code)
@@ -1648,12 +1667,21 @@ def links(hex_code, tail_number, db_path, days_mode, urls_only):
                 if not urls_only:
                     console.print("[yellow]No trace data found[/]")
                 return
-            for row in day_rows:
-                url = f"https://globe.adsbexchange.com/?icao={hex_code}&showTrace={row['date']}"
+            for day, rows in groupby(day_rows, key=lambda r: r["date"]):
+                # First row per date is the best-covered source (query orders
+                # by point count); its count is the only one shown, because
+                # sources overlap on the same broadcasts and summing or
+                # crediting the max to every source would misattribute.
+                best, *others = rows
+                url = _globe_trace_url(best["source"], hex_code, day)
                 if urls_only:
                     click.echo(url)
                     continue
-                console.print(f"[cyan]{row['date']}[/] {row['point_count']} pts ({row['sources']})  [dim]{url}[/]")
+                sources = best["source"] + "".join(f" +{r['source']}" for r in others)
+                console.print(
+                    f"[cyan]{day}[/] {best['point_count']} pts ({sources})  [dim]{url}[/]",
+                    soft_wrap=True,
+                )
             return
 
         flights = db.get_flights(hex_code)
@@ -1668,14 +1696,14 @@ def links(hex_code, tail_number, db_path, days_mode, urls_only):
 
         for f in flights:
             flight_date = f["takeoff_time"][:10]
-            url = f"https://globe.adsbexchange.com/?icao={hex_code}&showTrace={flight_date}"
+            url = _globe_trace_url("adsbx", hex_code, flight_date)
             if urls_only:
                 # Bypass rich formatting so shell pipelines get a clean stream.
                 click.echo(url)
                 continue
             origin = f["origin_icao"] or "?"
             dest = f["destination_icao"] or "?"
-            console.print(f"[cyan]{flight_date}[/] {origin} -> {dest}  [dim]{url}[/]")
+            console.print(f"[cyan]{flight_date}[/] {origin} -> {dest}  [dim]{url}[/]", soft_wrap=True)
 
 
 @cli.group()

@@ -588,6 +588,15 @@ def fetch(
 @cli.command()
 @click.option("--hex", "hex_code", default=None, callback=_validate_hex, help="ICAO hex code")
 @click.option("--tail", "tail_number", default=None, help=TAIL_HELP)
+@click.option(
+    "--all",
+    "all_aircraft",
+    is_flag=True,
+    default=False,
+    help="Extract every aircraft in the database instead of one. With --reprocess this "
+    "rebuilds the whole flights table, e.g. after an extractor upgrade. Commits after "
+    "each aircraft, so an interrupted run keeps the aircraft it finished.",
+)
 @click.option("--reprocess", is_flag=True, help="Clear and rebuild all flights")
 @click.option(
     "--since",
@@ -598,10 +607,12 @@ def fetch(
     "cannot be extended safely.",
 )
 @_db_option()
-def extract(hex_code, tail_number, reprocess, since_str, db_path):
+def extract(hex_code, tail_number, all_aircraft, reprocess, since_str, db_path):
     """Process raw traces into flights."""
     if reprocess and since_str:
         raise click.UsageError("Provide either --reprocess or --since, not both.")
+    if all_aircraft and (hex_code or tail_number):
+        raise click.UsageError("Provide either --all or one aircraft (--hex/--tail), not both.")
     since_date = None
     if since_str:
         try:
@@ -609,12 +620,33 @@ def extract(hex_code, tail_number, reprocess, since_str, db_path):
         except ValueError:
             console.print(f"[red]Invalid --since '{since_str}'; use YYYY-MM-DD.[/]")
             return
+    failed: list[str] = []
     with Database(Path(db_path)) as db:
-        hex_code = _resolve_hex_db(db, hex_code, tail_number)
         config = _load_config(db_path)
         ensure_airports(db, config)
-        count = extract_flights(db, config, hex_code, reprocess=reprocess, since_date=since_date)
-        console.print(f"[green]Extracted {count} flights[/]")
+        if all_aircraft:
+            icaos = db.get_all_icaos()
+            total = 0
+            for icao in icaos:
+                try:
+                    count = extract_flights(db, config, icao, reprocess=reprocess, since_date=since_date)
+                except Exception as e:
+                    # A half-extracted aircraft must not ride into the next
+                    # aircraft's commit: its clear may already have run.
+                    db.conn.rollback()
+                    failed.append(icao)
+                    console.print(f"[red]{icao}: extraction failed: {e}[/]")
+                    continue
+                # Per-aircraft commit so an interrupted bulk run keeps every
+                # aircraft it finished (extract_flights itself never commits).
+                db.commit()
+                total += count
+                console.print(f"{icao}: {count} flights")
+            console.print(f"[green]Extracted {total} flights across {len(icaos) - len(failed)} aircraft[/]")
+        else:
+            hex_code = _resolve_hex_db(db, hex_code, tail_number)
+            count = extract_flights(db, config, hex_code, reprocess=reprocess, since_date=since_date)
+            console.print(f"[green]Extracted {count} flights[/]")
         # v12 N13: enrich generic helipad names from OurAirports heliport data.
         try:
             enriched = enrich_helipad_names(db, config)
@@ -622,6 +654,9 @@ def extract(hex_code, tail_number, reprocess, since_str, db_path):
                 console.print(f"[green]Enriched {enriched} helipad names[/]")
         except Exception:
             pass
+    if failed:
+        console.print(f"[red]{len(failed)} aircraft failed: {', '.join(failed)}[/]")
+        sys.exit(1)
 
 
 def _load_airframes_api_key(config: Config) -> str:

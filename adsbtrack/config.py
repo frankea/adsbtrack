@@ -11,6 +11,18 @@ SOURCE_URLS = {
     "theairtraffic": "https://globe.theairtraffic.com/globe_history",
 }
 
+# tar1090 globe UI per trace source. Not always SOURCE_URLS minus the
+# /globe_history suffix (adsb.lol serves its UI at the bare domain), so
+# kept as an explicit table. The fetcher sends these as Referer headers;
+# `links` builds ?icao=&showTrace= replay URLs on them.
+GLOBE_UI_URLS = {
+    "adsbx": "https://globe.adsbexchange.com/",
+    "adsbfi": "https://globe.adsb.fi/",
+    "airplaneslive": "https://globe.airplanes.live/",
+    "adsblol": "https://adsb.lol/",
+    "theairtraffic": "https://globe.theairtraffic.com/",
+}
+
 # fetch_log statuses that mean a day's retries were exhausted without ever
 # landing on a terminal answer (403 bot-block, 429 rate-limit, 5xx server
 # error). A fetch_log row carrying only these statuses does NOT count as

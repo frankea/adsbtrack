@@ -83,6 +83,184 @@ def test_links_urls_only_emits_one_url_per_line(tmp_path):
     assert "showTrace=2022-06-15" in joined
 
 
+def _seed_trace_days(db_path: Path) -> None:
+    """Insert trace days with no extracted flights for hex 'adfa87' -- the
+    ground-station shape from issue #38: data exists but nothing ever flies,
+    so extract produces zero flights."""
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "adfa87",
+            "2026-08-28",
+            {"trace": [[0, 37.631, -116.529]] * 10, "timestamp": 1787875200},
+        )
+        db.insert_trace_day(
+            "adfa87",
+            "2026-08-29",
+            {"trace": [[0, 37.631, -116.529]] * 4, "timestamp": 1787961600},
+        )
+
+
+def _seed_multi_source_day(db_path: Path) -> None:
+    """One date held by two sources with different point counts, so tests can
+    pin both the collapse-to-one-link rule and the count attribution."""
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "adfa87",
+            "2026-08-28",
+            {"trace": [[0, 37.631, -116.529]] * 10, "timestamp": 1787875200},
+            source="adsbx",
+        )
+        db.insert_trace_day(
+            "adfa87",
+            "2026-08-28",
+            {"trace": [[0, 37.631, -116.529]] * 7, "timestamp": 1787875200},
+            source="adsbfi",
+        )
+
+
+def test_links_days_lists_trace_days_without_flights(tmp_path):
+    """`links --days` should link every day with trace data even when no
+    flight was ever extracted (ground stations, taxi-only days)."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_trace_days(db_path)
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--days", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "https://globe.adsbexchange.com/?icao=adfa87&showTrace=2026-08-28" in result.output
+    assert "https://globe.adsbexchange.com/?icao=adfa87&showTrace=2026-08-29" in result.output
+    # Point counts and source let the user rank days by how much data they hold.
+    assert "10" in result.output
+    assert "adsbx" in result.output
+
+
+def test_links_days_urls_only_emits_one_url_per_line(tmp_path):
+    """`links --days --urls-only` keeps the pipeable contract: bare URLs only."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_trace_days(db_path)
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--days", "--urls-only", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 2, f"Expected 2 URL lines, got: {lines!r}"
+    for line in lines:
+        assert line.startswith("https://globe.adsbexchange.com/?icao=adfa87&showTrace="), (
+            f"Line is not a bare URL: {line!r}"
+        )
+        assert "[" not in line
+    # Both stored dates must be represented, in order.
+    assert lines[0].endswith("showTrace=2026-08-28")
+    assert lines[1].endswith("showTrace=2026-08-29")
+
+
+def test_links_days_collapses_multiple_sources_per_date(tmp_path):
+    """Two sources holding the same date must produce one link, not two."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_multi_source_day(db_path)
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--days", "--urls-only", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 1, f"Expected 1 URL line for a date shared by 2 sources, got: {lines!r}"
+    assert lines[0].endswith("showTrace=2026-08-28")
+
+
+def test_links_days_attributes_point_count_to_linked_source(tmp_path):
+    """The pretty line must pair the printed point count with the source it
+    came from (the best-covered one, whose globe UI we link), never SUM the
+    sources' overlapping broadcasts or credit the max to every source."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_multi_source_day(db_path)
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--days", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "10 pts (adsbx +adsbfi)" in result.output
+    assert "17" not in result.output  # SUM would double-count overlapping points
+    assert "7 pts" not in result.output
+
+
+def test_links_days_uses_the_covering_sources_globe_ui(tmp_path):
+    """A day stored only by a non-adsbx source must link that source's globe
+    UI: adsbexchange's archive may not hold the day at all, and surfacing
+    exactly such days is what --days is for."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path) as db:
+        db.insert_trace_day(
+            "adfa87",
+            "2026-08-28",
+            {"trace": [[0, 37.631, -116.529]] * 7, "timestamp": 1787875200},
+            source="adsbfi",
+        )
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--days", "--urls-only", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert lines == ["https://globe.adsb.fi/?icao=adfa87&showTrace=2026-08-28"], lines
+
+
+def test_links_tail_urls_only_stdout_is_pure(tmp_path):
+    """--urls-only promises a bare-URL stream, so --tail resolution chatter
+    ('Resolved ... to hex ...') must not reach stdout in that mode."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_trace_days(db_path)
+    with Database(db_path) as db:
+        db.conn.execute(
+            "INSERT INTO aircraft_registry (icao, registration, last_updated) VALUES (?, ?, ?)",
+            ("adfa87", "G-STAT", "2026-04-10T00:00:00Z"),
+        )
+
+    result = CliRunner().invoke(cli, ["links", "--tail", "G-STAT", "--days", "--urls-only", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    lines = [line for line in result.output.splitlines() if line.strip()]
+    assert len(lines) == 2, f"Expected 2 URL lines and nothing else, got: {lines!r}"
+    for line in lines:
+        assert line.startswith("https://"), f"Non-URL line polluted --urls-only output: {line!r}"
+
+
+def test_links_urls_only_suppresses_no_flight_hint(tmp_path):
+    """The 'rerun with --days' hint must never leak into the pipeable
+    --urls-only stream of the default (flights) mode."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_trace_days(db_path)  # trace days but zero flights
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--urls-only", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == ""
+
+
+def test_links_no_flights_hints_at_days_flag(tmp_path):
+    """Plain `links` with zero flights but stored trace days should tell the
+    user those days exist and how to link them."""
+    db_path = tmp_path / "adsbtrack.db"
+    _seed_trace_days(db_path)
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "No flights found" in result.output
+    assert "--days" in result.output
+    assert "2" in result.output  # the day count
+
+
+def test_links_days_empty_db_says_no_days(tmp_path):
+    """`links --days` on a hex with no trace data should not print URLs."""
+    db_path = tmp_path / "adsbtrack.db"
+    with Database(db_path):
+        pass  # create empty schema
+
+    result = CliRunner().invoke(cli, ["links", "--hex", "adfa87", "--days", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "No trace data found" in result.output
+    assert "https://" not in result.output
+
+
 def _build_fake_releasable_zip(path):
     """Build a releasable zip using the real FAA format:
 

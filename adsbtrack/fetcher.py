@@ -13,17 +13,8 @@ from datetime import UTC, date, datetime, timedelta
 import httpx
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeRemainingColumn
 
-from .config import SOURCE_URLS, Config, is_retryable_fetch_status
+from .config import GLOBE_UI_URLS, SOURCE_URLS, Config, is_retryable_fetch_status
 from .db import Database
-
-# Referer headers per source domain
-_SOURCE_REFERERS = {
-    "adsbx": "https://globe.adsbexchange.com/",
-    "adsbfi": "https://globe.adsb.fi/",
-    "airplaneslive": "https://globe.airplanes.live/",
-    "adsblol": "https://adsb.lol/",
-    "theairtraffic": "https://globe.theairtraffic.com/",
-}
 
 
 def build_url(base_url: str, hex_code: str, day: date) -> str:
@@ -42,8 +33,8 @@ def date_range(start: date, end: date) -> list[date]:
 
 def _referer_for_source(source: str) -> str:
     """Derive a referer URL from the source name or its base URL."""
-    if source in _SOURCE_REFERERS:
-        return _SOURCE_REFERERS[source]
+    if source in GLOBE_UI_URLS:
+        return GLOBE_UI_URLS[source]
     if source in SOURCE_URLS:
         # Extract origin from base URL: https://globe.example.com/globe_history -> https://globe.example.com/
         base = SOURCE_URLS[source]

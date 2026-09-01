@@ -127,6 +127,8 @@ uv run python -m adsbtrack.cli extract --hex a66ad3 --reprocess
 
 Rebuilds the flight table from raw trace data after code changes.
 
+`--all` runs the extraction over every aircraft in the database instead of one; `--all --reprocess` rebuilds the whole flights table, which is how existing rows pick up a new extractor version. The bulk run commits after each aircraft, so interrupting it keeps everything already finished, and a single failing aircraft is rolled back and reported (exit code 1) without stopping the rest.
+
 `--since 2026-04-08` rebuilds only the trace days that new data on that date can affect and leaves the earlier flights alone - what `fetch` does automatically for the days it just downloaded. See [Incremental extraction](docs/internals.md#incremental-extraction) for how far back "can affect" reaches and when it falls back to a full rebuild.
 
 ## FAA aircraft registry

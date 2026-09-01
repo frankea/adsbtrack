@@ -2951,6 +2951,112 @@ def test_extract_rejects_since_with_reprocess(tmp_path):
     assert "--reprocess" in result.output and "--since" in result.output
 
 
+def test_extract_all_visits_every_aircraft(tmp_path, monkeypatch):
+    """`extract --all --reprocess` loops over every aircraft known to
+    trace_days or flights, passing reprocess through to each."""
+    from adsbtrack import cli as cli_module
+
+    calls: list = []
+    monkeypatch.setattr(cli_module, "extract_flights", _fake_extract(calls))
+
+    db_path = tmp_path / "extract.db"
+    _seed_airport(db_path)
+    with Database(db_path) as db:
+        db.insert_trace_day("adfa87", "2026-08-28", {"trace": [[0, 37.6, -116.5]] * 3, "timestamp": 1787875200})
+        db.insert_trace_day("ae07b3", "2026-08-28", {"trace": [[0, 35.0, -117.9]] * 3, "timestamp": 1787875200})
+        # An aircraft with flights but no trace days left must still be
+        # visited, so its stale rows get cleared.
+        db.insert_flight(
+            Flight(
+                icao="abc123",
+                takeoff_time=datetime(2026, 3, 27, 14, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-117.9,
+                takeoff_date="2026-03-27",
+            )
+        )
+
+    result = CliRunner().invoke(cli, ["extract", "--all", "--reprocess", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    assert [c["hex"] for c in calls] == ["abc123", "adfa87", "ae07b3"]
+    assert all(c["reprocess"] for c in calls)
+
+
+def test_extract_all_rejects_explicit_aircraft(tmp_path):
+    """--all and --hex/--tail are mutually exclusive."""
+    db_path = tmp_path / "extract.db"
+    result = CliRunner().invoke(cli, ["extract", "--all", "--hex", "abcdef", "--db", str(db_path)])
+    assert result.exit_code != 0
+    assert "--all" in result.output and "--hex" in result.output
+
+
+def test_extract_all_reprocess_clears_stale_flights_for_traceless_aircraft(tmp_path):
+    """Real end-to-end: flights are derived state, so an aircraft whose
+    trace days are gone ends the bulk reprocess with zero flights."""
+    db_path = tmp_path / "extract.db"
+    _seed_airport(db_path)
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="abc123",
+                takeoff_time=datetime(2026, 3, 27, 14, 0, 0, tzinfo=UTC),
+                takeoff_lat=35.0,
+                takeoff_lon=-117.9,
+                takeoff_date="2026-03-27",
+            )
+        )
+
+    result = CliRunner().invoke(cli, ["extract", "--all", "--reprocess", "--db", str(db_path)])
+
+    assert result.exit_code == 0, result.output
+    with Database(db_path) as db:
+        assert db.get_flight_count("abc123") == 0
+
+
+def test_extract_all_continues_past_a_failing_aircraft(tmp_path, monkeypatch):
+    """One aircraft's extraction failure must not abort the bulk run, must
+    not leak its partial writes into the next aircraft's commit, and must
+    surface in the exit code once the rest have finished."""
+    from adsbtrack import cli as cli_module
+
+    calls: list = []
+    record = _fake_extract(calls)
+
+    def flaky(db, config, hex_code, reprocess=False, since_date=None):
+        if hex_code == "adfa87":
+            # Simulate a crash after destructive work has begun: the bulk
+            # loop must roll this back, not commit it with the next aircraft.
+            db.clear_flights("adfa87")
+            raise ValueError("corrupt trace day")
+        return record(db, config, hex_code, reprocess=reprocess, since_date=since_date)
+
+    monkeypatch.setattr(cli_module, "extract_flights", flaky)
+
+    db_path = tmp_path / "extract.db"
+    _seed_airport(db_path)
+    with Database(db_path) as db:
+        db.insert_flight(
+            Flight(
+                icao="adfa87",
+                takeoff_time=datetime(2026, 3, 27, 14, 0, 0, tzinfo=UTC),
+                takeoff_lat=37.6,
+                takeoff_lon=-116.5,
+                takeoff_date="2026-03-27",
+            )
+        )
+        db.insert_trace_day("ae07b3", "2026-08-28", {"trace": [[0, 35.0, -117.9]] * 3, "timestamp": 1787875200})
+
+    result = CliRunner().invoke(cli, ["extract", "--all", "--db", str(db_path)])
+
+    assert result.exit_code == 1, result.output
+    assert [c["hex"] for c in calls] == ["ae07b3"]
+    assert "adfa87" in result.output
+    assert "corrupt trace day" in result.output
+    with Database(db_path) as db:
+        assert db.get_flight_count("adfa87") == 1, "failed aircraft's partial clear must be rolled back"
+
+
 # ---------------------------------------------------------------------------
 # inspect: day-level trace forensics (#23)
 # ---------------------------------------------------------------------------

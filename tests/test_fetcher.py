@@ -11,6 +11,7 @@ import pytest
 from adsbtrack.config import Config
 from adsbtrack.db import Database
 from adsbtrack.fetcher import (
+    _build_headers,
     _load_opensky_credentials,
     _opensky_path_to_readsb,
     _OpenSkyAuth,
@@ -448,3 +449,25 @@ def test_fetch_traces_opensky_persistent_429_stops_after_one_retry(scratch_db):
     assert stats["errors"] == 4  # every remaining day logged, none silently dropped
     assert stats["fetched"] == 4
     assert scratch_db.get_fetched_dates("abc123", source="opensky") == set()  # 429 stays retryable
+
+
+# ---------------------------------------------------------------------------
+# _build_headers
+# ---------------------------------------------------------------------------
+
+
+def test_build_headers_only_advertises_encodings_httpx_can_decode():
+    """Every Accept-Encoding token must have an httpx decoder behind it.
+
+    httpx silently passes through a Content-Encoding it has no decoder for
+    (KeyError -> continue in Response._get_content_decoder), so advertising
+    br or zstd without the brotli / zstandard packages would hand
+    _parse_trace_body a compressed body it cannot parse the day the CDN
+    picks one of them. Guards the httpx[brotli,zstd] extras in pyproject.
+    """
+    from httpx._decoders import SUPPORTED_DECODERS
+
+    headers = _build_headers("airplaneslive", "a6a2f7")
+    advertised = {tok.strip().lower() for tok in headers["accept-encoding"].split(",")}
+    undecodable = advertised - set(SUPPORTED_DECODERS)
+    assert not undecodable, f"Accept-Encoding advertises encodings httpx cannot decode: {sorted(undecodable)}"

@@ -263,7 +263,7 @@ Traces from multiple sources are automatically merged during extraction. `--sour
 |--------|------|-------|
 | [ADS-B Exchange](https://globe.adsbexchange.com/) | `--source adsbx` | Default |
 | [adsb.fi](https://globe.adsb.fi/) | `--source adsbfi` | |
-| [airplanes.live](https://globe.airplanes.live/) | `--source airplaneslive` | |
+| [airplanes.live](https://globe.airplanes.live/) | `--source airplaneslive` | Reads the map's `globe_history` archive (traces back to early 2023 as of Sep 2026). The public REST API at api.airplanes.live closed to anonymous callers in Aug 2026; adsbtrack never used it, but expect coverage to thin as feeders leave. |
 | [adsb.lol](https://adsb.lol/) | `--source adsblol` | |
 | [TheAirTraffic](https://globe.theairtraffic.com/) | `--source theairtraffic` | |
 | [OpenSky Network](https://opensky-network.org/) | `--source opensky` | OAuth2 API client credentials (see below) |

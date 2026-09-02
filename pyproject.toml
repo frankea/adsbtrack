@@ -19,7 +19,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 dependencies = [
-    "httpx[http2]>=0.28",
+    "httpx[http2,brotli,zstd]>=0.28",
     "click>=8.0",
     "rich>=13.0",
     "shapely>=2.0",
